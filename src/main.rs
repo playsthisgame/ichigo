@@ -6,6 +6,8 @@ use std::fs;
 
 mod config;
 mod runner;
+mod utils;
+mod tester;
 
 use config::{config_path, list_requests, RequestConfig, OXIDE_DIR};
 
@@ -51,6 +53,17 @@ enum Commands {
         /// Name of the request
         name: String,
     },
+    /// Run the configured tests
+    Test {
+        /// Name of the config to test
+        name: String,
+        /// Set a variable: KEY=VALUE (overrides env vars, supports {{KEY}} in config)
+        #[arg(short = 'v', long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
+        /// Number of iterations to test
+        #[arg(short = 'i', long = "iter")]
+        iterations: usize,
+    }
 }
 
 fn main() -> Result<()> {
@@ -61,6 +74,7 @@ fn main() -> Result<()> {
         Commands::List => cmd_list(),
         Commands::Show { name } => cmd_show(name),
         Commands::Delete { name } => cmd_delete(name),
+        Commands::Test { name , vars, iterations} => cmd_test(name, vars, iterations),
     }
 }
 
@@ -166,4 +180,22 @@ fn cmd_delete(name: String) -> Result<()> {
     fs::remove_file(&path)?;
     println!("{} '{}'", "Deleted".green().bold(), name);
     Ok(())
+}
+
+fn cmd_test(name: String, vars: Vec<String>, iterations: usize) -> Result<()> {
+    let mut var_map = HashMap::new();
+    for var in &vars {
+        match var.split_once('=') {
+            Some((k, v)) => {
+                var_map.insert(k.to_string(), v.to_string());
+            }
+            None => eprintln!(
+                "{} ignoring malformed var '{}' (expected KEY=VALUE)",
+                "warning:".yellow(),
+                var
+            ),
+        }
+    }
+    let config = RequestConfig::load(&name)?;
+    tester::run_tester(&config, &var_map, iterations)
 }
