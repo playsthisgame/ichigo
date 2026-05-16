@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-pub const OXIDE_DIR: &str = ".oxide";
+pub const ICHIGO_DIR: &str = ".ichigo";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RequestConfig {
@@ -37,16 +37,16 @@ impl RequestConfig {
 }
 
 pub fn config_path(name: &str) -> PathBuf {
-    PathBuf::from(OXIDE_DIR).join(format!("{}.yaml", name))
+    PathBuf::from(ICHIGO_DIR).join(format!("{}.yaml", name))
 }
 
 pub fn list_requests() -> Result<Vec<String>> {
-    let dir = PathBuf::from(OXIDE_DIR);
+    let dir = PathBuf::from(ICHIGO_DIR);
     if !dir.exists() {
         return Ok(vec![]);
     }
     let mut names = Vec::new();
-    for entry in fs::read_dir(&dir).context("Failed to read .oxide directory")? {
+    for entry in fs::read_dir(&dir).context("Failed to read .ichigo directory")? {
         let path = entry?.path();
         if path.extension().map_or(false, |e| e == "yaml") {
             if let Some(stem) = path.file_stem() {

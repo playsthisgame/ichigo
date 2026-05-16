@@ -500,6 +500,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichigo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "colored",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -779,19 +792,6 @@ dependencies = [
  "libc",
  "pkg-config",
  "vcpkg",
-]
-
-[[package]]
-name = "oxide"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "colored",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
 ]
 
 [[package]]

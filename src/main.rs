@@ -9,11 +9,11 @@ mod runner;
 mod utils;
 mod tester;
 
-use config::{config_path, list_requests, RequestConfig, OXIDE_DIR};
+use config::{config_path, list_requests, RequestConfig, ICHIGO_DIR};
 
 #[derive(Parser)]
-#[command(name = "oxide")]
-#[command(about = "A CLI HTTP client — store requests in .oxide/, run them on demand")]
+#[command(name = "ichigo")]
+#[command(about = "A CLI HTTP client — store requests in .ichigo/, run them on demand")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -24,7 +24,7 @@ struct Cli {
 enum Commands {
     /// Create a new request config
     New {
-        /// Name for the request (becomes .oxide/<name>.yaml)
+        /// Name for the request (becomes .ichigo/<name>.yaml)
         name: String,
         /// HTTP method
         #[arg(short, long, default_value = "GET")]
@@ -84,9 +84,9 @@ fn cmd_new(name: String, method: String, url: Option<String>) -> Result<()> {
         anyhow::bail!("Request '{}' already exists at {}", name, path.display());
     }
 
-    let dir = std::path::PathBuf::from(OXIDE_DIR);
+    let dir = std::path::PathBuf::from(ICHIGO_DIR);
     if !dir.exists() {
-        fs::create_dir_all(&dir).context("Failed to create .oxide directory")?;
+        fs::create_dir_all(&dir).context("Failed to create .ichigo directory")?;
     }
 
     let url = url.unwrap_or_else(|| "https://example.com".to_string());
@@ -138,7 +138,7 @@ fn cmd_run(name: String, vars: Vec<String>) -> Result<()> {
 fn cmd_list() -> Result<()> {
     let requests = list_requests()?;
     if requests.is_empty() {
-        println!("No requests found. Use `oxide new <name>` to create one.");
+        println!("No requests found. Use `ichigo new <name>` to create one.");
         return Ok(());
     }
     println!("{}", "Requests:".bold());
