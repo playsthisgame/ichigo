@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
@@ -69,6 +69,18 @@ enum Commands {
         #[arg(short = 'i', long = "iter")]
         iterations: usize,
     },
+    /// Print a shell completion script to stdout
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
+    },
+}
+
+#[derive(ValueEnum, Clone)]
+enum Shell {
+    Zsh,
+    Bash,
+    Fish,
 }
 
 fn main() -> Result<()> {
@@ -80,6 +92,7 @@ fn main() -> Result<()> {
         Commands::Show { name } => cmd_show(name),
         Commands::Delete { name } => cmd_delete(name),
         Commands::Test { name, vars, iterations } => cmd_test(name, vars, iterations),
+        Commands::Completions { shell } => cmd_completions(shell),
     }
 }
 
@@ -206,3 +219,117 @@ fn cmd_test(name: String, vars: Vec<String>, iterations: usize) -> Result<()> {
     let config = RequestConfig::load(&name)?;
     tester::run_tester(&config, &parse_vars(&vars), iterations)
 }
+
+fn cmd_completions(shell: Shell) -> Result<()> {
+    let script = match shell {
+        Shell::Zsh => ZSH_COMPLETION,
+        Shell::Bash => BASH_COMPLETION,
+        Shell::Fish => FISH_COMPLETION,
+    };
+    print!("{}", script);
+    Ok(())
+}
+
+const ZSH_COMPLETION: &str = r#"_ichigo_configs() {
+    local -a configs
+    local f
+    if [[ -d "$PWD/.ichigo" ]]; then
+        for f in "$PWD/.ichigo"/*.yaml(N); do
+            configs+=("${f:t:r}")
+        done
+    fi
+    local global_dir="${HOME}/.config/ichigo"
+    if [[ -d "$global_dir" ]]; then
+        for f in "$global_dir"/*.yaml(N); do
+            configs+=("${f:t:r}")
+        done
+    fi
+    _describe 'config name' configs
+}
+
+_ichigo() {
+    local -a cmds
+    cmds=(
+        'new:Create a new request config'
+        'run:Execute a configured request'
+        'list:List all configured requests'
+        'show:Print a request config'
+        'delete:Delete a request config'
+        'test:Run the configured tests'
+        'completions:Print a shell completion script'
+    )
+
+    _arguments -C '1: :->cmd' '*:: :->args'
+
+    case $state in
+        cmd)
+            _describe 'command' cmds
+            ;;
+        args)
+            case $words[1] in
+                run|show|delete|test)
+                    _arguments '1: :_ichigo_configs'
+                    ;;
+                completions)
+                    _arguments '1: :(zsh bash fish)'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+compdef _ichigo ichigo
+"#;
+
+const BASH_COMPLETION: &str = r#"_ichigo_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local cmd="${COMP_WORDS[1]}"
+
+    case "$cmd" in
+        run|show|delete|test)
+            local configs=()
+            if [[ -d "$PWD/.ichigo" ]]; then
+                for f in "$PWD/.ichigo"/*.yaml; do
+                    [[ -f "$f" ]] && configs+=("$(basename "${f%.yaml}")")
+                done
+            fi
+            local global_dir="${HOME}/.config/ichigo"
+            if [[ -d "$global_dir" ]]; then
+                for f in "$global_dir"/*.yaml; do
+                    [[ -f "$f" ]] && configs+=("$(basename "${f%.yaml}")")
+                done
+            fi
+            COMPREPLY=($(compgen -W "${configs[*]}" -- "$cur"))
+            ;;
+        completions)
+            COMPREPLY=($(compgen -W "zsh bash fish" -- "$cur"))
+            ;;
+        *)
+            COMPREPLY=($(compgen -W "new run list show delete test completions" -- "$cur"))
+            ;;
+    esac
+}
+
+complete -F _ichigo_completions ichigo
+"#;
+
+const FISH_COMPLETION: &str = r#"function __ichigo_configs
+    set -l local_dir (pwd)/.ichigo
+    set -l global_dir $HOME/.config/ichigo
+    for f in $local_dir/*.yaml $global_dir/*.yaml
+        if test -f $f
+            echo (basename $f .yaml)
+        end
+    end
+end
+
+set -l config_cmds run show delete test
+
+complete -c ichigo -f
+complete -c ichigo -n "not __fish_seen_subcommand_from new run list show delete test completions" \
+    -a "new run list show delete test completions"
+complete -c ichigo -n "__fish_seen_subcommand_from $config_cmds" \
+    -a "(__ichigo_configs)"
+complete -c ichigo -n "__fish_seen_subcommand_from completions" \
+    -a "zsh bash fish"
+"#;
