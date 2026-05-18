@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use colored::Colorize;
+use colored_json::ToColoredJson;
 use std::collections::HashMap;
 
 use crate::{config::RequestConfig, utils::send_request};
@@ -29,8 +30,8 @@ pub fn run_request(config: &RequestConfig, vars: &HashMap<String, String>) -> Re
 
     if body_text.is_empty() {
         println!("{}", "(empty body)".dimmed());
-    } else if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body_text) {
-        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else if let Ok(colored) = body_text.to_colored_json_auto() {
+        println!("{}", colored);
     } else {
         println!("{}", body_text);
     }

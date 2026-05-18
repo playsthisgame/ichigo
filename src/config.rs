@@ -1,11 +1,22 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_yaml;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-pub const ICHIGO_DIR: &str = ".ichigo";
+pub fn local_dir() -> PathBuf {
+    PathBuf::from(".ichigo")
+}
+
+pub fn global_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".config").join("ichigo")
+}
+
+pub struct RequestEntry {
+    pub name: String,
+    pub global: bool,
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RequestConfig {
@@ -28,32 +39,68 @@ pub struct Body {
 
 impl RequestConfig {
     pub fn load(name: &str) -> Result<Self> {
-        let path = config_path(name);
+        let path = resolve_config_path(name)
+            .with_context(|| format!("Request '{}' not found", name))?;
         let content = fs::read_to_string(&path)
-            .with_context(|| format!("Request '{}' not found (looked in {})", name, path.display()))?;
+            .with_context(|| format!("Failed to read {}", path.display()))?;
         serde_yaml::from_str(&content)
             .with_context(|| format!("Invalid YAML in request config '{}'", name))
     }
 }
 
-pub fn config_path(name: &str) -> PathBuf {
-    PathBuf::from(ICHIGO_DIR).join(format!("{}.yaml", name))
+pub fn local_config_path(name: &str) -> PathBuf {
+    local_dir().join(format!("{}.yaml", name))
 }
 
-pub fn list_requests() -> Result<Vec<String>> {
-    let dir = PathBuf::from(ICHIGO_DIR);
-    if !dir.exists() {
-        return Ok(vec![]);
+pub fn global_config_path(name: &str) -> PathBuf {
+    global_dir().join(format!("{}.yaml", name))
+}
+
+pub fn resolve_config_path(name: &str) -> Option<PathBuf> {
+    let local = local_config_path(name);
+    if local.exists() {
+        return Some(local);
     }
-    let mut names = Vec::new();
-    for entry in fs::read_dir(&dir).context("Failed to read .ichigo directory")? {
-        let path = entry?.path();
-        if path.extension().map_or(false, |e| e == "yaml") {
-            if let Some(stem) = path.file_stem() {
-                names.push(stem.to_string_lossy().into_owned());
+    let global = global_config_path(name);
+    if global.exists() {
+        return Some(global);
+    }
+    None
+}
+
+pub fn list_requests() -> Result<Vec<RequestEntry>> {
+    let mut entries: Vec<RequestEntry> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let local = local_dir();
+    if local.exists() {
+        for entry in fs::read_dir(&local).context("Failed to read .ichigo directory")? {
+            let path = entry?.path();
+            if path.extension().map_or(false, |e| e == "yaml") {
+                if let Some(stem) = path.file_stem() {
+                    let name = stem.to_string_lossy().into_owned();
+                    seen.insert(name.clone());
+                    entries.push(RequestEntry { name, global: false });
+                }
             }
         }
     }
-    names.sort();
-    Ok(names)
+
+    let global = global_dir();
+    if global.exists() {
+        for entry in fs::read_dir(&global).context("Failed to read ~/.config/ichigo directory")? {
+            let path = entry?.path();
+            if path.extension().map_or(false, |e| e == "yaml") {
+                if let Some(stem) = path.file_stem() {
+                    let name = stem.to_string_lossy().into_owned();
+                    if !seen.contains(&name) {
+                        entries.push(RequestEntry { name, global: true });
+                    }
+                }
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
 }

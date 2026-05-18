@@ -6,14 +6,16 @@ use std::fs;
 
 mod config;
 mod runner;
-mod utils;
 mod tester;
+mod utils;
 
-use config::{config_path, list_requests, RequestConfig, ICHIGO_DIR};
+use config::{
+    global_config_path, list_requests, local_config_path, resolve_config_path, RequestConfig,
+};
 
 #[derive(Parser)]
 #[command(name = "ichigo")]
-#[command(about = "A CLI HTTP client — store requests in .ichigo/, run them on demand")]
+#[command(about = "A CLI HTTP client — store requests in .ichigo/ or ~/.config/ichigo/")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -24,7 +26,7 @@ struct Cli {
 enum Commands {
     /// Create a new request config
     New {
-        /// Name for the request (becomes .ichigo/<name>.yaml)
+        /// Name for the request
         name: String,
         /// HTTP method
         #[arg(short, long, default_value = "GET")]
@@ -32,6 +34,9 @@ enum Commands {
         /// Target URL
         #[arg(short, long)]
         url: Option<String>,
+        /// Save to ~/.config/ichigo/ instead of .ichigo/
+        #[arg(short, long)]
+        global: bool,
     },
     /// Execute a configured request
     Run {
@@ -63,30 +68,36 @@ enum Commands {
         /// Number of iterations to test
         #[arg(short = 'i', long = "iter")]
         iterations: usize,
-    }
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::New { name, method, url } => cmd_new(name, method, url),
+        Commands::New { name, method, url, global } => cmd_new(name, method, url, global),
         Commands::Run { name, vars } => cmd_run(name, vars),
         Commands::List => cmd_list(),
         Commands::Show { name } => cmd_show(name),
         Commands::Delete { name } => cmd_delete(name),
-        Commands::Test { name , vars, iterations} => cmd_test(name, vars, iterations),
+        Commands::Test { name, vars, iterations } => cmd_test(name, vars, iterations),
     }
 }
 
-fn cmd_new(name: String, method: String, url: Option<String>) -> Result<()> {
-    let path = config_path(&name);
+fn cmd_new(name: String, method: String, url: Option<String>, global: bool) -> Result<()> {
+    let path = if global {
+        global_config_path(&name)
+    } else {
+        local_config_path(&name)
+    };
+
     if path.exists() {
         anyhow::bail!("Request '{}' already exists at {}", name, path.display());
     }
 
-    let dir = std::path::PathBuf::from(ICHIGO_DIR);
+    let dir = path.parent().unwrap();
     if !dir.exists() {
-        fs::create_dir_all(&dir).context("Failed to create .ichigo directory")?;
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create directory {}", dir.display()))?;
     }
 
     let url = url.unwrap_or_else(|| "https://example.com".to_string());
@@ -117,12 +128,12 @@ fn build_template(name: &str, method: &str, url: &str) -> String {
     )
 }
 
-fn cmd_run(name: String, vars: Vec<String>) -> Result<()> {
-    let mut var_map = HashMap::new();
-    for var in &vars {
+fn parse_vars(vars: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for var in vars {
         match var.split_once('=') {
             Some((k, v)) => {
-                var_map.insert(k.to_string(), v.to_string());
+                map.insert(k.to_string(), v.to_string());
             }
             None => eprintln!(
                 "{} ignoring malformed var '{}' (expected KEY=VALUE)",
@@ -131,19 +142,28 @@ fn cmd_run(name: String, vars: Vec<String>) -> Result<()> {
             ),
         }
     }
+    map
+}
+
+fn cmd_run(name: String, vars: Vec<String>) -> Result<()> {
     let config = RequestConfig::load(&name)?;
-    runner::run_request(&config, &var_map)
+    runner::run_request(&config, &parse_vars(&vars))
 }
 
 fn cmd_list() -> Result<()> {
-    let requests = list_requests()?;
-    if requests.is_empty() {
+    let entries = list_requests()?;
+    if entries.is_empty() {
         println!("No requests found. Use `ichigo new <name>` to create one.");
         return Ok(());
     }
     println!("{}", "Requests:".bold());
-    for name in &requests {
-        match RequestConfig::load(name) {
+    for entry in &entries {
+        let scope = if entry.global {
+            " global".dimmed()
+        } else {
+            " local".dimmed()
+        };
+        match RequestConfig::load(&entry.name) {
             Ok(config) => {
                 let desc = config
                     .description
@@ -151,21 +171,23 @@ fn cmd_list() -> Result<()> {
                     .map(|s| format!(" — {}", s))
                     .unwrap_or_default();
                 println!(
-                    "  {:<7} {}{}",
+                    "  {:<7} {}{}{}",
                     config.method.cyan(),
-                    name.bold(),
+                    entry.name.bold(),
                     desc.dimmed(),
+                    scope,
                 );
                 println!("          {}", config.url.dimmed());
             }
-            Err(e) => println!("  {} ({})", name, e),
+            Err(e) => println!("  {} ({})", entry.name, e),
         }
     }
     Ok(())
 }
 
 fn cmd_show(name: String) -> Result<()> {
-    let path = config_path(&name);
+    let path = resolve_config_path(&name)
+        .with_context(|| format!("Request '{}' not found", name))?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("Request '{}' not found", name))?;
     print!("{}", content);
@@ -173,29 +195,14 @@ fn cmd_show(name: String) -> Result<()> {
 }
 
 fn cmd_delete(name: String) -> Result<()> {
-    let path = config_path(&name);
-    if !path.exists() {
-        anyhow::bail!("Request '{}' not found", name);
-    }
+    let path = resolve_config_path(&name)
+        .with_context(|| format!("Request '{}' not found", name))?;
     fs::remove_file(&path)?;
     println!("{} '{}'", "Deleted".green().bold(), name);
     Ok(())
 }
 
 fn cmd_test(name: String, vars: Vec<String>, iterations: usize) -> Result<()> {
-    let mut var_map = HashMap::new();
-    for var in &vars {
-        match var.split_once('=') {
-            Some((k, v)) => {
-                var_map.insert(k.to_string(), v.to_string());
-            }
-            None => eprintln!(
-                "{} ignoring malformed var '{}' (expected KEY=VALUE)",
-                "warning:".yellow(),
-                var
-            ),
-        }
-    }
     let config = RequestConfig::load(&name)?;
-    tester::run_tester(&config, &var_map, iterations)
+    tester::run_tester(&config, &parse_vars(&vars), iterations)
 }
