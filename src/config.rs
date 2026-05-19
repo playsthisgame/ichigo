@@ -29,12 +29,19 @@ pub struct RequestConfig {
     #[serde(default)]
     pub query: HashMap<String, String>,
     pub body: Option<Body>,
+    pub extract: Option<HashMap<String,String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Body {
     pub content_type: String,
     pub data: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ChainConfig {
+    pub name: String,
+    pub steps: Vec<RequestConfig>,
 }
 
 impl RequestConfig {
@@ -45,6 +52,17 @@ impl RequestConfig {
             .with_context(|| format!("Failed to read {}", path.display()))?;
         serde_yaml::from_str(&content)
             .with_context(|| format!("Invalid YAML in request config '{}'", name))
+    }
+}
+
+impl ChainConfig {
+    pub fn load(name: &str) -> Result<Self> {
+        let path = resolve_config_path(name)
+            .with_context(|| format!("Request '{}' not found", name))?;
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        serde_yaml::from_str(&content)
+            .with_context(|| format!("Invalid YAML in chain config '{}'", name))
     }
 }
 
