@@ -20,12 +20,13 @@ When a name exists in both, the local one wins.
 ## Commands
 
 ```
-ichigo new <name>        Create a new request config
-ichigo run <name>        Execute a request
-ichigo list              List all configs
-ichigo show <name>       Print a config file
-ichigo delete <name>     Delete a config
-ichigo test <name>       Run a load test
+ichigo new <name>              Create a new request config
+ichigo run <name>              Execute a request
+ichigo list                    List all configs
+ichigo show <name>             Print a config file
+ichigo delete <name>           Delete a config
+ichigo test <name>             Run a load test
+ichigo copy <name> <new-name>  Duplicate a config under a new name
 ```
 
 ### `new`
@@ -49,6 +50,20 @@ ichigo run create-user --var TOKEN=abc123 --var USER_ID=42
 ```
 
 Variables replace `{{PLACEHOLDER}}` tokens anywhere in the config (url, headers, query, body). They are resolved in this order: `--var` flags → environment variables.
+
+### `copy`
+
+Duplicates an existing config under a new name. Useful for creating variants of a request (e.g. a prod and dev version of the same endpoint).
+
+```sh
+ichigo copy telescope-prod telescope-dev
+ichigo copy telescope-prod telescope-staging --global
+```
+
+Flags:
+- `-g, --global` — look for the source in `~/.config/ichigo/` and save the copy there too
+
+Without `--global`, both the source and the copy are in `.ichigo/`. With `--global`, both are in `~/.config/ichigo/`. The copy command will error if the source does not exist or if a config with the new name already exists.
 
 ### `test`
 

@@ -74,6 +74,16 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
+    /// Makes a copy of an existing config with a new name
+    Copy {
+        /// Name of the request to copy
+        name: String,
+        /// Name of the new request
+        new_name: String,
+        /// Save to ~/.config/ichigo/ instead of .ichigo/
+        #[arg(short, long)]
+        global: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone)]
@@ -93,6 +103,7 @@ fn main() -> Result<()> {
         Commands::Delete { name } => cmd_delete(name),
         Commands::Test { name, vars, iterations } => cmd_test(name, vars, iterations),
         Commands::Completions { shell } => cmd_completions(shell),
+        Commands::Copy { name, new_name , global} => cmd_copy(name, new_name, global),
     }
 }
 
@@ -230,6 +241,52 @@ fn cmd_completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
+fn cmd_copy(name: String, new_name: String, global: bool) -> Result<()> {
+    // get the path of the existing config
+    let path = if global {
+        global_config_path(&name)
+    } else {
+        local_config_path(&name)
+    };
+
+    // if it doesn't exists then bail
+    if !path.exists() {
+        anyhow::bail!("Request '{}' does not exists at {}", name, path.display());
+    }
+
+    // get the path of the new config
+    let new_path = if global {
+        global_config_path(&new_name)
+    } else {
+        local_config_path(&new_name)
+    };
+
+    // if it already exists then bail
+    if new_path.exists() {
+        anyhow::bail!("Request '{}' already exists at {}", new_name, new_path.display());
+    }
+    // create the new path if it doesn't exist
+    let dir = new_path.parent().unwrap();
+    if !dir.exists() {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create directory {}", dir.display()))?;
+    }
+    
+    // load the config and update the name
+    let mut config = RequestConfig::load(&name)?;
+    config.name = new_name;
+    
+    // convert the config to a string
+    let content = serde_yaml::to_string(&config)?;
+
+    // write the contents to the new path
+    fs::write(&new_path, &content)?;
+
+    println!("{} {}", "Created".green().bold(), new_path.display());
+    Ok(())
+
+}
+
 const ZSH_COMPLETION: &str = r#"_ichigo_configs() {
     local -a configs
     local f
@@ -256,6 +313,7 @@ _ichigo() {
         'show:Print a request config'
         'delete:Delete a request config'
         'test:Run the configured tests'
+        'copy:Makes a copy of an existing config with a new name'
         'completions:Print a shell completion script'
     )
 
@@ -267,7 +325,7 @@ _ichigo() {
             ;;
         args)
             case $words[1] in
-                run|show|delete|test)
+                run|show|delete|test|copy)
                     _arguments '1: :_ichigo_configs'
                     ;;
                 completions)
@@ -286,7 +344,7 @@ const BASH_COMPLETION: &str = r#"_ichigo_completions() {
     local cmd="${COMP_WORDS[1]}"
 
     case "$cmd" in
-        run|show|delete|test)
+        run|show|delete|test|copy)
             local configs=()
             if [[ -d "$PWD/.ichigo" ]]; then
                 for f in "$PWD/.ichigo"/*.yaml; do
@@ -305,7 +363,7 @@ const BASH_COMPLETION: &str = r#"_ichigo_completions() {
             COMPREPLY=($(compgen -W "zsh bash fish" -- "$cur"))
             ;;
         *)
-            COMPREPLY=($(compgen -W "new run list show delete test completions" -- "$cur"))
+            COMPREPLY=($(compgen -W "new run list show delete test copy completions" -- "$cur"))
             ;;
     esac
 }
@@ -323,11 +381,11 @@ const FISH_COMPLETION: &str = r#"function __ichigo_configs
     end
 end
 
-set -l config_cmds run show delete test
+set -l config_cmds run show delete test copy
 
 complete -c ichigo -f
-complete -c ichigo -n "not __fish_seen_subcommand_from new run list show delete test completions" \
-    -a "new run list show delete test completions"
+complete -c ichigo -n "not __fish_seen_subcommand_from new run list show delete test copy completions" \
+    -a "new run list show delete test copy completions"
 complete -c ichigo -n "__fish_seen_subcommand_from $config_cmds" \
     -a "(__ichigo_configs)"
 complete -c ichigo -n "__fish_seen_subcommand_from completions" \
