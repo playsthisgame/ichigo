@@ -32,8 +32,8 @@ ichigo copy <name> <new-name>  Duplicate a config under a new name
 ### `new`
 
 ```sh
-ichigo new telescope-prod --method GET --url https://api.example.com/health
-ichigo new telescope-dev  --method GET --url https://localhost:8080/health
+ichigo new config-server-prod --method GET --url https://api.example.com/health
+ichigo new config-server-dev  --method GET --url https://localhost:8080/health
 ichigo new create-user    --method POST --url https://api.example.com/users
 ```
 
@@ -45,7 +45,7 @@ Flags:
 ### `run`
 
 ```sh
-ichigo run telescope-prod
+ichigo run config-server-prod
 ichigo run create-user --var TOKEN=abc123 --var USER_ID=42
 ```
 
@@ -56,8 +56,8 @@ Variables replace `{{PLACEHOLDER}}` tokens anywhere in the config (url, headers,
 Duplicates an existing config under a new name. Useful for creating variants of a request (e.g. a prod and dev version of the same endpoint).
 
 ```sh
-ichigo copy telescope-prod telescope-dev
-ichigo copy telescope-prod telescope-staging --global
+ichigo copy config-server-prod config-server-dev
+ichigo copy config-server-prod config-server-staging --global
 ```
 
 Flags:
@@ -70,7 +70,7 @@ Without `--global`, both the source and the copy are in `.ichigo/`. With `--glob
 Runs the request N times and reports status code counts and timing stats.
 
 ```sh
-ichigo test telescope-prod --iter 100
+ichigo test config-server-prod --iter 100
 ```
 
 ## Config format
@@ -101,8 +101,8 @@ body:
 ichigo can generate a completion script so that pressing `Tab` autocompletes config names:
 
 ```sh
-ichigo run tel<TAB>
-# → telescope-dev  telescope-prod
+ichigo run config<TAB>
+# → config-server-dev  config-server-prod
 ```
 
 The completions resolve config names live from `.ichigo/` and `~/.config/ichigo/`, so new configs appear automatically without any extra setup.
