@@ -13,6 +13,8 @@ use config::{
     global_config_path, list_requests, local_config_path, resolve_config_path, RequestConfig,
 };
 
+use crate::config::ChainConfig;
+
 #[derive(Parser)]
 #[command(name = "ichigo")]
 #[command(about = "A CLI HTTP client — store requests in .ichigo/ or ~/.config/ichigo/")]
@@ -45,6 +47,9 @@ enum Commands {
         /// Set a variable: KEY=VALUE (overrides env vars, supports {{KEY}} in config)
         #[arg(short = 'v', long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Print Verbose response
+        #[arg(long)]
+        verbose: bool,
     },
     /// List all configured requests
     List,
@@ -97,7 +102,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::New { name, method, url, global } => cmd_new(name, method, url, global),
-        Commands::Run { name, vars } => cmd_run(name, vars),
+        Commands::Run { name, vars , verbose } => cmd_run(name, vars, verbose),
         Commands::List => cmd_list(),
         Commands::Show { name } => cmd_show(name),
         Commands::Delete { name } => cmd_delete(name),
@@ -169,9 +174,30 @@ fn parse_vars(vars: &[String]) -> HashMap<String, String> {
     map
 }
 
-fn cmd_run(name: String, vars: Vec<String>) -> Result<()> {
-    let config = RequestConfig::load(&name)?;
-    runner::run_request(&config, &parse_vars(&vars))
+fn cmd_run(name: String, vars: Vec<String>, verbose: bool) -> Result<()> {
+    let path = resolve_config_path(&name)
+        .with_context(|| format!("Request '{}' not found", name))?;
+    let content = fs::read_to_string(&path)?;
+    if !content.contains("steps:") {
+        let config = RequestConfig::load(&name)?;
+        runner::run_request(&config, &parse_vars(&vars), verbose, false)?;
+        Ok(())
+    } else {
+        let config = ChainConfig::load(&name)?;
+
+        let mut current_vars = parse_vars(&vars);
+        let steps_len = config.steps.len();
+        for (i, step) in config.steps.iter().enumerate() {
+            let is_last = i == steps_len - 1;
+            if verbose {
+                println!("{} {}", "▸".cyan().bold(), step.name.bold());
+                println!();
+            }
+            let extracted = runner::run_request(&step, &current_vars, verbose, !is_last)?;
+            current_vars.extend(extracted);
+        }
+        Ok(())
+    }
 }
 
 fn cmd_list() -> Result<()> {

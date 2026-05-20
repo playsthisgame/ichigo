@@ -13,7 +13,7 @@ pub fn run_tester(config: &RequestConfig, vars: &HashMap<String,String>, iterati
 
     for _ in 0..iterations {
         let start = Instant::now();
-        let response = send_request(config, vars)?;
+        let response = send_request(config, vars,false)?;
         timings.push(start.elapsed());
         results.entry(response.status().as_u16()).or_insert_with(Vec::new).push(response);
     }

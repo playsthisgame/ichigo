@@ -19,7 +19,7 @@ When a name exists in both, the local one wins.
 
 ## Commands
 
-```
+```text
 ichigo new <name>              Create a new request config
 ichigo run <name>              Execute a request
 ichigo list                    List all configs
@@ -38,6 +38,7 @@ ichigo new create-user    --method POST --url https://api.example.com/users
 ```
 
 Flags:
+
 - `-m, --method` — HTTP method (default: `GET`)
 - `-u, --url` — target URL
 - `-g, --global` — save to `~/.config/ichigo/` instead of `.ichigo/`
@@ -51,6 +52,16 @@ ichigo run create-user --var TOKEN=abc123 --var USER_ID=42
 
 Variables replace `{{PLACEHOLDER}}` tokens anywhere in the config (url, headers, query, body). They are resolved in this order: `--var` flags → environment variables.
 
+### Chaining requests
+
+A chain config runs multiple requests in sequence, passing extracted values from one step into the next. Only the final step's response is printed; use `--verbose` to see all steps.
+
+```sh
+ichigo run login-and-fetch --verbose
+```
+
+Chain configs are detected automatically by the presence of a `steps:` key — no separate command needed.
+
 ### `copy`
 
 Duplicates an existing config under a new name. Useful for creating variants of a request (e.g. a prod and dev version of the same endpoint).
@@ -61,6 +72,7 @@ ichigo copy config-server-prod config-server-staging --global
 ```
 
 Flags:
+
 - `-g, --global` — look for the source in `~/.config/ichigo/` and save the copy there too
 
 Without `--global`, both the source and the copy are in `.ichigo/`. With `--global`, both are in `~/.config/ichigo/`. The copy command will error if the source does not exist or if a config with the new name already exists.
@@ -94,6 +106,33 @@ body:
     {
       "name": "{{USER_NAME}}"
     }
+```
+
+### Chain config format
+
+Use `steps:` instead of a top-level request. Each step is a full request config, and `extract:` maps variable names to JSON paths in the response. Extracted values are available as `{{VAR}}` in all subsequent steps.
+
+```yaml
+name: login-and-fetch
+steps:
+  - name: login
+    method: POST
+    url: https://api.example.com/auth/login
+    body:
+      content_type: application/json
+      data: |
+        {
+          "username": "{{USERNAME}}",
+          "password": "{{PASSWORD}}"
+        }
+    extract:
+      TOKEN: $.token
+
+  - name: fetch-profile
+    method: GET
+    url: https://api.example.com/me
+    headers:
+      Authorization: "Bearer {{TOKEN}}"
 ```
 
 ## Shell completions
