@@ -7,6 +7,7 @@ use std::fs;
 mod config;
 mod runner;
 mod tester;
+mod tui;
 mod utils;
 
 use config::{
@@ -79,6 +80,8 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
+    /// Open the interactive TUI
+    Tui,
     /// Makes a copy of an existing config with a new name
     Copy {
         /// Name of the request to copy
@@ -108,6 +111,7 @@ fn main() -> Result<()> {
         Commands::Delete { name } => cmd_delete(name),
         Commands::Test { name, vars, iterations } => cmd_test(name, vars, iterations),
         Commands::Completions { shell } => cmd_completions(shell),
+        Commands::Tui => tui::run(),
         Commands::Copy { name, new_name , global} => cmd_copy(name, new_name, global),
     }
 }
