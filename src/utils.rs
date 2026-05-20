@@ -2,10 +2,11 @@ use std::{collections::HashMap, env};
 
 use reqwest::blocking::{Client, Response};
 use anyhow::{Context, Result};
+use colored::Colorize;
 
 use crate::config::RequestConfig;
 
-pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>) -> Result<Response>{
+pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>, verbose: bool) -> Result<Response>{
     let url = interpolate(&config.url, vars);
     let method = config.method.to_uppercase();
 
@@ -36,11 +37,22 @@ pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>) -> R
         m => anyhow::bail!("Unsupported HTTP method: {}", m),
     };
 
+    if verbose {
+        println!("{} {}", method.as_str().magenta().bold(), url.bold());
+        for header in &headers {
+            println!("  {} {}", format!("{}:", header.0).dimmed(), header.1);
+        }
+        for q in &query {
+            println!("  {} {}", format!("?{}:", q.0).dimmed(), q.1);
+        }
+        println!();
+    }
+
     for (k, v) in &headers {
         req = req.header(k.as_str(), v.as_str());
     }
 
-    if !query.is_empty() {
+    if !&query.is_empty() {
         req = req.query(&query);
     }
 
