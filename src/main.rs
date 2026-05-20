@@ -175,10 +175,7 @@ fn parse_vars(vars: &[String]) -> HashMap<String, String> {
 }
 
 fn cmd_run(name: String, vars: Vec<String>, verbose: bool) -> Result<()> {
-    let path = resolve_config_path(&name)
-        .with_context(|| format!("Request '{}' not found", name))?;
-    let content = fs::read_to_string(&path)?;
-    if !content.contains("steps:") {
+    if !is_chain_request(&name)? {
         let config = RequestConfig::load(&name)?;
         runner::run_request(&config, &parse_vars(&vars), verbose, false)?;
         Ok(())
@@ -191,7 +188,6 @@ fn cmd_run(name: String, vars: Vec<String>, verbose: bool) -> Result<()> {
             let is_last = i == steps_len - 1;
             if verbose {
                 println!("{} {}", "▸".cyan().bold(), step.name.bold());
-                println!();
             }
             let extracted = runner::run_request(&step, &current_vars, verbose, !is_last)?;
             current_vars.extend(extracted);
@@ -199,6 +195,7 @@ fn cmd_run(name: String, vars: Vec<String>, verbose: bool) -> Result<()> {
         Ok(())
     }
 }
+
 
 fn cmd_list() -> Result<()> {
     let entries = list_requests()?;
@@ -213,6 +210,10 @@ fn cmd_list() -> Result<()> {
         } else {
             " local".dimmed()
         };
+        if is_chain_request(&entry.name).unwrap_or(false) {
+            println!("  {:<7} {}{}", "CHAIN".magenta(), entry.name.bold(), scope);
+            continue;
+        }
         match RequestConfig::load(&entry.name) {
             Ok(config) => {
                 let desc = config
@@ -253,6 +254,9 @@ fn cmd_delete(name: String) -> Result<()> {
 }
 
 fn cmd_test(name: String, vars: Vec<String>, iterations: usize) -> Result<()> {
+    if is_chain_request(&name).unwrap_or(false) {
+        anyhow::bail!("'{}' is a chain config — testing chains is not supported", name);
+    }
     let config = RequestConfig::load(&name)?;
     tester::run_tester(&config, &parse_vars(&vars), iterations)
 }
@@ -298,19 +302,25 @@ fn cmd_copy(name: String, new_name: String, global: bool) -> Result<()> {
             .with_context(|| format!("Failed to create directory {}", dir.display()))?;
     }
     
-    // load the config and update the name
-    let mut config = RequestConfig::load(&name)?;
-    config.name = new_name;
-    
-    // convert the config to a string
-    let content = serde_yaml::to_string(&config)?;
-
-    // write the contents to the new path
-    fs::write(&new_path, &content)?;
+    if is_chain_request(&name).unwrap_or(false) {
+        fs::copy(&path, &new_path)?;
+    } else {
+        let mut config = RequestConfig::load(&name)?;
+        config.name = new_name;
+        let content = serde_yaml::to_string(&config)?;
+        fs::write(&new_path, &content)?;
+    }
 
     println!("{} {}", "Created".green().bold(), new_path.display());
     Ok(())
 
+}
+
+fn is_chain_request(name: &String) -> Result<bool> {
+    let path = resolve_config_path(&name)
+        .with_context(|| format!("Request '{}' not found", name))?;
+    let content = fs::read_to_string(&path)?;
+    Ok(content.contains("steps:"))
 }
 
 const ZSH_COMPLETION: &str = r#"_ichigo_configs() {
