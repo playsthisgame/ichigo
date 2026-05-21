@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph, Sparkline},
     Frame, Terminal,
 };
 use std::{collections::HashMap, fs, io};
@@ -75,10 +75,19 @@ enum Mode {
         vars: Vec<(String, String)>, // (placeholder name, value being typed)
         focused: usize,              // which field the cursor is in
     },
+    TestInput {
+        entry_name: String,
+        vars: Vec<(String, String)>,
+        iterations: String,
+        focused: usize, // 0..vars.len() = var fields, vars.len() = iterations field
+    },
     Response {
         status: u16,
         body: String,
         scroll: u16,
+    },
+    TestResponse {
+        results: crate::tester::TestResults,
     },
 }
 
@@ -174,6 +183,49 @@ impl App {
         }
     }
 
+    fn try_test_selected(&mut self) {
+        let Some(idx) = self.list_state.selected() else { return };
+        let entry = &self.entries[idx];
+
+        let entry_name = entry.name.clone();
+        let is_chain = matches!(&entry.kind, EntryKind::Chain { .. });
+
+        if is_chain {
+            self.mode = Mode::Response {
+                status: 0,
+                body: "Testing chains is not supported.".to_string(),
+                scroll: 0,
+            };
+            return;
+        }
+
+        let var_names = match &entry.kind {
+            EntryKind::Request { url, headers, query, body_data, .. } => {
+                extract_var_names(url, headers, query, body_data.as_deref())
+            }
+            _ => vec![],
+        };
+
+        let vars: Vec<(String, String)> = var_names
+            .into_iter()
+            .map(|name| {
+                let value = std::env::var(&name).unwrap_or_default();
+                (name, value)
+            })
+            .collect();
+
+        self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
+    }
+
+    fn execute_test(&mut self, entry_name: &str, vars: &HashMap<String, String>, iterations: usize) {
+        match RequestConfig::load(entry_name)
+            .and_then(|config| crate::tester::collect_test_results(&config, vars, iterations))
+        {
+            Ok(results) => self.mode = Mode::TestResponse { results },
+            Err(e) => self.mode = Mode::Response { status: 0, body: format!("Error: {e}"), scroll: 0 },
+        }
+    }
+
     fn execute_request(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
         let result = RequestConfig::load(entry_name)
             .and_then(|config| crate::utils::send_request(&config, vars, false));
@@ -197,13 +249,14 @@ impl App {
 
     // Returns true when the event loop should exit.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
-        // matches! only borrows self.mode for the boolean check; the borrow
-        // ends before the method call, so &mut self is free to use.
         if matches!(self.mode, Mode::Browse) {
             return self.handle_key_browse(key.code);
         }
         if matches!(self.mode, Mode::VarInput { .. }) {
             return self.handle_key_var_input(key);
+        }
+        if matches!(self.mode, Mode::TestInput { .. }) {
+            return self.handle_key_test_input(key);
         }
         self.handle_key_response(key.code)
     }
@@ -224,6 +277,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') | KeyCode::Enter => self.try_run_selected(),
+            KeyCode::Char('t') => self.try_test_selected(),
             _ => {}
         }
         false
@@ -273,6 +327,57 @@ impl App {
         false
     }
 
+    fn handle_key_test_input(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Enter => {
+                let (entry_name, var_map, iterations) = match &self.mode {
+                    Mode::TestInput { entry_name, vars, iterations, .. } => (
+                        entry_name.clone(),
+                        vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>(),
+                        iterations.parse::<usize>().unwrap_or(10),
+                    ),
+                    _ => return false,
+                };
+                self.execute_test(&entry_name, &var_map, iterations);
+            }
+            KeyCode::Tab => {
+                if let Mode::TestInput { vars, focused, .. } = &mut self.mode {
+                    let len = vars.len() + 1;
+                    *focused = (*focused + 1) % len;
+                }
+            }
+            KeyCode::BackTab => {
+                if let Mode::TestInput { vars, focused, .. } = &mut self.mode {
+                    let len = vars.len() + 1;
+                    *focused = focused.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Mode::TestInput { vars, focused, iterations, .. } = &mut self.mode {
+                    if *focused < vars.len() {
+                        vars[*focused].1.push(c);
+                    } else if c.is_ascii_digit() {
+                        iterations.push(c);
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Mode::TestInput { vars, focused, iterations, .. } = &mut self.mode {
+                    if *focused < vars.len() {
+                        vars[*focused].1.pop();
+                    } else {
+                        iterations.pop();
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
     fn handle_key_response(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('q') => return true,
@@ -288,6 +393,14 @@ impl App {
                 if let Mode::Response { scroll, .. } = &mut self.mode {
                     *scroll = scroll.saturating_sub(1);
                 }
+            }
+            KeyCode::Char('c') => {
+                let text = match &self.mode {
+                    Mode::Response { body, .. } => body.clone(),
+                    Mode::TestResponse { results } => format_test_results_text(results),
+                    _ => return false,
+                };
+                copy_to_clipboard(&text);
             }
             _ => {}
         }
@@ -357,8 +470,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Mode::VarInput { vars, focused, entry_name } => {
             draw_var_input(frame, panes[1], vars, *focused, entry_name);
         }
+        Mode::TestInput { vars, focused, iterations, entry_name } => {
+            draw_test_input(frame, panes[1], vars, iterations, *focused, entry_name);
+        }
         Mode::Response { status, body, scroll } => {
             draw_response(frame, panes[1], *status, body, *scroll);
+        }
+        Mode::TestResponse { results } => {
+            draw_test_results(frame, panes[1], results);
         }
     }
 
@@ -437,6 +556,139 @@ fn draw_var_input(
     frame.render_widget(paragraph, area);
 }
 
+fn draw_test_input(
+    frame: &mut Frame,
+    area: Rect,
+    vars: &[(String, String)],
+    iterations: &str,
+    focused: usize,
+    entry_name: &str,
+) {
+    let title = format!(" Test — {} ", entry_name);
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+
+    for (i, (name, value)) in vars.iter().enumerate() {
+        let is_focused = i == focused;
+        lines.push(Line::from(Span::styled(
+            format!("  {}", name),
+            Style::default()
+                .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )));
+        let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
+        let display = if is_focused { format!("{}█", value) } else { value.clone() };
+        let input = Span::styled(
+            display,
+            Style::default().fg(if is_focused { Color::White } else { Color::DarkGray }),
+        );
+        lines.push(Line::from(vec![prompt, input]));
+        lines.push(Line::raw(""));
+    }
+
+    let iter_focused = focused == vars.len();
+    lines.push(Line::from(Span::styled(
+        "  iterations",
+        Style::default()
+            .fg(if iter_focused { Color::Yellow } else { Color::DarkGray })
+            .add_modifier(Modifier::BOLD),
+    )));
+    let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
+    let display = if iter_focused { format!("{}█", iterations) } else { iterations.to_string() };
+    let input = Span::styled(
+        display,
+        Style::default().fg(if iter_focused { Color::White } else { Color::DarkGray }),
+    );
+    lines.push(Line::from(vec![prompt, input]));
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::TestResults) {
+    let iterations = results.timings.len();
+    let title = Line::from(vec![
+        Span::raw(" Test Results "),
+        Span::styled(
+            format!(" {} iterations ", iterations),
+            Style::default().fg(Color::Black).bg(Color::Cyan),
+        ),
+    ]);
+
+    let outer = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3), Constraint::Length(5)])
+        .split(inner);
+
+    // Status distribution bar chart
+    let max_count = results.statuses.iter().map(|s| s.count as u64).max().unwrap_or(1);
+    let bars: Vec<Bar> = results
+        .statuses
+        .iter()
+        .map(|sc| {
+            let color = status_color(sc.status);
+            Bar::default()
+                .value(sc.count as u64)
+                .label(Line::from(sc.status.to_string()))
+                .style(Style::default().fg(color))
+                .value_style(Style::default().fg(Color::Black).bg(color))
+        })
+        .collect();
+    let bar_chart = BarChart::default()
+        .block(
+            Block::default()
+                .title(" Status Distribution ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .data(BarGroup::default().bars(&bars))
+        .bar_width(7)
+        .bar_gap(2)
+        .max(max_count);
+    frame.render_widget(bar_chart, chunks[0]);
+
+    // Timing stats
+    let stats = Paragraph::new(Line::from(vec![
+        Span::styled("  avg ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.2?}", results.avg), Style::default().fg(Color::Yellow)),
+        Span::styled("   min ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.2?}", results.min), Style::default().fg(Color::Green)),
+        Span::styled("   max ", Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:.2?}", results.max), Style::default().fg(Color::Red)),
+    ]));
+    frame.render_widget(stats, chunks[1]);
+
+    // Per-iteration latency sparkline
+    let sparkline = Sparkline::default()
+        .block(
+            Block::default()
+                .title(" Latency (ms) ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .data(results.timings.iter().copied().collect::<Vec<u64>>())
+        .style(Style::default().fg(Color::Cyan));
+    frame.render_widget(sparkline, chunks[2]);
+}
+
+fn status_color(status: u16) -> Color {
+    if status < 300 { Color::Green }
+    else if status < 400 { Color::Cyan }
+    else if status < 500 { Color::Yellow }
+    else { Color::Red }
+}
+
 fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll: u16) {
     let (status_color, status_label) = if status == 0 {
         (Color::Red, " Error ".to_string())
@@ -455,8 +707,7 @@ fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll:
         Span::styled(status_label, Style::default().fg(Color::Black).bg(status_color)),
     ]);
 
-    let lines: Vec<Line<'static>> =
-        body.lines().map(|l| Line::raw(l.to_owned())).collect();
+    let lines: Vec<Line<'static>> = body.lines().map(colorize_json_line).collect();
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -483,6 +734,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("bottom", Style::default().fg(Color::DarkGray)),
             Span::styled("   r/Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("run", Style::default().fg(Color::DarkGray)),
+            Span::styled("   t ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("test", Style::default().fg(Color::DarkGray)),
         ],
         Mode::VarInput { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -492,9 +745,19 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
-        Mode::Response { .. } => vec![
+        Mode::TestInput { .. } => vec![
+            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("run test", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("switch field", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
+        Mode::Response { .. } | Mode::TestResponse { .. } => vec![
             Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("scroll", Style::default().fg(Color::DarkGray)),
+            Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("copy", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("back", Style::default().fg(Color::DarkGray)),
             Span::styled("   q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -505,6 +768,72 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+fn colorize_json_value(val: &str) -> Vec<Span<'static>> {
+    let (content, trailing) = val.strip_suffix(',').map_or((val, ""), |s| (s, ","));
+
+    let color = if content.starts_with('"') {
+        Color::Green
+    } else if matches!(content, "true" | "false") {
+        Color::Magenta
+    } else if content == "null" {
+        Color::Red
+    } else if matches!(content, "{" | "}" | "[" | "]" | "{}" | "[]") {
+        Color::DarkGray
+    } else {
+        Color::Cyan // numbers
+    };
+
+    let mut spans = vec![Span::styled(content.to_string(), Style::default().fg(color))];
+    if !trailing.is_empty() {
+        spans.push(Span::styled(",".to_string(), Style::default().fg(Color::DarkGray)));
+    }
+    spans
+}
+
+fn colorize_json_line(line: &str) -> Line<'static> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = line[..indent_len].to_string();
+    let trimmed = &line[indent_len..];
+
+    if matches!(trimmed, "{" | "}" | "[" | "]" | "}," | "]," | "{}" | "[]" | "{}," | "[],") {
+        return Line::from(vec![
+            Span::raw(indent),
+            Span::styled(trimmed.to_string(), Style::default().fg(Color::DarkGray)),
+        ]);
+    }
+
+    // Key-value line: "key": value
+    if trimmed.starts_with('"') {
+        if let Some(pos) = trimmed.find("\": ") {
+            let key = trimmed[..pos + 1].to_string(); // includes closing "
+            let value = &trimmed[pos + 3..];          // skip ": "
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled(key, Style::default().fg(Color::Yellow)),
+                Span::styled(": ".to_string(), Style::default().fg(Color::DarkGray)),
+            ];
+            spans.extend(colorize_json_value(value));
+            return Line::from(spans);
+        }
+    }
+
+    // Array value or plain text
+    let mut spans = vec![Span::raw(indent)];
+    spans.extend(colorize_json_value(trimmed));
+    Line::from(spans)
+}
+
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
 
 fn method_color(method: &str) -> Color {
     match method {
@@ -547,6 +876,24 @@ fn extract_var_names(
     }
 
     names
+}
+
+fn format_test_results_text(results: &crate::tester::TestResults) -> String {
+    let mut lines = vec!["Results".to_string(), "".to_string()];
+    for sc in &results.statuses {
+        let reason = reqwest::StatusCode::from_u16(sc.status)
+            .ok()
+            .and_then(|s| s.canonical_reason())
+            .unwrap_or("Unknown");
+        lines.push(format!("  {} {}  x {}", sc.status, reason, sc.count));
+    }
+    lines.push("".to_string());
+    lines.push("Timings".to_string());
+    lines.push("".to_string());
+    lines.push(format!("  avg:  {:.2?}", results.avg));
+    lines.push(format!("  min:  {:.2?}", results.min));
+    lines.push(format!("  max:  {:.2?}", results.max));
+    lines.join("\n")
 }
 
 fn make_list_item(entry: &Entry) -> ListItem<'static> {
