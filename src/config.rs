@@ -30,6 +30,7 @@ pub struct RequestConfig {
     pub query: HashMap<String, String>,
     pub body: Option<Body>,
     pub extract: Option<HashMap<String,String>>,
+    pub profiles: Option<Vec<Profile>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -42,6 +43,12 @@ pub struct Body {
 pub struct ChainConfig {
     pub name: String,
     pub steps: Vec<RequestConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct Profile {
+    pub name: String,
+    pub params: HashMap<String,String>,
 }
 
 impl RequestConfig {

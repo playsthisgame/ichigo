@@ -51,6 +51,8 @@ enum Commands {
         /// Print Verbose response
         #[arg(long)]
         verbose: bool,
+        #[arg(short = 'p', long = "profile")]
+        profile: Option<String>,
     },
     /// List all configured requests
     List,
@@ -74,6 +76,8 @@ enum Commands {
         /// Number of iterations to test
         #[arg(short = 'i', long = "iter")]
         iterations: usize,
+        #[arg(short = 'p', long = "profile")]
+        profile: Option<String>,
     },
     /// Print a shell completion script to stdout
     Completions {
@@ -105,11 +109,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::New { name, method, url, global } => cmd_new(name, method, url, global),
-        Commands::Run { name, vars , verbose } => cmd_run(name, vars, verbose),
+        Commands::Run { name, vars , verbose, profile } => cmd_run(name, vars, verbose, profile),
         Commands::List => cmd_list(),
         Commands::Show { name } => cmd_show(name),
         Commands::Delete { name } => cmd_delete(name),
-        Commands::Test { name, vars, iterations } => cmd_test(name, vars, iterations),
+        Commands::Test { name, vars, iterations, profile } => cmd_test(name, vars, iterations, profile),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Tui => tui::run(),
         Commands::Copy { name, new_name , global} => cmd_copy(name, new_name, global),
@@ -178,10 +182,11 @@ fn parse_vars(vars: &[String]) -> HashMap<String, String> {
     map
 }
 
-fn cmd_run(name: String, vars: Vec<String>, verbose: bool) -> Result<()> {
+fn cmd_run(name: String, vars: Vec<String>, verbose: bool, profile: Option<String>) -> Result<()> {
     if !is_chain_request(&name)? {
         let config = RequestConfig::load(&name)?;
-        runner::run_request(&config, &parse_vars(&vars), verbose, false)?;
+        let mut vars_map = parse_vars(&vars);
+        runner::run_request(&config, &mut vars_map, verbose, false, profile)?;
         Ok(())
     } else {
         let config = ChainConfig::load(&name)?;
@@ -193,7 +198,7 @@ fn cmd_run(name: String, vars: Vec<String>, verbose: bool) -> Result<()> {
             if verbose {
                 println!("{} {}", "▸".cyan().bold(), step.name.bold());
             }
-            let extracted = runner::run_request(&step, &current_vars, verbose, !is_last)?;
+            let extracted = runner::run_request(&step, &mut current_vars, verbose, !is_last, None)?;
             current_vars.extend(extracted);
         }
         Ok(())
@@ -257,12 +262,12 @@ fn cmd_delete(name: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_test(name: String, vars: Vec<String>, iterations: usize) -> Result<()> {
+fn cmd_test(name: String, vars: Vec<String>, iterations: usize, profile: Option<String>) -> Result<()> {
     if is_chain_request(&name).unwrap_or(false) {
         anyhow::bail!("'{}' is a chain config — testing chains is not supported", name);
     }
     let config = RequestConfig::load(&name)?;
-    tester::run_tester(&config, &parse_vars(&vars), iterations)
+    tester::run_tester(&config, &mut parse_vars(&vars), iterations, profile)
 }
 
 fn cmd_completions(shell: Shell) -> Result<()> {

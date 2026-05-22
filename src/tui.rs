@@ -26,6 +26,7 @@ enum EntryKind {
         headers: HashMap<String, String>,
         query: HashMap<String, String>,
         body_data: Option<String>,
+        profiles: Vec<crate::config::Profile>,
     },
     Chain {
         steps: Vec<String>,
@@ -59,6 +60,7 @@ fn load_entries() -> Result<Vec<Entry>> {
                 headers: config.headers,
                 query: config.query,
                 body_data: config.body.map(|b| b.data),
+                profiles: config.profiles.unwrap_or_default(),
             }
         };
         entries.push(Entry { name: r.name, global: r.global, kind });
@@ -70,6 +72,12 @@ fn load_entries() -> Result<Vec<Entry>> {
 
 enum Mode {
     Browse,
+    ProfileSelect {
+        entry_name: String,
+        profiles: Vec<crate::config::Profile>,
+        selected: usize, // 0 = no profile, 1..=n = profiles[selected-1]
+        for_test: bool,
+    },
     VarInput {
         entry_name: String,
         vars: Vec<(String, String)>, // (placeholder name, value being typed)
@@ -148,13 +156,11 @@ impl App {
         let Some(idx) = self.list_state.selected() else { return };
         let entry = &self.entries[idx];
 
-        // Clone everything we need before mutating self.mode.
-        // With NLL, the borrow of `entry` ends after this block.
         let entry_name = entry.name.clone();
-        let (var_names, is_chain) = match &entry.kind {
-            EntryKind::Chain { .. } => (vec![], true),
-            EntryKind::Request { url, headers, query, body_data, .. } => {
-                (extract_var_names(url, headers, query, body_data.as_deref()), false)
+        let (var_names, is_chain, profiles) = match &entry.kind {
+            EntryKind::Chain { .. } => (vec![], true, vec![]),
+            EntryKind::Request { url, headers, query, body_data, profiles, .. } => {
+                (extract_var_names(url, headers, query, body_data.as_deref()), false, profiles.clone())
             }
         };
 
@@ -167,7 +173,11 @@ impl App {
             return;
         }
 
-        // Pre-fill any var that's already set in the environment.
+        if !profiles.is_empty() {
+            self.mode = Mode::ProfileSelect { entry_name, profiles, selected: 0, for_test: false };
+            return;
+        }
+
         let vars: Vec<(String, String)> = var_names
             .into_iter()
             .map(|name| {
@@ -199,12 +209,17 @@ impl App {
             return;
         }
 
-        let var_names = match &entry.kind {
-            EntryKind::Request { url, headers, query, body_data, .. } => {
-                extract_var_names(url, headers, query, body_data.as_deref())
+        let (var_names, profiles) = match &entry.kind {
+            EntryKind::Request { url, headers, query, body_data, profiles, .. } => {
+                (extract_var_names(url, headers, query, body_data.as_deref()), profiles.clone())
             }
-            _ => vec![],
+            _ => (vec![], vec![]),
         };
+
+        if !profiles.is_empty() {
+            self.mode = Mode::ProfileSelect { entry_name, profiles, selected: 0, for_test: true };
+            return;
+        }
 
         let vars: Vec<(String, String)> = var_names
             .into_iter()
@@ -215,6 +230,52 @@ impl App {
             .collect();
 
         self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
+    }
+
+    fn confirm_profile_select(&mut self) {
+        let (entry_name, profile_params, for_test) = match &self.mode {
+            Mode::ProfileSelect { entry_name, profiles, selected, for_test } => {
+                let params: HashMap<String, String> = if *selected == 0 {
+                    HashMap::new()
+                } else {
+                    profiles[*selected - 1].params.clone()
+                };
+                (entry_name.clone(), params, *for_test)
+            }
+            _ => return,
+        };
+
+        let (var_names, all_covered) = {
+            let entry = self.entries.iter().find(|e| e.name == entry_name);
+            match entry.map(|e| &e.kind) {
+                Some(EntryKind::Request { url, headers, query, body_data, .. }) => {
+                    let names = extract_var_names(url, headers, query, body_data.as_deref());
+                    let covered = names.iter().all(|n| profile_params.contains_key(n));
+                    (names, covered)
+                }
+                _ => (vec![], true),
+            }
+        };
+
+        let vars: Vec<(String, String)> = var_names
+            .into_iter()
+            .map(|name| {
+                let value = profile_params.get(&name)
+                    .cloned()
+                    .or_else(|| std::env::var(&name).ok())
+                    .unwrap_or_default();
+                (name, value)
+            })
+            .collect();
+
+        if for_test {
+            self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
+        } else if all_covered && vars.iter().all(|(_, v)| !v.is_empty()) {
+            let var_map = vars.into_iter().collect();
+            self.execute_request(&entry_name, &var_map);
+        } else {
+            self.mode = Mode::VarInput { entry_name, vars, focused: 0 };
+        }
     }
 
     fn execute_test(&mut self, entry_name: &str, vars: &HashMap<String, String>, iterations: usize) {
@@ -252,6 +313,9 @@ impl App {
         if matches!(self.mode, Mode::Browse) {
             return self.handle_key_browse(key.code);
         }
+        if matches!(self.mode, Mode::ProfileSelect { .. }) {
+            return self.handle_key_profile_select(key.code);
+        }
         if matches!(self.mode, Mode::VarInput { .. }) {
             return self.handle_key_var_input(key);
         }
@@ -259,6 +323,29 @@ impl App {
             return self.handle_key_test_input(key);
         }
         self.handle_key_response(key.code)
+    }
+
+    fn handle_key_profile_select(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Mode::ProfileSelect { profiles, selected, .. } = &mut self.mode {
+                    *selected = (*selected + 1).min(profiles.len());
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Mode::ProfileSelect { selected, .. } = &mut self.mode {
+                    *selected = selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                self.confirm_profile_select();
+            }
+            _ => {}
+        }
+        false
     }
 
     fn handle_key_browse(&mut self, code: KeyCode) -> bool {
@@ -467,6 +554,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
             let selected = app.list_state.selected().map(|i| &app.entries[i]);
             draw_detail_browse(frame, panes[1], selected);
         }
+        Mode::ProfileSelect { profiles, selected, entry_name, .. } => {
+            draw_profile_select(frame, panes[1], profiles, *selected, entry_name);
+        }
         Mode::VarInput { vars, focused, entry_name } => {
             draw_var_input(frame, panes[1], vars, *focused, entry_name);
         }
@@ -512,6 +602,54 @@ fn draw_detail_browse(frame: &mut Frame, area: Rect, selected: Option<&Entry>) {
             .title(" Details ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Blue)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_profile_select(
+    frame: &mut Frame,
+    area: Rect,
+    profiles: &[crate::config::Profile],
+    selected: usize,
+    entry_name: &str,
+) {
+    let title = format!(" Profile — {} ", entry_name);
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+
+    let is_none_selected = selected == 0;
+    let none_style = if is_none_selected {
+        Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    lines.push(Line::from(Span::styled("  (no profile)", none_style)));
+    lines.push(Line::raw(""));
+
+    for (i, profile) in profiles.iter().enumerate() {
+        let is_selected = selected == i + 1;
+        let name_style = if is_selected {
+            Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}", profile.name),
+            name_style,
+        )));
+        for (k, v) in &profile.params {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}: ", k), Style::default().fg(Color::DarkGray)),
+                Span::styled(v.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -736,6 +874,14 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("run", Style::default().fg(Color::DarkGray)),
             Span::styled("   t ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("test", Style::default().fg(Color::DarkGray)),
+        ],
+        Mode::ProfileSelect { .. } => vec![
+            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("select", Style::default().fg(Color::DarkGray)),
+            Span::styled("   j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("navigate", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
         Mode::VarInput { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),

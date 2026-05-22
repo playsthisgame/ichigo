@@ -71,9 +71,17 @@ fn ascii_sparkline(timings: &[u64]) -> String {
 
 pub fn run_tester(
     config: &RequestConfig,
-    vars: &HashMap<String, String>,
+    vars: &mut HashMap<String, String>,
     iterations: usize,
+    profile: Option<String>,
 ) -> Result<()> {
+    if let Some(ref profile_name) = profile {
+        if let Some(profiles) = &config.profiles {
+            if let Some(found) = profiles.iter().find(|p| p.name.eq_ignore_ascii_case(profile_name)) {
+                vars.extend(found.params.clone());
+            }
+        }
+    }
     let results = collect_test_results(config, vars, iterations)?;
     let max_count = results.statuses.iter().map(|s| s.count).max().unwrap_or(1);
 
