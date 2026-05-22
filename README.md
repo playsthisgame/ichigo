@@ -52,6 +52,12 @@ ichigo run create-user --var TOKEN=abc123 --var USER_ID=42
 
 Variables replace `{{PLACEHOLDER}}` tokens anywhere in the config (url, headers, query, body). They are resolved in this order: `--var` flags → environment variables.
 
+Flags:
+
+- `-v, --var KEY=VALUE` — set a variable
+- `--verbose` — print the full response (status, headers, body)
+- `-p, --profile` — use a named profile (see [Profiles](#profiles))
+
 ### Chaining requests
 
 A chain config runs multiple requests in sequence, passing extracted values from one step into the next. Only the final step's response is printed; use `--verbose` to see all steps.
@@ -83,7 +89,35 @@ Runs the request N times and reports status code counts and timing stats.
 
 ```sh
 ichigo test config-server-prod --iter 100
+ichigo test create-user --iter 50 --profile staging
 ```
+
+Flags:
+
+- `-v, --var KEY=VALUE` — set a variable
+- `-i, --iter` — number of iterations
+- `-p, --profile` — use a named profile
+
+### `tui`
+
+Opens an interactive terminal UI for browsing, running, and load-testing your configs.
+
+```sh
+ichigo tui
+```
+
+Keybindings:
+
+| Key | Action |
+| --- | ------ |
+| `j` / `k` | Navigate list |
+| `gg` / `G` | Jump to top / bottom |
+| `r` / Enter | Run selected request |
+| `t` | Load-test selected request |
+| `q` | Quit |
+| Esc | Go back |
+
+If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
 
 ## Config format
 
@@ -134,6 +168,44 @@ steps:
     headers:
       Authorization: "Bearer {{TOKEN}}"
 ```
+
+### Profiles
+
+Profiles let you bundle a set of variable values under a name, so you can switch between environments (e.g. dev vs staging vs prod) without retyping vars each time.
+
+```yaml
+name: create-user
+method: POST
+url: https://{{HOST}}/users
+headers:
+  Authorization: "Bearer {{TOKEN}}"
+body:
+  content_type: application/json
+  data: |
+    {
+      "name": "{{USER_NAME}}"
+    }
+
+profiles:
+  - name: dev
+    params:
+      HOST: localhost:8080
+      TOKEN: dev-token-123
+
+  - name: staging
+    params:
+      HOST: staging.example.com
+      TOKEN: stg-token-456
+```
+
+Run with a profile from the CLI:
+
+```sh
+ichigo run create-user --profile dev
+ichigo test create-user --iter 50 --profile staging
+```
+
+Any `{{PLACEHOLDER}}` not covered by the chosen profile is still resolved from `--var` flags or environment variables as normal. In the TUI, a profile picker appears automatically when profiles are present — pick one (or skip) and fill in any remaining variables interactively.
 
 ## Shell completions
 
