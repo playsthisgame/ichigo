@@ -47,26 +47,45 @@ pub fn collect_test_results(
     Ok(TestResults { statuses, avg, min, max, timings })
 }
 
-fn ascii_bar(count: usize, max_count: usize) -> String {
-    let width = (count * 30 / max_count).max(1);
-    "█".repeat(width)
+fn ascii_bar(count: usize, max_count: usize) -> (String, String) {
+    let filled = (count * 30 / max_count).max(1);
+    ("█".repeat(filled), "░".repeat(30 - filled))
 }
 
-fn ascii_sparkline(timings: &[u64]) -> String {
-    const CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+fn print_ascii_line_graph(timings: &[u64]) {
     if timings.is_empty() {
-        return String::new();
+        return;
     }
-    let min = *timings.iter().min().unwrap();
-    let max = *timings.iter().max().unwrap();
-    let range = (max - min).max(1);
-    timings
-        .iter()
-        .map(|&t| {
-            let idx = ((t - min) * 7 / range) as usize;
-            CHARS[idx.min(7)]
-        })
-        .collect()
+
+    const H: usize = 8;
+    const W: usize = 60;
+
+    let min_ms = *timings.iter().min().unwrap();
+    let max_ms = *timings.iter().max().unwrap();
+    let range = (max_ms - min_ms).max(1);
+    let n = timings.len();
+
+    let mut grid: Vec<Vec<bool>> = vec![vec![false; W]; H];
+    for col in 0..W {
+        let idx = (col * n / W).min(n - 1);
+        let ms = timings[idx];
+        let row = H - 1 - ((ms - min_ms) as usize * (H - 1) / range as usize);
+        grid[row][col] = true;
+    }
+
+    let label_w = format!("{}ms", max_ms).len().max(5);
+
+    for (r, row) in grid.iter().enumerate() {
+        let ms_val = max_ms.saturating_sub(r as u64 * range / (H as u64 - 1));
+        let label = if r == 0 || r == H / 2 || r == H - 1 {
+            format!("{:>label_w$}", format!("{}ms", ms_val))
+        } else {
+            " ".repeat(label_w)
+        };
+        let dots: String = row.iter().map(|&d| if d { '•' } else { ' ' }).collect();
+        println!("  {} {} {}", label.dimmed(), "│".dimmed(), dots.cyan());
+    }
+    println!("  {} {}", " ".repeat(label_w), format!("└{}", "─".repeat(W + 1)).dimmed());
 }
 
 pub fn run_tester(
@@ -91,15 +110,14 @@ pub fn run_tester(
             .ok()
             .and_then(|s| s.canonical_reason())
             .unwrap_or("Unknown");
-        let label = format!("{} {:<20}", sc.status, reason);
-        let bar = ascii_bar(sc.count, max_count);
-        let count = format!("x {}", sc.count);
+        let (filled, empty) = ascii_bar(sc.count, max_count);
+        let count = format!("×{}", sc.count);
         if sc.status < 300 {
-            println!("  {}  {}  {}", label.green().bold(), bar.green(), count.dimmed());
+            println!("  {}  {}{}  {}  {}", format!("{:>3}", sc.status).green().bold(), filled.green(), empty.dimmed(), reason.dimmed(), count.dimmed());
         } else if sc.status < 500 {
-            println!("  {}  {}  {}", label.yellow().bold(), bar.yellow(), count.dimmed());
+            println!("  {}  {}{}  {}  {}", format!("{:>3}", sc.status).yellow().bold(), filled.yellow(), empty.dimmed(), reason.dimmed(), count.dimmed());
         } else {
-            println!("  {}  {}  {}", label.red().bold(), bar.red(), count.dimmed());
+            println!("  {}  {}{}  {}  {}", format!("{:>3}", sc.status).red().bold(), filled.red(), empty.dimmed(), reason.dimmed(), count.dimmed());
         }
     }
 
@@ -108,7 +126,8 @@ pub fn run_tester(
     println!("  {}  {}", "avg:".dimmed(), format!("{:.2?}", results.avg).yellow());
     println!("  {}  {}", "min:".dimmed(), format!("{:.2?}", results.min).green());
     println!("  {}  {}", "max:".dimmed(), format!("{:.2?}", results.max).red());
-    println!("  {}", ascii_sparkline(&results.timings));
+    println!();
+    print_ascii_line_graph(&results.timings);
 
     Ok(())
 }

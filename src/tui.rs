@@ -9,7 +9,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph, Sparkline},
+    symbols,
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use std::{collections::HashMap, fs, io};
@@ -769,32 +770,28 @@ fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::Tes
         .constraints([Constraint::Min(5), Constraint::Length(3), Constraint::Length(5)])
         .split(inner);
 
-    // Status distribution bar chart
-    let max_count = results.statuses.iter().map(|s| s.count as u64).max().unwrap_or(1);
-    let bars: Vec<Bar> = results
-        .statuses
-        .iter()
-        .map(|sc| {
-            let color = status_color(sc.status);
-            Bar::default()
-                .value(sc.count as u64)
-                .label(Line::from(sc.status.to_string()))
-                .style(Style::default().fg(color))
-                .value_style(Style::default().fg(Color::Black).bg(color))
-        })
-        .collect();
-    let bar_chart = BarChart::default()
-        .block(
-            Block::default()
-                .title(" Status Distribution ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .data(BarGroup::default().bars(&bars))
-        .bar_width(7)
-        .bar_gap(2)
-        .max(max_count);
-    frame.render_widget(bar_chart, chunks[0]);
+    // Status distribution horizontal gauges
+    let max_count = results.statuses.iter().map(|s| s.count).max().unwrap_or(1);
+    let bar_width = 30usize;
+    let mut gauge_lines: Vec<Line<'static>> = vec![Line::raw("")];
+    for sc in &results.statuses {
+        let color = status_color(sc.status);
+        let filled = ((sc.count * bar_width) / max_count).max(1);
+        let empty = bar_width - filled;
+        gauge_lines.push(Line::from(vec![
+            Span::styled(format!("  {:>3}  ", sc.status), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled("█".repeat(filled), Style::default().fg(color)),
+            Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  ×{}", sc.count), Style::default().fg(Color::White)),
+        ]));
+    }
+    let gauge_widget = Paragraph::new(gauge_lines).block(
+        Block::default()
+            .title(" Status Distribution ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(gauge_widget, chunks[0]);
 
     // Timing stats
     let stats = Paragraph::new(Line::from(vec![
@@ -807,17 +804,36 @@ fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::Tes
     ]));
     frame.render_widget(stats, chunks[1]);
 
-    // Per-iteration latency sparkline
-    let sparkline = Sparkline::default()
+    // Per-iteration latency line chart
+    let max_ms = results.timings.iter().copied().max().unwrap_or(1);
+    let latency_points: Vec<(f64, f64)> = results
+        .timings
+        .iter()
+        .enumerate()
+        .map(|(i, &ms)| (i as f64, ms as f64))
+        .collect();
+    let latency_dataset = Dataset::default()
+        .marker(symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(Color::Cyan))
+        .data(&latency_points);
+    let latency_chart = Chart::new(vec![latency_dataset])
         .block(
             Block::default()
                 .title(" Latency (ms) ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
-        .data(results.timings.iter().copied().collect::<Vec<u64>>())
-        .style(Style::default().fg(Color::Cyan));
-    frame.render_widget(sparkline, chunks[2]);
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, results.timings.len().saturating_sub(1) as f64]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, max_ms as f64])
+                .labels(vec![Span::raw("0"), Span::raw(format!("{}ms", max_ms))]),
+        );
+    frame.render_widget(latency_chart, chunks[2]);
 }
 
 fn status_color(status: u16) -> Color {
