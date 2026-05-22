@@ -6,7 +6,15 @@ use std::collections::HashMap;
 
 use crate::{config::RequestConfig, utils::send_request};
 
-pub fn run_request(config: &RequestConfig, vars: &HashMap<String, String>, verbose: bool, is_chain: bool) -> Result<HashMap<String, String>> {
+pub fn run_request(config: &RequestConfig, vars: &mut HashMap<String, String>, verbose: bool, is_chain: bool, profile: Option<String>) -> Result<HashMap<String, String>> {
+    if !is_chain && let Some(ref profile_name) = profile {
+        if let Some(profiles) = &config.profiles {
+            if let Some(found) = profiles.iter().find(|p| p.name.eq_ignore_ascii_case(profile_name)) {
+                vars.extend(found.params.clone());
+            }
+        }
+    }
+
     let response = send_request(config, vars, verbose)?;
 
     if verbose {
