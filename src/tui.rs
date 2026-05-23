@@ -105,6 +105,9 @@ enum Mode {
         original_name: Option<String>, // Some(name) when editing an existing request
         error: Option<String>,
     },
+    ConfirmDelete {
+        entry_name: String,
+    },
     // Sub-mode for adding a profile while creating/editing a request.
     // focused: 0 = profile name, 1+2i = params[i].key, 2+2i = params[i].value
     NewProfile {
@@ -347,6 +350,9 @@ impl App {
         }
         if matches!(self.mode, Mode::NewProfile { .. }) {
             return self.handle_key_new_profile(key);
+        }
+        if matches!(self.mode, Mode::ConfirmDelete { .. }) {
+            return self.handle_key_confirm_delete(key.code);
         }
         self.handle_key_response(key.code)
     }
@@ -704,6 +710,39 @@ impl App {
                     };
                 }
             }
+            KeyCode::Char('d') => {
+                let Some(idx) = self.list_state.selected() else { return false };
+                let entry = &self.entries[idx];
+                if entry.global {
+                    return false;
+                }
+                self.mode = Mode::ConfirmDelete { entry_name: entry.name.clone() };
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_key_confirm_delete(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let entry_name = match &self.mode {
+                    Mode::ConfirmDelete { entry_name } => entry_name.clone(),
+                    _ => return false,
+                };
+                let path = crate::config::local_config_path(&entry_name);
+                let _ = fs::remove_file(&path);
+                if let Ok(entries) = load_entries() {
+                    let new_idx = self.list_state.selected()
+                        .map(|i| i.min(entries.len().saturating_sub(1)));
+                    self.entries = entries;
+                    self.list_state.select(if self.entries.is_empty() { None } else { new_idx });
+                }
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.mode = Mode::Browse;
+            }
             _ => {}
         }
         false
@@ -913,6 +952,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
         }
         Mode::NewProfile { name, params, focused, error, .. } => {
             draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref());
+        }
+        Mode::ConfirmDelete { entry_name } => {
+            draw_confirm_delete(frame, panes[1], entry_name);
         }
     }
 
@@ -1388,6 +1430,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("edit", Style::default().fg(Color::DarkGray)),
             Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("copy", Style::default().fg(Color::DarkGray)),
+            Span::styled("   d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("delete", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ProfileSelect { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1433,6 +1477,12 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
+        Mode::ConfirmDelete { .. } => vec![
+            Span::styled(" y/Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("confirm delete", Style::default().fg(Color::DarkGray)),
+            Span::styled("   n/Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
         Mode::Response { .. } | Mode::TestResponse { .. } => vec![
             Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("scroll", Style::default().fg(Color::DarkGray)),
@@ -1445,6 +1495,39 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         ],
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
+    let lines: Vec<Line<'static>> = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  Delete  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(entry_name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled("?", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  This action cannot be undone.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  y / Enter  ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled("yes, delete", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled("  n / Esc    ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Confirm Delete ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red)),
+    );
+    frame.render_widget(paragraph, area);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
