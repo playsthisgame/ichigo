@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -97,6 +97,25 @@ enum Mode {
     },
     TestResponse {
         results: crate::tester::TestResults,
+    },
+    NewRequest {
+        fields: Vec<(String, String)>, // (label, value): name, method, url, description
+        focused: usize,
+        profiles: Vec<crate::config::Profile>,
+        original_name: Option<String>, // Some(name) when editing an existing request
+        error: Option<String>,
+    },
+    // Sub-mode for adding a profile while creating/editing a request.
+    // focused: 0 = profile name, 1+2i = params[i].key, 2+2i = params[i].value
+    NewProfile {
+        request_fields: Vec<(String, String)>,
+        request_focused: usize,
+        request_profiles: Vec<crate::config::Profile>,
+        request_original_name: Option<String>,
+        name: String,
+        params: Vec<(String, String)>,
+        focused: usize,
+        error: Option<String>,
     },
 }
 
@@ -323,7 +342,272 @@ impl App {
         if matches!(self.mode, Mode::TestInput { .. }) {
             return self.handle_key_test_input(key);
         }
+        if matches!(self.mode, Mode::NewRequest { .. }) {
+            return self.handle_key_new_request(key);
+        }
+        if matches!(self.mode, Mode::NewProfile { .. }) {
+            return self.handle_key_new_profile(key);
+        }
         self.handle_key_response(key.code)
+    }
+
+    fn handle_key_new_request(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+            }
+            KeyCode::Tab => {
+                if let Mode::NewRequest { fields, focused, .. } = &mut self.mode {
+                    *focused = (*focused + 1) % fields.len();
+                }
+            }
+            KeyCode::BackTab => {
+                if let Mode::NewRequest { fields, focused, .. } = &mut self.mode {
+                    let len = fields.len();
+                    *focused = focused.checked_sub(1).unwrap_or(len - 1);
+                }
+            }
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let snapshot = match &self.mode {
+                    Mode::NewRequest { fields, focused, profiles, original_name, .. } => {
+                        Some((fields.clone(), *focused, profiles.clone(), original_name.clone()))
+                    }
+                    _ => None,
+                };
+                if let Some((fields, focused, profiles, original_name)) = snapshot {
+                    self.mode = Mode::NewProfile {
+                        request_fields: fields,
+                        request_focused: focused,
+                        request_profiles: profiles,
+                        request_original_name: original_name,
+                        name: String::new(),
+                        params: Vec::new(),
+                        focused: 0,
+                        error: None,
+                    };
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Mode::NewRequest { fields, focused, error, .. } = &mut self.mode {
+                    fields[*focused].1.push(c);
+                    *error = None;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Mode::NewRequest { fields, focused, error, .. } = &mut self.mode {
+                    fields[*focused].1.pop();
+                    *error = None;
+                }
+            }
+            KeyCode::Enter => {
+                self.save_new_request();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_key_new_profile(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                // Return to NewRequest without saving the profile
+                if let Mode::NewProfile { request_fields, request_focused, request_profiles, request_original_name, .. } = &self.mode {
+                    self.mode = Mode::NewRequest {
+                        fields: request_fields.clone(),
+                        focused: *request_focused,
+                        profiles: request_profiles.clone(),
+                        original_name: request_original_name.clone(),
+                        error: None,
+                    };
+                }
+            }
+            KeyCode::Tab => {
+                if let Mode::NewProfile { params, focused, .. } = &mut self.mode {
+                    let total = 1 + 2 * params.len();
+                    *focused = (*focused + 1) % total.max(1);
+                }
+            }
+            KeyCode::BackTab => {
+                if let Mode::NewProfile { params, focused, .. } = &mut self.mode {
+                    let total = 1 + 2 * params.len();
+                    *focused = focused.checked_sub(1).unwrap_or(total.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Mode::NewProfile { params, focused, .. } = &mut self.mode {
+                    let new_idx = 1 + 2 * params.len();
+                    params.push((String::new(), String::new()));
+                    *focused = new_idx;
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Mode::NewProfile { name, params, focused, error, .. } = &mut self.mode {
+                    *error = None;
+                    if *focused == 0 {
+                        name.push(c);
+                    } else {
+                        let param_idx = (*focused - 1) / 2;
+                        let is_value = (*focused - 1) % 2 == 1;
+                        if let Some((k, v)) = params.get_mut(param_idx) {
+                            if is_value { v.push(c) } else { k.push(c) }
+                        }
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Mode::NewProfile { name, params, focused, .. } = &mut self.mode {
+                    if *focused == 0 {
+                        name.pop();
+                    } else {
+                        let param_idx = (*focused - 1) / 2;
+                        let is_value = (*focused - 1) % 2 == 1;
+                        if let Some((k, v)) = params.get_mut(param_idx) {
+                            if is_value { v.pop() } else { k.pop() };
+                        }
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                self.save_new_profile();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn save_new_profile(&mut self) {
+        let (profile_name, params, req_fields, req_focused, mut req_profiles, req_original_name) = match &self.mode {
+            Mode::NewProfile { name, params, request_fields, request_focused, request_profiles, request_original_name, .. } => (
+                name.trim().to_string(),
+                params.clone(),
+                request_fields.clone(),
+                *request_focused,
+                request_profiles.clone(),
+                request_original_name.clone(),
+            ),
+            _ => return,
+        };
+
+        if profile_name.is_empty() {
+            if let Mode::NewProfile { error, .. } = &mut self.mode {
+                *error = Some("Profile name is required".to_string());
+            }
+            return;
+        }
+
+        let filtered_params: HashMap<String, String> = params
+            .into_iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect();
+
+        req_profiles.push(crate::config::Profile { name: profile_name, params: filtered_params });
+
+        self.mode = Mode::NewRequest {
+            fields: req_fields,
+            focused: req_focused,
+            profiles: req_profiles,
+            original_name: req_original_name,
+            error: None,
+        };
+    }
+
+    fn save_new_request(&mut self) {
+        let (name, method, url, description, profiles, original_name) = match &self.mode {
+            Mode::NewRequest { fields, profiles, original_name, .. } => (
+                fields[0].1.trim().to_string(),
+                fields[1].1.trim().to_uppercase(),
+                fields[2].1.trim().to_string(),
+                fields[3].1.trim().to_string(),
+                profiles.clone(),
+                original_name.clone(),
+            ),
+            _ => return,
+        };
+
+        let set_error = |mode: &mut Mode, msg: &str| {
+            if let Mode::NewRequest { error, .. } = mode {
+                *error = Some(msg.to_string());
+            }
+        };
+
+        if name.is_empty() {
+            set_error(&mut self.mode, "Name is required");
+            return;
+        }
+        if name.chars().any(|c| c == '/' || c == '\\' || c == '.') {
+            set_error(&mut self.mode, "Name cannot contain '/', '\\', or '.'");
+            return;
+        }
+        if method.is_empty() {
+            set_error(&mut self.mode, "Method is required");
+            return;
+        }
+        if url.is_empty() {
+            set_error(&mut self.mode, "URL is required");
+            return;
+        }
+
+        let path = crate::config::local_config_path(&name);
+        let is_rename = original_name.as_deref() != Some(name.as_str());
+        if path.exists() && (original_name.is_none() || is_rename) {
+            set_error(&mut self.mode, &format!("'{}' already exists", name));
+            return;
+        }
+
+        // When editing, preserve headers/query/body/extract from the original file.
+        let (headers, query, body, extract) = original_name
+            .as_deref()
+            .and_then(|orig| crate::config::RequestConfig::load(orig).ok())
+            .map(|c| (c.headers, c.query, c.body, c.extract))
+            .unwrap_or_default();
+
+        let config = crate::config::RequestConfig {
+            name: name.clone(),
+            method,
+            url,
+            description: if description.is_empty() { None } else { Some(description) },
+            headers,
+            query,
+            body,
+            extract,
+            profiles: if profiles.is_empty() { None } else { Some(profiles) },
+        };
+
+        let dir = crate::config::local_dir();
+        if let Err(e) = fs::create_dir_all(&dir) {
+            set_error(&mut self.mode, &format!("Failed to create directory: {e}"));
+            return;
+        }
+
+        match serde_yaml::to_string(&config) {
+            Ok(yaml) => {
+                if let Err(e) = fs::write(&path, yaml) {
+                    set_error(&mut self.mode, &format!("Failed to write file: {e}"));
+                    return;
+                }
+            }
+            Err(e) => {
+                set_error(&mut self.mode, &format!("Serialization error: {e}"));
+                return;
+            }
+        }
+
+        // On rename, remove the old file.
+        if let Some(ref old_name) = original_name {
+            if is_rename {
+                let _ = fs::remove_file(crate::config::local_config_path(old_name));
+            }
+        }
+
+        if let Ok(entries) = load_entries() {
+            let idx = entries.iter().position(|e| e.name == name);
+            self.entries = entries;
+            if let Some(i) = idx {
+                self.list_state.select(Some(i));
+            }
+        }
+        self.mode = Mode::Browse;
     }
 
     fn handle_key_profile_select(&mut self, code: KeyCode) -> bool {
@@ -366,6 +650,60 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::Enter => self.try_run_selected(),
             KeyCode::Char('t') => self.try_test_selected(),
+            KeyCode::Char('n') => {
+                self.mode = Mode::NewRequest {
+                    fields: vec![
+                        ("name".to_string(), String::new()),
+                        ("method".to_string(), "GET".to_string()),
+                        ("url".to_string(), String::new()),
+                        ("description".to_string(), String::new()),
+                    ],
+                    focused: 0,
+                    profiles: Vec::new(),
+                    original_name: None,
+                    error: None,
+                };
+            }
+            KeyCode::Char('e') => {
+                let Some(idx) = self.list_state.selected() else { return false };
+                let entry = &self.entries[idx];
+                if entry.global {
+                    return false;
+                }
+                if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
+                    let name = entry.name.clone();
+                    self.mode = Mode::NewRequest {
+                        fields: vec![
+                            ("name".to_string(), name.clone()),
+                            ("method".to_string(), method.clone()),
+                            ("url".to_string(), url.clone()),
+                            ("description".to_string(), description.clone().unwrap_or_default()),
+                        ],
+                        focused: 0,
+                        profiles: profiles.clone(),
+                        original_name: Some(name),
+                        error: None,
+                    };
+                }
+            }
+            KeyCode::Char('c') => {
+                let Some(idx) = self.list_state.selected() else { return false };
+                let entry = &self.entries[idx];
+                if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
+                    self.mode = Mode::NewRequest {
+                        fields: vec![
+                            ("name".to_string(), String::new()),
+                            ("method".to_string(), method.clone()),
+                            ("url".to_string(), url.clone()),
+                            ("description".to_string(), description.clone().unwrap_or_default()),
+                        ],
+                        focused: 0,
+                        profiles: profiles.clone(),
+                        original_name: None,
+                        error: None,
+                    };
+                }
+            }
             _ => {}
         }
         false
@@ -570,6 +908,12 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
         }
+        Mode::NewRequest { fields, focused, profiles, original_name, error } => {
+            draw_new_request(frame, panes[1], fields, *focused, profiles, original_name.is_some(), error.as_deref());
+        }
+        Mode::NewProfile { name, params, focused, error, .. } => {
+            draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref());
+        }
     }
 
     draw_help(frame, outer[1], &app.mode);
@@ -649,6 +993,154 @@ fn draw_profile_select(
     let paragraph = Paragraph::new(lines).block(
         Block::default()
             .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_new_request(
+    frame: &mut Frame,
+    area: Rect,
+    fields: &[(String, String)],
+    focused: usize,
+    profiles: &[crate::config::Profile],
+    is_edit: bool,
+    error: Option<&str>,
+) {
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+
+    for (i, (label, value)) in fields.iter().enumerate() {
+        let is_focused = i == focused;
+        let is_required = i < 3; // name, method, url are required
+
+        let mut label_spans = vec![Span::styled(
+            format!("  {}", label),
+            Style::default()
+                .fg(if is_focused { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )];
+        if is_required {
+            label_spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
+        }
+        lines.push(Line::from(label_spans));
+
+        let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
+        let display = if is_focused { format!("{}█", value) } else { value.clone() };
+        let input = Span::styled(
+            display,
+            Style::default().fg(if is_focused { Color::White } else { Color::DarkGray }),
+        );
+        lines.push(Line::from(vec![prompt, input]));
+        lines.push(Line::raw(""));
+    }
+
+    if !profiles.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  profiles",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        )));
+        for profile in profiles {
+            lines.push(Line::from(vec![
+                Span::styled("    ", Style::default()),
+                Span::styled(profile.name.clone(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            ]));
+            for (k, v) in &profile.params {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("      {}: ", k), Style::default().fg(Color::DarkGray)),
+                    Span::styled(v.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    if let Some(err) = error {
+        lines.push(Line::from(Span::styled(
+            format!("  error: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let title = if is_edit { " Edit Request " } else { " New Request " };
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_new_profile(
+    frame: &mut Frame,
+    area: Rect,
+    name: &str,
+    params: &[(String, String)],
+    focused: usize,
+    error: Option<&str>,
+) {
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+
+    // Profile name field
+    let name_focused = focused == 0;
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  profile name",
+            Style::default()
+                .fg(if name_focused { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" *", Style::default().fg(Color::Red)),
+    ]));
+    let display = if name_focused { format!("{}█", name) } else { name.to_string() };
+    lines.push(Line::from(vec![
+        Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+        Span::styled(display, Style::default().fg(if name_focused { Color::White } else { Color::DarkGray })),
+    ]));
+    lines.push(Line::raw(""));
+
+    // Param pairs: focused index 1+2i = key, 2+2i = value
+    for (i, (key, value)) in params.iter().enumerate() {
+        let key_focused = focused == 1 + 2 * i;
+        let val_focused = focused == 2 + 2 * i;
+
+        lines.push(Line::from(Span::styled(
+            format!("  param {} key", i + 1),
+            Style::default()
+                .fg(if key_focused { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )));
+        let display = if key_focused { format!("{}█", key) } else { key.clone() };
+        lines.push(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+            Span::styled(display, Style::default().fg(if key_focused { Color::White } else { Color::DarkGray })),
+        ]));
+
+        lines.push(Line::from(Span::styled(
+            format!("  param {} value", i + 1),
+            Style::default()
+                .fg(if val_focused { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )));
+        let display = if val_focused { format!("{}█", value) } else { value.clone() };
+        lines.push(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+            Span::styled(display, Style::default().fg(if val_focused { Color::White } else { Color::DarkGray })),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    if let Some(err) = error {
+        lines.push(Line::from(Span::styled(
+            format!("  error: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" New Profile ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
     );
@@ -890,6 +1382,12 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("run", Style::default().fg(Color::DarkGray)),
             Span::styled("   t ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("test", Style::default().fg(Color::DarkGray)),
+            Span::styled("   n ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("new", Style::default().fg(Color::DarkGray)),
+            Span::styled("   e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("edit", Style::default().fg(Color::DarkGray)),
+            Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("copy", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ProfileSelect { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -912,6 +1410,26 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("run test", Style::default().fg(Color::DarkGray)),
             Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("switch field", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
+        Mode::NewRequest { .. } => vec![
+            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("save", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("next/prev field", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Ctrl+p ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("add profile", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
+        Mode::NewProfile { .. } => vec![
+            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("save profile", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("next/prev field", Style::default().fg(Color::DarkGray)),
+            Span::styled("   a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("add param", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
