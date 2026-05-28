@@ -695,9 +695,7 @@ impl App {
             KeyCode::Char('e') => {
                 let Some(idx) = self.list_state.selected() else { return false };
                 let entry = &self.entries[idx];
-                if entry.global {
-                    return false;
-                }
+                let entry_global = entry.global;
                 if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
                     let name = entry.name.clone();
                     self.mode = Mode::NewRequest {
@@ -710,7 +708,7 @@ impl App {
                         focused: 0,
                         profiles: profiles.clone(),
                         original_name: Some(name),
-                        global: false,
+                        global: entry_global,
                         error: None,
                     };
                 }
