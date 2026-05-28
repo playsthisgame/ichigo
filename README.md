@@ -4,8 +4,22 @@ A CLI HTTP client. Store named request configs in your project or globally, then
 
 ## Installation
 
+**Via shell script (macOS/Linux):**
+
 ```sh
-cargo install --path .
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/playsthisgame/ichigo/releases/latest/download/ichigo-installer.sh | sh
+```
+
+**Via PowerShell (Windows):**
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/playsthisgame/ichigo/releases/latest/download/ichigo-installer.ps1 | iex"
+```
+
+**Via Cargo:**
+
+```sh
+cargo install ichigo
 ```
 
 ## Config files
