@@ -103,6 +103,7 @@ enum Mode {
         focused: usize,
         profiles: Vec<crate::config::Profile>,
         original_name: Option<String>, // Some(name) when editing an existing request
+        global: bool,
         error: Option<String>,
     },
     ConfirmDelete {
@@ -115,6 +116,7 @@ enum Mode {
         request_focused: usize,
         request_profiles: Vec<crate::config::Profile>,
         request_original_name: Option<String>,
+        request_global: bool,
         name: String,
         params: Vec<(String, String)>,
         focused: usize,
@@ -373,19 +375,25 @@ impl App {
                     *focused = focused.checked_sub(1).unwrap_or(len - 1);
                 }
             }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Mode::NewRequest { global, .. } = &mut self.mode {
+                    *global = !*global;
+                }
+            }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let snapshot = match &self.mode {
-                    Mode::NewRequest { fields, focused, profiles, original_name, .. } => {
-                        Some((fields.clone(), *focused, profiles.clone(), original_name.clone()))
+                    Mode::NewRequest { fields, focused, profiles, original_name, global, .. } => {
+                        Some((fields.clone(), *focused, profiles.clone(), original_name.clone(), *global))
                     }
                     _ => None,
                 };
-                if let Some((fields, focused, profiles, original_name)) = snapshot {
+                if let Some((fields, focused, profiles, original_name, global)) = snapshot {
                     self.mode = Mode::NewProfile {
                         request_fields: fields,
                         request_focused: focused,
                         request_profiles: profiles,
                         request_original_name: original_name,
+                        request_global: global,
                         name: String::new(),
                         params: Vec::new(),
                         focused: 0,
@@ -417,12 +425,13 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 // Return to NewRequest without saving the profile
-                if let Mode::NewProfile { request_fields, request_focused, request_profiles, request_original_name, .. } = &self.mode {
+                if let Mode::NewProfile { request_fields, request_focused, request_profiles, request_original_name, request_global, .. } = &self.mode {
                     self.mode = Mode::NewRequest {
                         fields: request_fields.clone(),
                         focused: *request_focused,
                         profiles: request_profiles.clone(),
                         original_name: request_original_name.clone(),
+                        global: *request_global,
                         error: None,
                     };
                 }
@@ -482,14 +491,15 @@ impl App {
     }
 
     fn save_new_profile(&mut self) {
-        let (profile_name, params, req_fields, req_focused, mut req_profiles, req_original_name) = match &self.mode {
-            Mode::NewProfile { name, params, request_fields, request_focused, request_profiles, request_original_name, .. } => (
+        let (profile_name, params, req_fields, req_focused, mut req_profiles, req_original_name, req_global) = match &self.mode {
+            Mode::NewProfile { name, params, request_fields, request_focused, request_profiles, request_original_name, request_global, .. } => (
                 name.trim().to_string(),
                 params.clone(),
                 request_fields.clone(),
                 *request_focused,
                 request_profiles.clone(),
                 request_original_name.clone(),
+                *request_global,
             ),
             _ => return,
         };
@@ -514,19 +524,21 @@ impl App {
             focused: req_focused,
             profiles: req_profiles,
             original_name: req_original_name,
+            global: req_global,
             error: None,
         };
     }
 
     fn save_new_request(&mut self) {
-        let (name, method, url, description, profiles, original_name) = match &self.mode {
-            Mode::NewRequest { fields, profiles, original_name, .. } => (
+        let (name, method, url, description, profiles, original_name, global) = match &self.mode {
+            Mode::NewRequest { fields, profiles, original_name, global, .. } => (
                 fields[0].1.trim().to_string(),
                 fields[1].1.trim().to_uppercase(),
                 fields[2].1.trim().to_string(),
                 fields[3].1.trim().to_string(),
                 profiles.clone(),
                 original_name.clone(),
+                *global,
             ),
             _ => return,
         };
@@ -554,7 +566,11 @@ impl App {
             return;
         }
 
-        let path = crate::config::local_config_path(&name);
+        let path = if global {
+            crate::config::global_config_path(&name)
+        } else {
+            crate::config::local_config_path(&name)
+        };
         let is_rename = original_name.as_deref() != Some(name.as_str());
         if path.exists() && (original_name.is_none() || is_rename) {
             set_error(&mut self.mode, &format!("'{}' already exists", name));
@@ -580,7 +596,7 @@ impl App {
             profiles: if profiles.is_empty() { None } else { Some(profiles) },
         };
 
-        let dir = crate::config::local_dir();
+        let dir = if global { crate::config::global_dir() } else { crate::config::local_dir() };
         if let Err(e) = fs::create_dir_all(&dir) {
             set_error(&mut self.mode, &format!("Failed to create directory: {e}"));
             return;
@@ -602,7 +618,12 @@ impl App {
         // On rename, remove the old file.
         if let Some(ref old_name) = original_name {
             if is_rename {
-                let _ = fs::remove_file(crate::config::local_config_path(old_name));
+                let old_path = if global {
+                    crate::config::global_config_path(old_name)
+                } else {
+                    crate::config::local_config_path(old_name)
+                };
+                let _ = fs::remove_file(old_path);
             }
         }
 
@@ -667,15 +688,14 @@ impl App {
                     focused: 0,
                     profiles: Vec::new(),
                     original_name: None,
+                    global: false,
                     error: None,
                 };
             }
             KeyCode::Char('e') => {
                 let Some(idx) = self.list_state.selected() else { return false };
                 let entry = &self.entries[idx];
-                if entry.global {
-                    return false;
-                }
+                let entry_global = entry.global;
                 if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
                     let name = entry.name.clone();
                     self.mode = Mode::NewRequest {
@@ -688,6 +708,7 @@ impl App {
                         focused: 0,
                         profiles: profiles.clone(),
                         original_name: Some(name),
+                        global: entry_global,
                         error: None,
                     };
                 }
@@ -706,6 +727,7 @@ impl App {
                         focused: 0,
                         profiles: profiles.clone(),
                         original_name: None,
+                        global: false,
                         error: None,
                     };
                 }
@@ -947,8 +969,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
         }
-        Mode::NewRequest { fields, focused, profiles, original_name, error } => {
-            draw_new_request(frame, panes[1], fields, *focused, profiles, original_name.is_some(), error.as_deref());
+        Mode::NewRequest { fields, focused, profiles, original_name, global, error } => {
+            draw_new_request(frame, panes[1], fields, *focused, profiles, original_name.is_some(), *global, error.as_deref());
         }
         Mode::NewProfile { name, params, focused, error, .. } => {
             draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref());
@@ -1048,6 +1070,7 @@ fn draw_new_request(
     focused: usize,
     profiles: &[crate::config::Profile],
     is_edit: bool,
+    global: bool,
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
@@ -1076,6 +1099,18 @@ fn draw_new_request(
         lines.push(Line::from(vec![prompt, input]));
         lines.push(Line::raw(""));
     }
+
+    let (global_check, global_color) = if global {
+        ("[x] global", Color::Cyan)
+    } else {
+        ("[ ] global", Color::DarkGray)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(global_check, Style::default().fg(global_color).add_modifier(Modifier::BOLD)),
+        Span::styled("  Ctrl+g to toggle", Style::default().fg(Color::DarkGray)),
+    ]));
+    lines.push(Line::raw(""));
 
     if !profiles.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1462,6 +1497,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("save", Style::default().fg(Color::DarkGray)),
             Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("next/prev field", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Ctrl+g ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("toggle global", Style::default().fg(Color::DarkGray)),
             Span::styled("   Ctrl+p ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("add profile", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
