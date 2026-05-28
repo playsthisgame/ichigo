@@ -1,5 +1,5 @@
 use std::{collections::HashMap, env};
-
+use std::time::Duration;
 use reqwest::blocking::{Client, Response};
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -23,6 +23,7 @@ pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>, verb
         .collect();
 
     let client = Client::builder()
+        .timeout(Duration::from_mins(5))
         .build()
         .context("Failed to build HTTP client")?;
 
