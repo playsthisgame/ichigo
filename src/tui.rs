@@ -130,6 +130,8 @@ struct App {
     entries: Vec<Entry>,
     list_state: ListState,
     pending_g: bool,
+    filter: String,
+    filter_active: bool,
     mode: Mode,
 }
 
@@ -140,24 +142,43 @@ impl App {
         if !entries.is_empty() {
             list_state.select(Some(0));
         }
-        Ok(Self { entries, list_state, pending_g: false, mode: Mode::Browse })
+        Ok(Self { entries, list_state, pending_g: false, filter: String::new(), filter_active: false, mode: Mode::Browse })
+    }
+
+    fn filtered_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.entries.len()).collect();
+        }
+        let q = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                if e.name.to_lowercase().contains(&q) {
+                    return true;
+                }
+                if let EntryKind::Request { method, url, .. } = &e.kind {
+                    return method.to_lowercase().contains(&q) || url.to_lowercase().contains(&q);
+                }
+                false
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     fn move_down(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
+        let count = self.filtered_indices().len();
+        if count == 0 { return; }
         let next = match self.list_state.selected() {
-            Some(i) => (i + 1).min(self.entries.len() - 1),
+            Some(i) => (i + 1).min(count - 1),
             None => 0,
         };
         self.list_state.select(Some(next));
     }
 
     fn move_up(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
+        let count = self.filtered_indices().len();
+        if count == 0 { return; }
         let next = match self.list_state.selected() {
             Some(i) => i.saturating_sub(1),
             None => 0,
@@ -166,19 +187,25 @@ impl App {
     }
 
     fn move_top(&mut self) {
-        if !self.entries.is_empty() {
+        if !self.filtered_indices().is_empty() {
             self.list_state.select(Some(0));
         }
     }
 
     fn move_bottom(&mut self) {
-        if !self.entries.is_empty() {
-            self.list_state.select(Some(self.entries.len() - 1));
+        let count = self.filtered_indices().len();
+        if count > 0 {
+            self.list_state.select(Some(count - 1));
         }
     }
 
+    fn selected_entry_index(&self) -> Option<usize> {
+        let filtered = self.filtered_indices();
+        self.list_state.selected().and_then(|pos| filtered.get(pos).copied())
+    }
+
     fn try_run_selected(&mut self) {
-        let Some(idx) = self.list_state.selected() else { return };
+        let Some(idx) = self.selected_entry_index() else { return };
         let entry = &self.entries[idx];
 
         let entry_name = entry.name.clone();
@@ -219,7 +246,7 @@ impl App {
     }
 
     fn try_test_selected(&mut self) {
-        let Some(idx) = self.list_state.selected() else { return };
+        let Some(idx) = self.selected_entry_index() else { return };
         let entry = &self.entries[idx];
 
         let entry_name = entry.name.clone();
@@ -335,6 +362,9 @@ impl App {
 
     // Returns true when the event loop should exit.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.filter_active && matches!(self.mode, Mode::Browse) {
+            return self.handle_key_filter(key);
+        }
         if matches!(self.mode, Mode::Browse) {
             return self.handle_key_browse(key.code);
         }
@@ -693,7 +723,7 @@ impl App {
                 };
             }
             KeyCode::Char('e') => {
-                let Some(idx) = self.list_state.selected() else { return false };
+                let Some(idx) = self.selected_entry_index() else { return false };
                 let entry = &self.entries[idx];
                 let entry_global = entry.global;
                 if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
@@ -714,7 +744,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') => {
-                let Some(idx) = self.list_state.selected() else { return false };
+                let Some(idx) = self.selected_entry_index() else { return false };
                 let entry = &self.entries[idx];
                 if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
                     self.mode = Mode::NewRequest {
@@ -733,12 +763,39 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                let Some(idx) = self.list_state.selected() else { return false };
+                let Some(idx) = self.selected_entry_index() else { return false };
                 let entry = &self.entries[idx];
                 if entry.global {
                     return false;
                 }
                 self.mode = Mode::ConfirmDelete { entry_name: entry.name.clone() };
+            }
+            KeyCode::Char('f') => {
+                self.filter_active = true;
+                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_key_filter(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.filter_active = false;
+                self.filter.clear();
+                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+            }
+            KeyCode::Enter => {
+                self.filter_active = false;
+            }
+            KeyCode::Char(c) => {
+                self.filter.push(c);
+                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
             }
             _ => {}
         }
@@ -755,10 +812,11 @@ impl App {
                 let path = crate::config::local_config_path(&entry_name);
                 let _ = fs::remove_file(&path);
                 if let Ok(entries) = load_entries() {
-                    let new_idx = self.list_state.selected()
-                        .map(|i| i.min(entries.len().saturating_sub(1)));
                     self.entries = entries;
-                    self.list_state.select(if self.entries.is_empty() { None } else { new_idx });
+                    let count = self.filtered_indices().len();
+                    let new_pos = self.list_state.selected()
+                        .map(|i| i.min(count.saturating_sub(1)));
+                    self.list_state.select(if count == 0 { None } else { new_pos });
                 }
                 self.mode = Mode::Browse;
             }
@@ -943,15 +1001,14 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(outer[0]);
 
-    // Pass list_state by field so the mutable borrow ends before we read
-    // app.mode and app.entries below.
-    draw_list(frame, panes[0], &app.entries, &mut app.list_state);
+    let filtered = app.filtered_indices();
+    draw_list(frame, panes[0], &app.entries, &filtered, &mut app.list_state, &app.filter, app.filter_active);
 
     match &app.mode {
         Mode::Browse => {
             // Accessing app.list_state and app.entries here is fine: they are
             // different fields from app.mode, and Rust can split-borrow them.
-            let selected = app.list_state.selected().map(|i| &app.entries[i]);
+            let selected = app.selected_entry_index().map(|i| &app.entries[i]);
             draw_detail_browse(frame, panes[1], selected);
         }
         Mode::ProfileSelect { profiles, selected, entry_name, .. } => {
@@ -983,8 +1040,45 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_help(frame, outer[1], &app.mode);
 }
 
-fn draw_list(frame: &mut Frame, area: Rect, entries: &[Entry], list_state: &mut ListState) {
-    let items: Vec<ListItem> = entries.iter().map(make_list_item).collect();
+fn draw_list(
+    frame: &mut Frame,
+    area: Rect,
+    entries: &[Entry],
+    filtered: &[usize],
+    list_state: &mut ListState,
+    filter: &str,
+    filter_active: bool,
+) {
+    // Split the panel: filter box on top (3 rows) when active or non-empty, list below.
+    let show_filter = filter_active || !filter.is_empty();
+    let chunks = if show_filter {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(0), Constraint::Min(0)])
+            .split(area)
+    };
+
+    if show_filter {
+        let display = if filter_active { format!("{}█", filter) } else { filter.to_string() };
+        let filter_widget = Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(display, Style::default().fg(Color::White)),
+        ]))
+        .block(
+            Block::default()
+                .title(" Filter ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if filter_active { Color::Yellow } else { Color::DarkGray })),
+        );
+        frame.render_widget(filter_widget, chunks[0]);
+    }
+
+    let items: Vec<ListItem> = filtered.iter().map(|&i| make_list_item(&entries[i])).collect();
     let list = List::new(items)
         .block(
             Block::default()
@@ -999,7 +1093,7 @@ fn draw_list(frame: &mut Frame, area: Rect, entries: &[Entry], list_state: &mut 
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("▶ ");
-    frame.render_stateful_widget(list, area, list_state);
+    frame.render_stateful_widget(list, chunks[1], list_state);
 }
 
 fn draw_detail_browse(frame: &mut Frame, area: Rect, selected: Option<&Entry>) {
@@ -1467,6 +1561,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("copy", Style::default().fg(Color::DarkGray)),
             Span::styled("   d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("delete", Style::default().fg(Color::DarkGray)),
+            Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("filter", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ProfileSelect { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
