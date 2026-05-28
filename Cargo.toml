@@ -2,6 +2,12 @@
 name = "ichigo"
 version = "0.1.0"
 edition = "2024"
+description = "A CLI HTTP client — store named request configs in your project or globally, then run them by name or through the TUI"
+license = "MIT"
+repository = "https://github.com/playsthisgame/ichigo"
+homepage = "https://github.com/playsthisgame/ichigo"
+keywords = ["http", "cli", "rest", "client", "requests"]
+categories = ["command-line-utilities", "web-programming::http-client"]
 
 [[bin]]
 name = "ichigo"
@@ -18,3 +24,8 @@ colored = "2"
 colored_json = "5"
 ratatui = "0.29"
 crossterm = "0.28"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
