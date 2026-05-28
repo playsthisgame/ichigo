@@ -2,6 +2,8 @@
 
 A CLI HTTP client. Store named request configs in your project or globally, then run them by name.
 
+![ichigo TUI](https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.png)
+
 ## Installation
 
 **Via shell script (macOS/Linux):**
