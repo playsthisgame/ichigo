@@ -15,7 +15,9 @@ use ratatui::{
 };
 use std::{collections::HashMap, fs, io};
 
-use crate::config::{list_requests, resolve_config_path, ChainConfig, RequestConfig};
+use crate::config::{
+    dir_for, list_requests, prune_empty_parents, resolve_config_path, ChainConfig, RequestConfig,
+};
 
 // ─── Data ─────────────────────────────────────────────────────────────────────
 
@@ -584,8 +586,12 @@ impl App {
             set_error(&mut self.mode, "Name is required");
             return;
         }
-        if name.chars().any(|c| c == '/' || c == '\\' || c == '.') {
-            set_error(&mut self.mode, "Name cannot contain '/', '\\', or '.'");
+        if name.chars().any(|c| c == '\\' || c == '.')
+            || name.starts_with('/')
+            || name.ends_with('/')
+            || name.contains("//")
+        {
+            set_error(&mut self.mode, "Invalid name (use folder/name for subfolders)");
             return;
         }
         if method.is_empty() {
@@ -627,8 +633,8 @@ impl App {
             profiles: if profiles.is_empty() { None } else { Some(profiles) },
         };
 
-        let dir = if global { crate::config::global_dir() } else { crate::config::local_dir() };
-        if let Err(e) = fs::create_dir_all(&dir) {
+        let dir = path.parent().expect("config path has no parent");
+        if let Err(e) = fs::create_dir_all(dir) {
             set_error(&mut self.mode, &format!("Failed to create directory: {e}"));
             return;
         }
@@ -646,7 +652,6 @@ impl App {
             }
         }
 
-        // On rename, remove the old file.
         if let Some(ref old_name) = original_name {
             if is_rename {
                 let old_path = if global {
@@ -654,7 +659,8 @@ impl App {
                 } else {
                     crate::config::local_config_path(old_name)
                 };
-                let _ = fs::remove_file(old_path);
+                let _ = fs::remove_file(&old_path);
+                prune_empty_parents(&old_path, &dir_for(global));
             }
         }
 
@@ -814,6 +820,7 @@ impl App {
                     crate::config::local_config_path(&entry_name)
                 };
                 let _ = fs::remove_file(&path);
+                prune_empty_parents(&path, &dir_for(global));
                 if let Ok(entries) = load_entries() {
                     self.entries = entries;
                     let count = self.filtered_indices().len();
@@ -1795,18 +1802,40 @@ fn format_test_results_text(results: &crate::tester::TestResults) -> String {
     lines.join("\n")
 }
 
+fn folder_name_spans(name: &str) -> Vec<Span<'static>> {
+    match name.rfind('/') {
+        Some(pos) => vec![
+            Span::styled(
+                format!("{}/ ", &name[..pos]),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                name[pos + 1..].to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ],
+        None => vec![Span::styled(
+            name.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )],
+    }
+}
+
 fn make_list_item(entry: &Entry) -> ListItem<'static> {
     let scope = if entry.global { " global" } else { " local" };
     let line = match &entry.kind {
-        EntryKind::Chain { .. } => Line::from(vec![
-            Span::styled(
-                " CHAIN ",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(entry.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(scope, Style::default().fg(Color::DarkGray)),
-        ]),
+        EntryKind::Chain { .. } => {
+            let mut spans = vec![
+                Span::styled(
+                    " CHAIN ",
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ];
+            spans.extend(folder_name_spans(&entry.name));
+            spans.push(Span::styled(scope, Style::default().fg(Color::DarkGray)));
+            Line::from(spans)
+        }
         EntryKind::Request { method, description, .. } => {
             let color = method_color(method);
             let mut spans = vec![
@@ -1815,8 +1844,8 @@ fn make_list_item(entry: &Entry) -> ListItem<'static> {
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(entry.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
             ];
+            spans.extend(folder_name_spans(&entry.name));
             if let Some(desc) = description
                 && !desc.is_empty()
             {
@@ -1837,14 +1866,15 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
 
     match &entry.kind {
         EntryKind::Chain { steps } => {
-            lines.push(Line::from(vec![
+            let mut header = vec![
                 Span::styled(
                     " CHAIN ",
                     Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(entry.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-            ]));
+            ];
+            header.extend(folder_name_spans(&entry.name));
+            lines.push(Line::from(header));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 " Steps",
@@ -1862,14 +1892,15 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
         }
         EntryKind::Request { method, url, description, headers, query, .. } => {
             let color = method_color(method);
-            lines.push(Line::from(vec![
+            let mut header = vec![
                 Span::styled(
                     format!(" {} ", method),
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::styled(entry.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-            ]));
+            ];
+            header.extend(folder_name_spans(&entry.name));
+            lines.push(Line::from(header));
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![
                 Span::styled(" url    ", Style::default().fg(Color::DarkGray)),

@@ -1,0 +1,34 @@
+generated_at: "2026-05-29T02:48:55Z"
+dependencies:
+    - name: github.com/apollographql/skills/skills/rust-best-practices
+      version: 1.2.3
+      git_tag: v1.2.3
+      repo_url: https://github.com/apollographql/skills
+      subdir: skills/rust-best-practices
+      entrypoint: SKILL.md
+      tree_hash: sha256:f94adc9e0971861c0d31d875a5b0def14752c85ae29029ea4a1775213719ed5b
+      files:
+        - SKILL.md
+        - references/chapter_01.md
+        - references/chapter_02.md
+        - references/chapter_03.md
+        - references/chapter_04.md
+        - references/chapter_05.md
+        - references/chapter_06.md
+        - references/chapter_07.md
+        - references/chapter_08.md
+        - references/chapter_09.md
+    - name: github.com/jeffallan/claude-skills/skills/rust-engineer
+      version: 0.4.15
+      git_tag: v0.4.15
+      repo_url: https://github.com/jeffallan/claude-skills
+      subdir: skills/rust-engineer
+      entrypoint: SKILL.md
+      tree_hash: sha256:d047a9206641ec8f543ec98f4075b5d6e21e9bdbe1346d3745bb4cf2257a332f
+      files:
+        - SKILL.md
+        - references/async.md
+        - references/error-handling.md
+        - references/ownership.md
+        - references/testing.md
+        - references/traits.md

@@ -1,0 +1,9 @@
+name: ichigo
+version: 0.1.0
+entrypoint: ""
+dependencies:
+    github.com/apollographql/skills/skills/rust-best-practices: ^1.2.3
+    github.com/jeffallan/claude-skills/skills/rust-engineer: ^0.4.15
+tool_compat:
+    - claude-code
+vendor: false

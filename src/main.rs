@@ -11,7 +11,8 @@ mod tui;
 mod utils;
 
 use config::{
-    global_config_path, list_requests, local_config_path, resolve_config_path, RequestConfig,
+    global_config_path, global_dir, list_requests, local_config_path, local_dir,
+    prune_empty_parents, resolve_config_path, RequestConfig,
 };
 
 use crate::config::ChainConfig;
@@ -257,7 +258,10 @@ fn cmd_show(name: String) -> Result<()> {
 fn cmd_delete(name: String) -> Result<()> {
     let path = resolve_config_path(&name)
         .with_context(|| format!("Request '{}' not found", name))?;
+    let gd = global_dir();
+    let base = if path.starts_with(&gd) { gd } else { local_dir() };
     fs::remove_file(&path)?;
+    prune_empty_parents(&path, &base);
     println!("{} '{}'", "Deleted".green().bold(), name);
     Ok(())
 }
@@ -281,17 +285,8 @@ fn cmd_completions(shell: Shell) -> Result<()> {
 }
 
 fn cmd_copy(name: String, new_name: String, global: bool) -> Result<()> {
-    // get the path of the existing config
-    let path = if global {
-        global_config_path(&name)
-    } else {
-        local_config_path(&name)
-    };
-
-    // if it doesn't exists then bail
-    if !path.exists() {
-        anyhow::bail!("Request '{}' does not exists at {}", name, path.display());
-    }
+    let path = resolve_config_path(&name)
+        .with_context(|| format!("Request '{}' not found", name))?;
 
     // get the path of the new config
     let new_path = if global {
@@ -334,18 +329,14 @@ fn is_chain_request(name: &String) -> Result<bool> {
 
 const ZSH_COMPLETION: &str = r#"_ichigo_configs() {
     local -a configs
-    local f
-    if [[ -d "$PWD/.ichigo" ]]; then
-        for f in "$PWD/.ichigo"/*.yaml(N); do
-            configs+=("${f:t:r}")
-        done
-    fi
-    local global_dir="${HOME}/.config/ichigo"
-    if [[ -d "$global_dir" ]]; then
-        for f in "$global_dir"/*.yaml(N); do
-            configs+=("${f:t:r}")
-        done
-    fi
+    local base f rel
+    for base in "$PWD/.ichigo" "${HOME}/.config/ichigo"; do
+        [[ -d "$base" ]] || continue
+        while IFS= read -r f; do
+            rel="${f#$base/}"
+            configs+=("${rel%.yaml}")
+        done < <(find "$base" -name "*.yaml" 2>/dev/null)
+    done
     _describe 'config name' configs
 }
 
@@ -390,18 +381,14 @@ const BASH_COMPLETION: &str = r#"_ichigo_completions() {
 
     case "$cmd" in
         run|show|delete|test|copy)
-            local configs=()
-            if [[ -d "$PWD/.ichigo" ]]; then
-                for f in "$PWD/.ichigo"/*.yaml; do
-                    [[ -f "$f" ]] && configs+=("$(basename "${f%.yaml}")")
-                done
-            fi
-            local global_dir="${HOME}/.config/ichigo"
-            if [[ -d "$global_dir" ]]; then
-                for f in "$global_dir"/*.yaml; do
-                    [[ -f "$f" ]] && configs+=("$(basename "${f%.yaml}")")
-                done
-            fi
+            local configs=() base f rel
+            for base in "$PWD/.ichigo" "${HOME}/.config/ichigo"; do
+                [[ -d "$base" ]] || continue
+                while IFS= read -r f; do
+                    rel="${f#$base/}"
+                    configs+=("${rel%.yaml}")
+                done < <(find "$base" -name "*.yaml" 2>/dev/null)
+            done
             COMPREPLY=($(compgen -W "${configs[*]}" -- "$cur"))
             ;;
         completions)
@@ -417,11 +404,11 @@ complete -F _ichigo_completions ichigo
 "#;
 
 const FISH_COMPLETION: &str = r#"function __ichigo_configs
-    set -l local_dir (pwd)/.ichigo
-    set -l global_dir $HOME/.config/ichigo
-    for f in $local_dir/*.yaml $global_dir/*.yaml
-        if test -f $f
-            echo (basename $f .yaml)
+    for base in (pwd)/.ichigo $HOME/.config/ichigo
+        test -d $base || continue
+        find $base -name "*.yaml" 2>/dev/null | while read -l f
+            set -l rel (string replace -- "$base/" "" $f)
+            echo (string replace -r '\.yaml$' '' -- $rel)
         end
     end
 end
