@@ -13,6 +13,10 @@ pub fn global_dir() -> PathBuf {
     PathBuf::from(home).join(".config").join("ichigo")
 }
 
+pub(crate) fn dir_for(global: bool) -> PathBuf {
+    if global { global_dir() } else { local_dir() }
+}
+
 pub struct RequestEntry {
     pub name: String,
     pub global: bool,
@@ -99,33 +103,51 @@ pub fn list_requests() -> Result<Vec<RequestEntry>> {
 
     let local = local_dir();
     if local.exists() {
-        for entry in fs::read_dir(&local).context("Failed to read .ichigo directory")? {
-            let path = entry?.path();
-            if path.extension().map_or(false, |e| e == "yaml") {
-                if let Some(stem) = path.file_stem() {
-                    let name = stem.to_string_lossy().into_owned();
-                    seen.insert(name.clone());
-                    entries.push(RequestEntry { name, global: false });
-                }
-            }
-        }
+        collect_yaml_entries(&local, &local, false, &mut seen, &mut entries);
     }
 
     let global = global_dir();
     if global.exists() {
-        for entry in fs::read_dir(&global).context("Failed to read ~/.config/ichigo directory")? {
-            let path = entry?.path();
-            if path.extension().map_or(false, |e| e == "yaml") {
-                if let Some(stem) = path.file_stem() {
-                    let name = stem.to_string_lossy().into_owned();
-                    if !seen.contains(&name) {
-                        entries.push(RequestEntry { name, global: true });
-                    }
-                }
-            }
-        }
+        collect_yaml_entries(&global, &global, true, &mut seen, &mut entries);
     }
 
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
+}
+
+fn collect_yaml_entries(
+    dir: &std::path::Path,
+    base: &std::path::Path,
+    global: bool,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<RequestEntry>,
+) {
+    let Ok(read) = fs::read_dir(dir) else { return };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_yaml_entries(&path, base, global, seen, entries);
+        } else if path.extension().map_or(false, |e| e == "yaml") {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let name = rel.with_extension("").to_string_lossy().into_owned();
+                if seen.insert(name.clone()) {
+                    entries.push(RequestEntry { name, global });
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn prune_empty_parents(path: &std::path::Path, base: &std::path::Path) {
+    for dir in path.ancestors().skip(1) {
+        if dir == base {
+            break;
+        }
+        let is_empty = fs::read_dir(dir).map_or(false, |mut d| d.next().is_none());
+        if is_empty {
+            fs::remove_dir(dir).ok();
+        } else {
+            break;
+        }
+    }
 }
