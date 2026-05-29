@@ -108,6 +108,7 @@ enum Mode {
     },
     ConfirmDelete {
         entry_name: String,
+        global: bool,
     },
     // Sub-mode for adding a profile while creating/editing a request.
     // focused: 0 = profile name, 1+2i = params[i].key, 2+2i = params[i].value
@@ -765,10 +766,10 @@ impl App {
             KeyCode::Char('d') => {
                 let Some(idx) = self.selected_entry_index() else { return false };
                 let entry = &self.entries[idx];
-                if entry.global {
-                    return false;
-                }
-                self.mode = Mode::ConfirmDelete { entry_name: entry.name.clone() };
+                // if entry.global {
+                //     return false;
+                // }
+                self.mode = Mode::ConfirmDelete { entry_name: entry.name.clone(), global: entry.global };
             }
             KeyCode::Char('f') => {
                 self.filter_active = true;
@@ -805,11 +806,17 @@ impl App {
     fn handle_key_confirm_delete(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let entry_name = match &self.mode {
-                    Mode::ConfirmDelete { entry_name } => entry_name.clone(),
+                let (entry_name, global) = match &self.mode {
+                    Mode::ConfirmDelete { entry_name , global} => (entry_name.clone(), *global),
                     _ => return false,
                 };
-                let path = crate::config::local_config_path(&entry_name);
+
+                let path = if global {
+                    crate::config::global_config_path(&entry_name)
+                } else {
+                    crate::config::local_config_path(&entry_name)
+                };
+                // let path = crate::config::local_config_path(&entry_name);
                 let _ = fs::remove_file(&path);
                 if let Ok(entries) = load_entries() {
                     self.entries = entries;
@@ -1032,7 +1039,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Mode::NewProfile { name, params, focused, error, .. } => {
             draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref());
         }
-        Mode::ConfirmDelete { entry_name } => {
+        Mode::ConfirmDelete { entry_name, ..} => {
             draw_confirm_delete(frame, panes[1], entry_name);
         }
     }
