@@ -766,9 +766,6 @@ impl App {
             KeyCode::Char('d') => {
                 let Some(idx) = self.selected_entry_index() else { return false };
                 let entry = &self.entries[idx];
-                // if entry.global {
-                //     return false;
-                // }
                 self.mode = Mode::ConfirmDelete { entry_name: entry.name.clone(), global: entry.global };
             }
             KeyCode::Char('f') => {
@@ -816,7 +813,6 @@ impl App {
                 } else {
                     crate::config::local_config_path(&entry_name)
                 };
-                // let path = crate::config::local_config_path(&entry_name);
                 let _ = fs::remove_file(&path);
                 if let Ok(entries) = load_entries() {
                     self.entries = entries;
