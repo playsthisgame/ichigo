@@ -96,6 +96,8 @@ enum Mode {
         status: u16,
         body: String,
         scroll: u16,
+        response_filter: String,
+        response_filter_active: bool,
     },
     TestResponse {
         results: crate::tester::TestResults,
@@ -224,6 +226,8 @@ impl App {
                 status: 0,
                 body: "Chain execution is not supported in the TUI yet.".to_string(),
                 scroll: 0,
+                response_filter: String::new(),
+                response_filter_active: false,
             };
             return;
         }
@@ -260,6 +264,8 @@ impl App {
                 status: 0,
                 body: "Testing chains is not supported.".to_string(),
                 scroll: 0,
+                response_filter: String::new(),
+                response_filter_active: false,
             };
             return;
         }
@@ -338,7 +344,7 @@ impl App {
             .and_then(|config| crate::tester::collect_test_results(&config, vars, iterations))
         {
             Ok(results) => self.mode = Mode::TestResponse { results },
-            Err(e) => self.mode = Mode::Response { status: 0, body: format!("Error: {e}"), scroll: 0 },
+            Err(e) => self.mode = Mode::Response { status: 0, body: format!("Error: {e}"), scroll: 0, response_filter: String::new(), response_filter_active: false},
         }
     }
 
@@ -360,7 +366,7 @@ impl App {
             Err(e) => (0, format!("Error: {e}")),
         };
 
-        self.mode = Mode::Response { status, body, scroll: 0 };
+        self.mode = Mode::Response { status, body, scroll: 0 , response_filter: String::new(), response_filter_active: false };
     }
 
     // Returns true when the event loop should exit.
@@ -388,6 +394,9 @@ impl App {
         }
         if matches!(self.mode, Mode::ConfirmDelete { .. }) {
             return self.handle_key_confirm_delete(key.code);
+        }
+        if matches!(self.mode, Mode::Response { response_filter_active: true, .. }) {
+            return self.handle_key_response_filter(key);
         }
         self.handle_key_response(key.code)
     }
@@ -481,7 +490,7 @@ impl App {
                     *focused = focused.checked_sub(1).unwrap_or(total.saturating_sub(1));
                 }
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Mode::NewProfile { params, focused, .. } = &mut self.mode {
                     let new_idx = 1 + 2 * params.len();
                     params.push((String::new(), String::new()));
@@ -806,6 +815,31 @@ impl App {
         false
     }
 
+    fn handle_key_response_filter(&mut self, key: KeyEvent) -> bool {
+        if let Mode::Response { response_filter, response_filter_active, scroll, .. } = &mut self.mode {
+            match key.code {
+                KeyCode::Esc => {
+                    response_filter.clear();
+                    *response_filter_active = false;
+                    *scroll = 0;
+                }
+                KeyCode::Enter => {
+                    *response_filter_active = false;
+                }
+                KeyCode::Char(c) => {
+                    response_filter.push(c);
+                    *scroll = 0;
+                }
+                KeyCode::Backspace => {
+                    response_filter.pop();
+                    *scroll = 0;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn handle_key_confirm_delete(&mut self, code: KeyCode) -> bool {
         match code {
             KeyCode::Char('y') | KeyCode::Enter => {
@@ -957,6 +991,11 @@ impl App {
                 };
                 copy_to_clipboard(&text);
             }
+            KeyCode::Char('f') => {
+                if let Mode::Response { response_filter_active, .. } = &mut self.mode {
+                    *response_filter_active = true;
+                }
+            }
             _ => {}
         }
         false
@@ -1030,8 +1069,8 @@ fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestInput { vars, focused, iterations, entry_name } => {
             draw_test_input(frame, panes[1], vars, iterations, *focused, entry_name);
         }
-        Mode::Response { status, body, scroll } => {
-            draw_response(frame, panes[1], *status, body, *scroll);
+        Mode::Response { status, body, scroll , response_filter, response_filter_active} => {
+            draw_response(frame, panes[1], *status, body, *scroll, response_filter, *response_filter_active);
         }
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
@@ -1516,7 +1555,7 @@ fn status_color(status: u16) -> Color {
     else { Color::Red }
 }
 
-fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll: u16) {
+fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll: u16, response_filter: &str, response_filter_active: bool) {
     let (status_color, status_label) = if status == 0 {
         (Color::Red, " Error ".to_string())
     } else if status < 300 {
@@ -1534,7 +1573,40 @@ fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll:
         Span::styled(status_label, Style::default().fg(Color::Black).bg(status_color)),
     ]);
 
-    let lines: Vec<Line<'static>> = body.lines().map(colorize_json_line).collect();
+    let show_filter = response_filter_active || !response_filter.is_empty();
+    let chunks = if show_filter {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(0), Constraint::Min(0)])
+            .split(area)
+    };
+
+    if show_filter {
+        let display = if response_filter_active { format!("{}█", response_filter) } else { response_filter.to_string() };
+        let filter_widget = Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(display, Style::default().fg(Color::White)),
+        ]))
+        .block(
+            Block::default()
+                .title(" Filter ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(if response_filter_active { Color::Yellow } else { Color::DarkGray })),
+        );
+        frame.render_widget(filter_widget, chunks[0]);
+    }
+
+    let q = response_filter.to_lowercase();
+    let lines: Vec<Line<'static>> = body
+        .lines()
+        .filter(|line| q.is_empty() || line.to_lowercase().contains(&q))
+        .map(colorize_json_line)
+        .collect();
 
     let paragraph = Paragraph::new(lines)
         .block(
@@ -1545,8 +1617,9 @@ fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll:
         )
         .scroll((scroll, 0));
 
-    frame.render_widget(paragraph, area);
+    frame.render_widget(paragraph, chunks[1]);
 }
+
 
 fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
     let spans: Vec<Span<'static>> = match mode {
@@ -1615,7 +1688,7 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("save profile", Style::default().fg(Color::DarkGray)),
             Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("next/prev field", Style::default().fg(Color::DarkGray)),
-            Span::styled("   a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("   Ctrl+a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("add param", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
@@ -1629,6 +1702,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         Mode::Response { .. } | Mode::TestResponse { .. } => vec![
             Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("scroll", Style::default().fg(Color::DarkGray)),
+            Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("filter", Style::default().fg(Color::DarkGray)),
             Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("copy", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
