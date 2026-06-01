@@ -66,6 +66,7 @@ fn print_ascii_line_graph(timings: &[u64]) {
     let n = timings.len();
 
     let mut grid: Vec<Vec<bool>> = vec![vec![false; W]; H];
+    #[allow(clippy::needless_range_loop)]
     for col in 0..W {
         let idx = (col * n / W).min(n - 1);
         let ms = timings[idx];
@@ -94,13 +95,11 @@ pub fn run_tester(
     iterations: usize,
     profile: Option<String>,
 ) -> Result<()> {
-    if let Some(ref profile_name) = profile {
-        if let Some(profiles) = &config.profiles {
-            if let Some(found) = profiles.iter().find(|p| p.name.eq_ignore_ascii_case(profile_name)) {
+    if let Some(ref profile_name) = profile
+        && let Some(profiles) = &config.profiles
+            && let Some(found) = profiles.iter().find(|p| p.name.eq_ignore_ascii_case(profile_name)) {
                 vars.extend(found.params.clone());
             }
-        }
-    }
     let results = collect_test_results(config, vars, iterations)?;
     let max_count = results.statuses.iter().map(|s| s.count).max().unwrap_or(1);
 

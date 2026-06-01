@@ -64,7 +64,7 @@ pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>, verb
             .body(data);
     }
 
-    return req.send().with_context(|| format!("Failed to connect to {}",url));
+    req.send().with_context(|| format!("Failed to connect to {}",url))
 
 }
 

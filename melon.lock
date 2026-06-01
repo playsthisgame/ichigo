@@ -1,5 +1,14 @@
-generated_at: "2026-05-29T02:48:55Z"
+generated_at: "2026-06-01T00:59:04Z"
 dependencies:
+    - name: github.com/affaan-m/everything-claude-code/skills/rust-testing
+      version: 2.0.0-rc.1
+      git_tag: v2.0.0-rc.1
+      repo_url: https://github.com/affaan-m/everything-claude-code
+      subdir: skills/rust-testing
+      entrypoint: SKILL.md
+      tree_hash: sha256:4ab924e1cd287af91df73ca78709826aa34258ef6206caba2ba9edab567e481f
+      files:
+        - SKILL.md
     - name: github.com/apollographql/skills/skills/rust-best-practices
       version: 1.2.3
       git_tag: v1.2.3

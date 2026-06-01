@@ -199,7 +199,7 @@ fn cmd_run(name: String, vars: Vec<String>, verbose: bool, profile: Option<Strin
             if verbose {
                 println!("{} {}", "▸".cyan().bold(), step.name.bold());
             }
-            let extracted = runner::run_request(&step, &mut current_vars, verbose, !is_last, None)?;
+            let extracted = runner::run_request(step, &mut current_vars, verbose, !is_last, None)?;
             current_vars.extend(extracted);
         }
         Ok(())
@@ -321,7 +321,7 @@ fn cmd_copy(name: String, new_name: String, global: bool) -> Result<()> {
 }
 
 fn is_chain_request(name: &String) -> Result<bool> {
-    let path = resolve_config_path(&name)
+    let path = resolve_config_path(name)
         .with_context(|| format!("Request '{}' not found", name))?;
     let content = fs::read_to_string(&path)?;
     Ok(content.contains("steps:"))

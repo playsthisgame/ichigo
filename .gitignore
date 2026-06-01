@@ -3,7 +3,3 @@
 .ichigo
 .idea
 
-# melon managed — do not edit this block
-.melon/
-.claude/skills/rust-best-practices
-.claude/skills/rust-engineer

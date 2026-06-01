@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use std::{collections::HashMap, fs, io};
+use std::{collections::{HashMap, HashSet}, fs, io};
 
 use crate::config::{
     dir_for, list_requests, prune_empty_parents, resolve_config_path, ChainConfig, RequestConfig,
@@ -69,6 +69,141 @@ fn load_entries() -> Result<Vec<Entry>> {
         entries.push(Entry { name: r.name, global: r.global, kind });
     }
     Ok(entries)
+}
+
+// ─── Tree model ───────────────────────────────────────────────────────────────
+
+enum TreeNode {
+    Folder { path: String, children: Vec<TreeNode> },
+    Leaf { entry_idx: usize },
+}
+
+enum VisibleRow {
+    Folder { path: String, expanded: bool, prefix: String },
+    Leaf { entry_idx: usize, prefix: String },
+}
+
+fn build_tree(entries: &[Entry]) -> Vec<TreeNode> {
+    let (globals, locals): (Vec<_>, Vec<_>) =
+        entries.iter().enumerate().partition(|(_, e)| e.global);
+
+    let mut root: Vec<TreeNode> = Vec::new();
+    for (idx, entry) in &locals {
+        tree_insert(&mut root, &entry.name, *idx, "");
+    }
+    if !globals.is_empty() {
+        let mut global_children: Vec<TreeNode> = Vec::new();
+        for (idx, entry) in &globals {
+            tree_insert(&mut global_children, &entry.name, *idx, "[global]");
+        }
+        root.push(TreeNode::Folder { path: "[global]".to_string(), children: global_children });
+    }
+    root
+}
+
+fn tree_insert(nodes: &mut Vec<TreeNode>, name: &str, entry_idx: usize, path_prefix: &str) {
+    match name.find('/') {
+        None => nodes.push(TreeNode::Leaf { entry_idx }),
+        Some(slash) => {
+            let segment = &name[..slash];
+            let rest = &name[slash + 1..];
+            let full_path = if path_prefix.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{}/{}", path_prefix, segment)
+            };
+            if let Some(pos) = nodes.iter().position(|n| {
+                matches!(n, TreeNode::Folder { path, .. } if path == &full_path)
+            }) {
+                if let TreeNode::Folder { children, .. } = &mut nodes[pos] {
+                    tree_insert(children, rest, entry_idx, &full_path);
+                }
+            } else {
+                let mut children = Vec::new();
+                tree_insert(&mut children, rest, entry_idx, &full_path);
+                nodes.push(TreeNode::Folder { path: full_path, children });
+            }
+        }
+    }
+}
+
+fn visible_rows(tree: &[TreeNode], collapsed: &HashSet<String>) -> Vec<VisibleRow> {
+    let mut rows = Vec::new();
+    emit_rows(tree, collapsed, true, "", &mut rows);
+    rows
+}
+
+fn emit_rows(
+    nodes: &[TreeNode],
+    collapsed: &HashSet<String>,
+    is_root: bool,
+    parent_prefix: &str,
+    rows: &mut Vec<VisibleRow>,
+) {
+    let count = nodes.len();
+    for (i, node) in nodes.iter().enumerate() {
+        let is_last = i == count - 1;
+        match node {
+            TreeNode::Folder { path, children } => {
+                let expanded = !collapsed.contains(path);
+                let (my_prefix, child_prefix) = if is_root {
+                    (String::new(), String::new())
+                } else {
+                    let conn = if is_last { "└── " } else { "├── " };
+                    let cont = if is_last { "    " } else { "│   " };
+                    (format!("{}{}", parent_prefix, conn), format!("{}{}", parent_prefix, cont))
+                };
+                rows.push(VisibleRow::Folder { path: path.clone(), expanded, prefix: my_prefix });
+                if expanded {
+                    emit_rows(children, collapsed, false, &child_prefix, rows);
+                }
+            }
+            TreeNode::Leaf { entry_idx } => {
+                let my_prefix = if is_root {
+                    String::new()
+                } else {
+                    let conn = if is_last { "└── " } else { "├── " };
+                    format!("{}{}", parent_prefix, conn)
+                };
+                rows.push(VisibleRow::Leaf { entry_idx: *entry_idx, prefix: my_prefix });
+            }
+        }
+    }
+}
+
+fn detect_nerd_fonts() -> bool {
+    if let Ok(val) = std::env::var("ICHIGO_ICONS") {
+        return val == "1";
+    }
+    if std::env::var("KITTY_WINDOW_ID").is_ok() { return true; }
+    if std::env::var("WEZTERM_PANE").is_ok() || std::env::var("WEZTERM_EXECUTABLE").is_ok() { return true; }
+    if let Ok(p) = std::env::var("TERM_PROGRAM")
+        && matches!(p.as_str(), "ghostty" | "iTerm.app") { return true; }
+    if let Ok(t) = std::env::var("TERM")
+        && matches!(t.as_str(), "xterm-kitty" | "xterm-ghostty") { return true; }
+    // Inside tmux, the outer terminal's env vars are hidden. Ask tmux directly.
+    if std::env::var("TMUX").is_ok() {
+        if tmux_env_matches("TERM_PROGRAM", &["ghostty", "iTerm.app"]) { return true; }
+        if tmux_env_matches("TERM", &["xterm-kitty", "xterm-ghostty"]) { return true; }
+        if tmux_env_matches("KITTY_WINDOW_ID", &[]) { return true; }
+    }
+    false
+}
+
+fn tmux_env_matches(var: &str, values: &[&str]) -> bool {
+    let Ok(out) = std::process::Command::new("tmux")
+        .args(["show-environment", "-g", var])
+        .output() else { return false };
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let line = raw.trim();
+    // tmux prefixes unset vars with '-'; skip those.
+    if line.starts_with('-') { return false; }
+    if values.is_empty() {
+        // Caller just wants to know if the var is set at all (e.g. KITTY_WINDOW_ID).
+        return line.contains('=');
+    }
+    let val = line.trim_start_matches(&format!("{}=", var));
+    values.contains(&val)
 }
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
@@ -133,6 +268,9 @@ enum Mode {
 
 struct App {
     entries: Vec<Entry>,
+    tree: Vec<TreeNode>,
+    collapsed_folders: HashSet<String>,
+    use_nerd_fonts: bool,
     list_state: ListState,
     pending_g: bool,
     filter: String,
@@ -143,11 +281,29 @@ struct App {
 impl App {
     fn new() -> Result<Self> {
         let entries = load_entries()?;
+        let tree = build_tree(&entries);
+        let use_nerd_fonts = detect_nerd_fonts();
+        let collapsed_folders = HashSet::new();
         let mut list_state = ListState::default();
-        if !entries.is_empty() {
+        let initial_count = visible_rows(&tree, &collapsed_folders).len();
+        if initial_count > 0 {
             list_state.select(Some(0));
         }
-        Ok(Self { entries, list_state, pending_g: false, filter: String::new(), filter_active: false, mode: Mode::Browse })
+        Ok(Self {
+            entries,
+            tree,
+            collapsed_folders,
+            use_nerd_fonts,
+            list_state,
+            pending_g: false,
+            filter: String::new(),
+            filter_active: false,
+            mode: Mode::Browse,
+        })
+    }
+
+    fn using_tree(&self) -> bool {
+        self.filter.is_empty()
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
@@ -171,8 +327,16 @@ impl App {
             .collect()
     }
 
+    fn visible_count(&self) -> usize {
+        if self.using_tree() {
+            visible_rows(&self.tree, &self.collapsed_folders).len()
+        } else {
+            self.filtered_indices().len()
+        }
+    }
+
     fn move_down(&mut self) {
-        let count = self.filtered_indices().len();
+        let count = self.visible_count();
         if count == 0 { return; }
         let next = match self.list_state.selected() {
             Some(i) => (i + 1).min(count - 1),
@@ -182,7 +346,7 @@ impl App {
     }
 
     fn move_up(&mut self) {
-        let count = self.filtered_indices().len();
+        let count = self.visible_count();
         if count == 0 { return; }
         let next = match self.list_state.selected() {
             Some(i) => i.saturating_sub(1),
@@ -192,21 +356,49 @@ impl App {
     }
 
     fn move_top(&mut self) {
-        if !self.filtered_indices().is_empty() {
+        if self.visible_count() > 0 {
             self.list_state.select(Some(0));
         }
     }
 
     fn move_bottom(&mut self) {
-        let count = self.filtered_indices().len();
+        let count = self.visible_count();
         if count > 0 {
             self.list_state.select(Some(count - 1));
         }
     }
 
     fn selected_entry_index(&self) -> Option<usize> {
-        let filtered = self.filtered_indices();
-        self.list_state.selected().and_then(|pos| filtered.get(pos).copied())
+        if self.using_tree() {
+            let rows = visible_rows(&self.tree, &self.collapsed_folders);
+            self.list_state.selected().and_then(|pos| {
+                rows.get(pos).and_then(|row| match row {
+                    VisibleRow::Leaf { entry_idx, .. } => Some(*entry_idx),
+                    VisibleRow::Folder { .. } => None,
+                })
+            })
+        } else {
+            let filtered = self.filtered_indices();
+            self.list_state.selected().and_then(|pos| filtered.get(pos).copied())
+        }
+    }
+
+    fn toggle_folder(&mut self, path: String) {
+        if self.collapsed_folders.contains(&path) {
+            self.collapsed_folders.remove(&path);
+        } else {
+            self.collapsed_folders.insert(path.clone());
+            // After collapse, move cursor to the folder node if it went out of bounds.
+            let rows = visible_rows(&self.tree, &self.collapsed_folders);
+            let count = rows.len();
+            if let Some(pos) = self.list_state.selected()
+                && pos >= count {
+                    let folder_pos = rows.iter().position(|row| {
+                        matches!(row, VisibleRow::Folder { path: p, .. } if *p == path)
+                    });
+                    self.list_state.select(Some(folder_pos.unwrap_or(count.saturating_sub(1))));
+                }
+        }
     }
 
     fn try_run_selected(&mut self) {
@@ -661,8 +853,8 @@ impl App {
             }
         }
 
-        if let Some(ref old_name) = original_name {
-            if is_rename {
+        if let Some(ref old_name) = original_name
+            && is_rename {
                 let old_path = if global {
                     crate::config::global_config_path(old_name)
                 } else {
@@ -671,13 +863,17 @@ impl App {
                 let _ = fs::remove_file(&old_path);
                 prune_empty_parents(&old_path, &dir_for(global));
             }
-        }
 
         if let Ok(entries) = load_entries() {
             let idx = entries.iter().position(|e| e.name == name);
+            self.tree = build_tree(&entries);
             self.entries = entries;
-            if let Some(i) = idx {
-                self.list_state.select(Some(i));
+            if let Some(entry_idx) = idx {
+                let rows = visible_rows(&self.tree, &self.collapsed_folders);
+                let pos = rows.iter().position(|row| {
+                    matches!(row, VisibleRow::Leaf { entry_idx: i, .. } if *i == entry_idx)
+                });
+                self.list_state.select(pos.or(if rows.is_empty() { None } else { Some(0) }));
             }
         }
         self.mode = Mode::Browse;
@@ -721,7 +917,26 @@ impl App {
                     self.pending_g = true;
                 }
             }
-            KeyCode::Char('r') | KeyCode::Enter => self.try_run_selected(),
+            KeyCode::Char(' ') if self.using_tree() => {
+                if let Some(pos) = self.list_state.selected() {
+                    let rows = visible_rows(&self.tree, &self.collapsed_folders);
+                    if let Some(VisibleRow::Folder { path, .. }) = rows.get(pos) {
+                        self.toggle_folder(path.clone());
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {}
+            KeyCode::Char('r') | KeyCode::Enter => {
+                if self.using_tree()
+                    && let Some(pos) = self.list_state.selected() {
+                    let rows = visible_rows(&self.tree, &self.collapsed_folders);
+                    if let Some(VisibleRow::Folder { path, .. }) = rows.get(pos) {
+                        self.toggle_folder(path.clone());
+                        return false;
+                    }
+                }
+                self.try_run_selected()
+            }
             KeyCode::Char('t') => self.try_test_selected(),
             KeyCode::Char('n') => {
                 self.mode = Mode::NewRequest {
@@ -785,7 +1000,8 @@ impl App {
             }
             KeyCode::Char('f') => {
                 self.filter_active = true;
-                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+                let count = self.filtered_indices().len();
+                self.list_state.select(if count == 0 { None } else { Some(0) });
             }
             _ => {}
         }
@@ -797,18 +1013,22 @@ impl App {
             KeyCode::Esc => {
                 self.filter_active = false;
                 self.filter.clear();
-                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+                // Esc returns to tree mode; restore cursor at top of tree.
+                let count = self.visible_count();
+                self.list_state.select(if count == 0 { None } else { Some(0) });
             }
             KeyCode::Enter => {
                 self.filter_active = false;
             }
             KeyCode::Char(c) => {
                 self.filter.push(c);
-                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+                let count = self.visible_count();
+                self.list_state.select(if count == 0 { None } else { Some(0) });
             }
             KeyCode::Backspace => {
                 self.filter.pop();
-                self.list_state.select(if self.filtered_indices().is_empty() { None } else { Some(0) });
+                let count = self.visible_count();
+                self.list_state.select(if count == 0 { None } else { Some(0) });
             }
             _ => {}
         }
@@ -856,8 +1076,9 @@ impl App {
                 let _ = fs::remove_file(&path);
                 prune_empty_parents(&path, &dir_for(global));
                 if let Ok(entries) = load_entries() {
+                    self.tree = build_tree(&entries);
                     self.entries = entries;
-                    let count = self.filtered_indices().len();
+                    let count = self.visible_count();
                     let new_pos = self.list_state.selected()
                         .map(|i| i.min(count.saturating_sub(1)));
                     self.list_state.select(if count == 0 { None } else { new_pos });
@@ -1051,7 +1272,13 @@ fn draw(frame: &mut Frame, app: &mut App) {
         .split(outer[0]);
 
     let filtered = app.filtered_indices();
-    draw_list(frame, panes[0], &app.entries, &filtered, &mut app.list_state, &app.filter, app.filter_active);
+    let tree_rows_storage: Option<Vec<VisibleRow>> = if app.using_tree() {
+        Some(visible_rows(&app.tree, &app.collapsed_folders))
+    } else {
+        None
+    };
+    let tree_rows = tree_rows_storage.as_deref();
+    draw_list(frame, panes[0], &app.entries, tree_rows, &filtered, &mut app.list_state, &app.filter, app.filter_active, app.use_nerd_fonts);
 
     match &app.mode {
         Mode::Browse => {
@@ -1089,16 +1316,18 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_help(frame, outer[1], &app.mode);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_list(
     frame: &mut Frame,
     area: Rect,
     entries: &[Entry],
+    tree_rows: Option<&[VisibleRow]>,
     filtered: &[usize],
     list_state: &mut ListState,
     filter: &str,
     filter_active: bool,
+    use_nerd_fonts: bool,
 ) {
-    // Split the panel: filter box on top (3 rows) when active or non-empty, list below.
     let show_filter = filter_active || !filter.is_empty();
     let chunks = if show_filter {
         Layout::default()
@@ -1127,7 +1356,21 @@ fn draw_list(
         frame.render_widget(filter_widget, chunks[0]);
     }
 
-    let items: Vec<ListItem> = filtered.iter().map(|&i| make_list_item(&entries[i])).collect();
+    let (items, highlight_sym): (Vec<ListItem>, &str) = if let Some(rows) = tree_rows {
+        let items = rows.iter().map(|row| match row {
+            VisibleRow::Folder { path, expanded, prefix, .. } => {
+                make_tree_folder_item(path, *expanded, prefix, use_nerd_fonts)
+            }
+            VisibleRow::Leaf { entry_idx, prefix, .. } => {
+                make_tree_leaf_item(&entries[*entry_idx], prefix, use_nerd_fonts)
+            }
+        }).collect();
+        (items, "▶ ")
+    } else {
+        let items = filtered.iter().map(|&i| make_list_item(&entries[i])).collect();
+        (items, "▶ ")
+    };
+
     let list = List::new(items)
         .block(
             Block::default()
@@ -1141,7 +1384,7 @@ fn draw_list(
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(highlight_sym);
     frame.render_stateful_widget(list, chunks[1], list_state);
 }
 
@@ -1206,6 +1449,7 @@ fn draw_profile_select(
     frame.render_widget(paragraph, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_new_request(
     frame: &mut Frame,
     area: Rect,
@@ -1785,8 +2029,8 @@ fn colorize_json_line(line: &str) -> Line<'static> {
     }
 
     // Key-value line: "key": value
-    if trimmed.starts_with('"') {
-        if let Some(pos) = trimmed.find("\": ") {
+    if trimmed.starts_with('"')
+        && let Some(pos) = trimmed.find("\": ") {
             let key = trimmed[..pos + 1].to_string(); // includes closing "
             let value = &trimmed[pos + 3..];          // skip ": "
             let mut spans = vec![
@@ -1797,7 +2041,6 @@ fn colorize_json_line(line: &str) -> Line<'static> {
             spans.extend(colorize_json_value(value));
             return Line::from(spans);
         }
-    }
 
     // Array value or plain text
     let mut spans = vec![Span::raw(indent)];
@@ -1936,6 +2179,50 @@ fn make_list_item(entry: &Entry) -> ListItem<'static> {
     ListItem::new(line)
 }
 
+fn make_tree_folder_item(path: &str, expanded: bool, prefix: &str, use_nerd_fonts: bool) -> ListItem<'static> {
+    let display_name = path.rsplit('/').next().unwrap_or(path).to_string();
+    let line = if use_nerd_fonts {
+        let icon = if expanded { "\u{f07c} " } else { "\u{f07b} " };
+        Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(icon.to_string(), Style::default().fg(Color::Yellow)),
+            Span::styled(display_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}/", display_name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        ])
+    };
+    ListItem::new(line)
+}
+
+fn make_tree_leaf_item(entry: &Entry, prefix: &str, _use_nerd_fonts: bool) -> ListItem<'static> {
+    let leaf_name = entry.name.rsplit('/').next().unwrap_or(&entry.name).to_string();
+    let line = match &entry.kind {
+        EntryKind::Chain { .. } => Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(" CHAIN ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(leaf_name, Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        EntryKind::Request { method, description, .. } => {
+            let color = method_color(method);
+            let mut spans = vec![
+                Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!(" {:<6}", method), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(leaf_name, Style::default().add_modifier(Modifier::BOLD)),
+            ];
+            if let Some(desc) = description.as_ref().filter(|d| !d.is_empty()) {
+                spans.push(Span::styled(format!(" — {}", desc), Style::default().fg(Color::DarkGray)));
+            }
+            Line::from(spans)
+        }
+    };
+    ListItem::new(line)
+}
+
 fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = vec![];
 
@@ -2019,4 +2306,117 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
     }
 
     lines
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf_entry(name: &str, global: bool) -> Entry {
+        Entry {
+            name: name.to_string(),
+            global,
+            kind: EntryKind::Request {
+                method: "GET".to_string(),
+                url: "http://example.com".to_string(),
+                description: None,
+                headers: HashMap::new(),
+                query: HashMap::new(),
+                body_data: None,
+                profiles: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn build_tree_flat_list() {
+        let entries = vec![leaf_entry("login", false), leaf_entry("ping", false)];
+        let tree = build_tree(&entries);
+        assert_eq!(tree.len(), 2);
+        assert!(matches!(tree[0], TreeNode::Leaf { entry_idx: 0 }));
+        assert!(matches!(tree[1], TreeNode::Leaf { entry_idx: 1 }));
+    }
+
+    #[test]
+    fn build_tree_nested() {
+        let entries = vec![
+            leaf_entry("auth/login", false),
+            leaf_entry("auth/refresh", false),
+            leaf_entry("ping", false),
+        ];
+        let tree = build_tree(&entries);
+        assert_eq!(tree.len(), 2);
+        match &tree[0] {
+            TreeNode::Folder { path, children } => {
+                assert_eq!(path, "auth");
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[0], TreeNode::Leaf { entry_idx: 0 }));
+                assert!(matches!(children[1], TreeNode::Leaf { entry_idx: 1 }));
+            }
+            _ => panic!("expected folder node"),
+        }
+        assert!(matches!(tree[1], TreeNode::Leaf { entry_idx: 2 }));
+    }
+
+    #[test]
+    fn build_tree_global_folder() {
+        let entries = vec![leaf_entry("login", false), leaf_entry("global_req", true)];
+        let tree = build_tree(&entries);
+        assert_eq!(tree.len(), 2);
+        assert!(matches!(tree[0], TreeNode::Leaf { entry_idx: 0 }));
+        match &tree[1] {
+            TreeNode::Folder { path, children } => {
+                assert_eq!(path, "[global]");
+                assert_eq!(children.len(), 1);
+            }
+            _ => panic!("expected [global] folder"),
+        }
+    }
+
+    #[test]
+    fn visible_rows_all_expanded() {
+        let entries = vec![leaf_entry("auth/login", false), leaf_entry("auth/refresh", false)];
+        let tree = build_tree(&entries);
+        let collapsed = HashSet::new();
+        let rows = visible_rows(&tree, &collapsed);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(&rows[0], VisibleRow::Folder { path, expanded: true, .. } if path == "auth"));
+        assert!(matches!(&rows[1], VisibleRow::Leaf { entry_idx: 0, .. }));
+        assert!(matches!(&rows[2], VisibleRow::Leaf { entry_idx: 1, .. }));
+    }
+
+    #[test]
+    fn visible_rows_collapsed_hides_children() {
+        let entries = vec![
+            leaf_entry("auth/login", false),
+            leaf_entry("auth/refresh", false),
+            leaf_entry("ping", false),
+        ];
+        let tree = build_tree(&entries);
+        let mut collapsed = HashSet::new();
+        collapsed.insert("auth".to_string());
+        let rows = visible_rows(&tree, &collapsed);
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(&rows[0], VisibleRow::Folder { path, expanded: false, .. } if path == "auth"));
+        assert!(matches!(&rows[1], VisibleRow::Leaf { entry_idx: 2, .. }));
+    }
+
+    #[test]
+    fn visible_rows_tree_prefixes() {
+        let entries = vec![leaf_entry("auth/login", false), leaf_entry("auth/refresh", false)];
+        let tree = build_tree(&entries);
+        let collapsed = HashSet::new();
+        let rows = visible_rows(&tree, &collapsed);
+        match &rows[0] {
+            VisibleRow::Folder { prefix, .. } => assert!(prefix.is_empty()),
+            _ => panic!(),
+        }
+        match &rows[1] {
+            VisibleRow::Leaf { prefix, .. } => assert!(prefix.contains("├──")),
+            _ => panic!(),
+        }
+        match &rows[2] {
+            VisibleRow::Leaf { prefix, .. } => assert!(prefix.contains("└──")),
+            _ => panic!(),
+        }
+    }
 }
