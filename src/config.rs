@@ -127,14 +127,13 @@ fn collect_yaml_entries(
         let path = entry.path();
         if path.is_dir() {
             collect_yaml_entries(&path, base, global, seen, entries);
-        } else if path.extension().map_or(false, |e| e == "yaml") {
-            if let Ok(rel) = path.strip_prefix(base) {
+        } else if path.extension().is_some_and(|e| e == "yaml")
+            && let Ok(rel) = path.strip_prefix(base) {
                 let name = rel.with_extension("").to_string_lossy().into_owned();
                 if seen.insert(name.clone()) {
                     entries.push(RequestEntry { name, global });
                 }
             }
-        }
     }
 }
 
@@ -143,7 +142,7 @@ pub(crate) fn prune_empty_parents(path: &std::path::Path, base: &std::path::Path
         if dir == base {
             break;
         }
-        let is_empty = fs::read_dir(dir).map_or(false, |mut d| d.next().is_none());
+        let is_empty = fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
         if is_empty {
             fs::remove_dir(dir).ok();
         } else {
