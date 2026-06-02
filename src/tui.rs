@@ -127,6 +127,15 @@ fn tree_insert(nodes: &mut Vec<TreeNode>, name: &str, entry_idx: usize, path_pre
     }
 }
 
+fn collect_folder_paths(nodes: &[TreeNode], paths: &mut HashSet<String>) {
+    for node in nodes {
+        if let TreeNode::Folder { path, children } = node {
+            paths.insert(path.clone());
+            collect_folder_paths(children, paths);
+        }
+    }
+}
+
 fn visible_rows(tree: &[TreeNode], collapsed: &HashSet<String>) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
     emit_rows(tree, collapsed, true, "", &mut rows);
@@ -283,7 +292,8 @@ impl App {
         let entries = load_entries()?;
         let tree = build_tree(&entries);
         let use_nerd_fonts = detect_nerd_fonts();
-        let collapsed_folders = HashSet::new();
+        let mut collapsed_folders = HashSet::new();
+        collect_folder_paths(&tree, &mut collapsed_folders);
         let mut list_state = ListState::default();
         let initial_count = visible_rows(&tree, &collapsed_folders).len();
         if initial_count > 0 {
