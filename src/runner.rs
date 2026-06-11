@@ -54,13 +54,60 @@ pub fn run_request(config: &RequestConfig, vars: &mut HashMap<String, String>, v
         }
     }
 
+    let extracted  = extract_values(&config.extract, &body_text, is_json)?;
+
+    // let mut extracted = HashMap::new();
+    //
+    // if let Some(extractions) = &config.extract {
+    //     if !is_json {
+    //         anyhow::bail!("Cannot extract values: response is not JSON");
+    //     }
+    //     let json: serde_json::Value = serde_json::from_str(&body_text)?;
+    //     for (var_name, path) in extractions {
+    //         let path = path.strip_prefix("$.").unwrap_or(path);
+    //         let mut current = &json;
+    //         for segment in path.split('.') {
+    //             current = if let Ok(index) = segment.parse::<usize>() {
+    //                 current
+    //                     .get(index)
+    //                     .with_context(|| format!("Index {} out of bounds in response", index))?
+    //             } else {
+    //                 current
+    //                     .get(segment)
+    //                     .with_context(|| format!("Path '{}' not found in response", segment))?
+    //             };
+    //         }
+    //         let value = match current {
+    //             serde_json::Value::String(s) => s.clone(),
+    //             other => other.to_string(),
+    //         };
+    //         extracted.insert(var_name.clone(), value);
+    //     }
+    // }
+
+    if verbose && !extracted.is_empty() {
+        println!();
+        for (k, v) in &extracted {
+            println!("  {} {}", format!("← {}:", k).cyan().dimmed(), v.bold());
+            println!();
+        }
+    }
+
+    Ok(extracted)
+}
+
+pub fn extract_values(
+    extract: &Option<HashMap<String, String>>,
+    body_text: &str,
+    is_json: bool,
+) -> Result<HashMap<String, String>> {
     let mut extracted = HashMap::new();
 
-    if let Some(extractions) = &config.extract {
+    if let Some(extractions) = extract {
         if !is_json {
             anyhow::bail!("Cannot extract values: response is not JSON");
         }
-        let json: serde_json::Value = serde_json::from_str(&body_text)?;
+        let json: serde_json::Value = serde_json::from_str(body_text)?;
         for (var_name, path) in extractions {
             let path = path.strip_prefix("$.").unwrap_or(path);
             let mut current = &json;
@@ -82,14 +129,5 @@ pub fn run_request(config: &RequestConfig, vars: &mut HashMap<String, String>, v
             extracted.insert(var_name.clone(), value);
         }
     }
-
-    if verbose && !extracted.is_empty() {
-        println!();
-        for (k, v) in &extracted {
-            println!("  {} {}", format!("← {}:", k).cyan().dimmed(), v.bold());
-            println!();
-        }
-    }
-
     Ok(extracted)
 }

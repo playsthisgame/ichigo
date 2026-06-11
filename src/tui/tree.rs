@@ -33,7 +33,7 @@ pub(crate) fn load_entries() -> Result<Vec<Entry>> {
         let content = fs::read_to_string(&path)?;
         let kind = if content.contains("steps:") {
             let chain: ChainConfig = serde_yaml::from_str(&content)
-                .unwrap_or(ChainConfig { name: r.name.clone(), steps: vec![] });
+                .unwrap_or(ChainConfig { name: r.name.clone(), steps: vec![], profiles: None });
             EntryKind::Chain {
                 steps: chain.steps.iter().map(|s| s.name.clone()).collect(),
             }

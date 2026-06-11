@@ -12,7 +12,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 use std::{collections::{HashMap, HashSet}, fs, io};
-use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, RequestConfig};
+use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, RequestConfig};
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
 
@@ -223,13 +223,7 @@ impl App {
         };
 
         if is_chain {
-            self.mode = Mode::Response {
-                status: 0,
-                body: "Chain execution is not supported in the TUI yet.".to_string(),
-                scroll: 0,
-                response_filter: String::new(),
-                response_filter_active: false,
-            };
+            self.start_chain(&entry_name);
             return;
         }
 
@@ -250,6 +244,53 @@ impl App {
             self.execute_request(&entry_name, &HashMap::new());
         } else {
             self.mode = Mode::VarInput { entry_name, vars, focused: 0 };
+        }
+    }
+
+    fn start_chain(&mut self, entry_name: &str) {
+        let chain = match ChainConfig::load(entry_name) {
+            Ok(c) => c,
+            Err(e) => {
+                self.mode = Mode::Response {
+                    status: 0,
+                    body: format!("Error: {e}"),
+                    scroll: 0,
+                    response_filter: String::new(),
+                    response_filter_active: false,
+                };
+                return;
+            }
+        };
+
+        // If the chain defines profiles, ask which one first (same as a request).
+        let profiles = chain.profiles.clone().unwrap_or_default();
+        if !profiles.is_empty() {
+            self.mode = Mode::ProfileSelect {
+                entry_name: entry_name.to_string(),
+                profiles,
+                selected: 0,
+                for_test: false,
+            };
+            return;
+        }
+
+        // No profiles: gather the placeholders the chain needs and prompt for them.
+        let vars: Vec<(String, String)> = chain_var_names(&chain.steps)
+            .into_iter()
+            .map(|name| {
+                let value = std::env::var(&name).unwrap_or_default();
+                (name, value)
+            })
+            .collect();
+
+        if vars.is_empty() {
+            self.execute_chain(entry_name, &HashMap::new());
+        } else {
+            self.mode = Mode::VarInput {
+                entry_name: entry_name.to_string(),
+                vars,
+                focused: 0,
+            };
         }
     }
 
@@ -294,6 +335,12 @@ impl App {
         self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
     }
 
+    fn is_chain_entry(&self, name: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.name == name && matches!(e.kind, EntryKind::Chain { .. }))
+    }
+
     fn confirm_profile_select(&mut self) {
         let (entry_name, profile_params, for_test) = match &self.mode {
             Mode::ProfileSelect { entry_name, profiles, selected, for_test } => {
@@ -307,7 +354,17 @@ impl App {
             _ => return,
         };
 
-        let (var_names, all_covered) = {
+        let is_chain = self.is_chain_entry(&entry_name);
+        let (var_names, all_covered) = if is_chain {
+            match ChainConfig::load(&entry_name) {
+                Ok(chain) => {
+                    let names = chain_var_names(&chain.steps);
+                    let covered = names.iter().all(|n| profile_params.contains_key(n));
+                    (names, covered)
+                }
+                Err(_) => (vec![], true),
+            }
+        } else {
             let entry = self.entries.iter().find(|e| e.name == entry_name);
             match entry.map(|e| &e.kind) {
                 Some(EntryKind::Request { url, headers, query, body_data, .. }) => {
@@ -334,7 +391,11 @@ impl App {
             self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
         } else if all_covered && vars.iter().all(|(_, v)| !v.is_empty()) {
             let var_map = vars.into_iter().collect();
-            self.execute_request(&entry_name, &var_map);
+            if is_chain {
+                self.execute_chain(&entry_name, &var_map);
+            } else {
+                self.execute_request(&entry_name, &var_map);
+            }
         } else {
             self.mode = Mode::VarInput { entry_name, vars, focused: 0 };
         }
@@ -369,6 +430,72 @@ impl App {
 
         self.mode = Mode::Response { status, body, scroll: 0 , response_filter: String::new(), response_filter_active: false };
     }
+
+    fn execute_chain(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
+        // Run every step in order, threading extracted values forward, and
+        // build one combined text block for the Response pane.
+        let result = (|| -> Result<(u16, String)> {
+            let chain = ChainConfig::load(entry_name)?;
+            let mut current_vars = vars.clone();
+            let mut out = String::new();
+            let mut last_status = 0u16;
+            let step_count = chain.steps.len();
+
+            for (i, step) in chain.steps.iter().enumerate() {
+                let response = crate::utils::send_request(step, &current_vars, false)?;
+                let status = response.status().as_u16();
+                last_status = status;
+
+                let is_json = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.contains("application/json"))
+                    .unwrap_or(false);
+
+                let text = response.text().unwrap_or_default();
+                let pretty = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                    .unwrap_or_else(|| text.clone());
+
+                out.push_str(&format!("▸ {}  [{}]\n", step.name, status));
+                if pretty.is_empty() {
+                    out.push_str("(empty body)\n");
+                } else {
+                    out.push_str(&pretty);
+                    out.push('\n');
+                }
+
+                // Reuse the shared extractor from Layer 2.
+                let extracted = crate::runner::extract_values(&step.extract, &text, is_json)?;
+                for (k, v) in &extracted {
+                    out.push_str(&format!("  ← {k}: {v}\n"));
+                }
+
+                if i + 1 < step_count {
+                    out.push('\n'); // blank line between steps
+                }
+                current_vars.extend(extracted); // feed values into the next step
+            }
+
+            Ok((last_status, out))
+        })();
+
+        let (status, body) = match result {
+            Ok((s, b)) => (s, b),
+            Err(e) => (0, format!("Error: {e}")),
+        };
+
+        self.mode = Mode::Response {
+            status,
+            body,
+            scroll: 0,
+            response_filter: String::new(),
+            response_filter_active: false,
+        };
+    }
+
 
     fn save_new_profile(&mut self) {
         let (profile_name, params, req_fields, req_focused, mut req_profiles, req_original_name, req_global) = match &self.mode {
@@ -597,6 +724,32 @@ fn event_loop(
 
 // Scans all string fields of a config for {{NAME}} placeholders, preserving
 // the order they first appear and deduplicating. Mirrors the logic in utils::interpolate.
+// Collects the {{VAR}} placeholders a chain needs the user to supply.
+// Skips names that an earlier step produces via `extract`, since those are
+// filled in automatically as the chain runs.
+fn chain_var_names(steps: &[RequestConfig]) -> Vec<String> {
+    let mut produced: HashSet<String> = HashSet::new();
+    for step in steps {
+        if let Some(extract) = &step.extract {
+            for key in extract.keys() {
+                produced.insert(key.clone());
+            }
+        }
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for step in steps {
+        let body = step.body.as_ref().map(|b| b.data.as_str());
+        for name in extract_var_names(&step.url, &step.headers, &step.query, body) {
+            if !produced.contains(&name) && seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
 fn extract_var_names(
     url: &str,
     headers: &HashMap<String, String>,
@@ -626,4 +779,58 @@ fn extract_var_names(
     }
 
     names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Body;
+
+    // Minimal RequestConfig builder for tests; callers tweak the fields they care about.
+    fn step(url: &str) -> RequestConfig {
+        RequestConfig {
+            name: "step".to_string(),
+            method: "GET".to_string(),
+            url: url.to_string(),
+            description: None,
+            headers: HashMap::new(),
+            query: HashMap::new(),
+            body: None,
+            extract: None,
+            profiles: None,
+        }
+    }
+
+    #[test]
+    fn chain_var_names_collects_across_fields() {
+        let mut s = step("https://api/{{USER_ID}}");
+        s.query.insert("page".to_string(), "{{PAGE}}".to_string());
+        s.body = Some(Body {
+            content_type: "application/json".to_string(),
+            data: "{\"q\": \"{{SEARCH}}\"}".to_string(),
+        });
+        let names = chain_var_names(&[s]);
+        // url, query, and body placeholders are all picked up.
+        assert!(names.contains(&"USER_ID".to_string()));
+        assert!(names.contains(&"PAGE".to_string()));
+        assert!(names.contains(&"SEARCH".to_string()));
+    }
+
+    #[test]
+    fn chain_var_names_excludes_extracted_and_dedupes() {
+        // Step 1 prompts for USER_ID and produces USERNAME via extract.
+        let mut s1 = step("https://api/users/{{USER_ID}}");
+        let mut extract = HashMap::new();
+        extract.insert("USERNAME".to_string(), "$.username".to_string());
+        s1.extract = Some(extract);
+
+        // Step 2 reuses USER_ID (should dedupe) and consumes USERNAME (should be excluded).
+        let mut s2 = step("https://api/posts");
+        s2.query.insert("userId".to_string(), "{{USER_ID}}".to_string());
+        s2.headers.insert("X-User".to_string(), "{{USERNAME}}".to_string());
+
+        let names = chain_var_names(&[s1, s2]);
+        // Only the truly user-supplied variable remains, listed once.
+        assert_eq!(names, vec!["USER_ID".to_string()]);
+    }
 }
