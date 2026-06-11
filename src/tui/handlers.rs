@@ -365,7 +365,11 @@ pub(super) fn handle_key_var_input(app: &mut App, key: KeyEvent) -> bool {
                 ),
                 _ => return false,
             };
-            app.execute_request(&entry_name, &var_map);
+            if app.is_chain_entry(&entry_name) {
+                app.execute_chain(&entry_name, &var_map);
+            } else {
+                app.execute_request(&entry_name, &var_map);
+            }
         }
         KeyCode::Tab => {
             if let Mode::VarInput { vars, focused, .. } = &mut app.mode {

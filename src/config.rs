@@ -47,6 +47,7 @@ pub struct Body {
 pub struct ChainConfig {
     pub name: String,
     pub steps: Vec<RequestConfig>,
+    pub profiles: Option<Vec<Profile>>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
