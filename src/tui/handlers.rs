@@ -452,6 +452,8 @@ pub(super) fn handle_key_test_input(app: &mut App, key: KeyEvent) -> bool {
 pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
     use super::render::format_test_results_text;
     use super::render::copy_to_clipboard;
+    let was_pending_g = app.pending_g;
+    app.pending_g = false;
     match code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
@@ -465,6 +467,27 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Char('k') | KeyCode::Up => {
             if let Mode::Response { scroll, .. } = &mut app.mode {
                 *scroll = scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::Char('g') => {
+            if was_pending_g {
+                if let Mode::Response { scroll, .. } = &mut app.mode {
+                    *scroll = 0;
+                }
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Char('G') => {
+            let view_height = app.response_view_height;
+            if let Mode::Response { scroll, body, response_filter, .. } = &mut app.mode {
+                let q = response_filter.to_lowercase();
+                let line_count = body
+                    .lines()
+                    .filter(|line| q.is_empty() || line.to_lowercase().contains(&q))
+                    .count()
+                    .min(u16::MAX as usize) as u16;
+                *scroll = line_count.saturating_sub(view_height);
             }
         }
         KeyCode::Char('c') => {

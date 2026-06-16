@@ -81,6 +81,9 @@ struct App {
     use_nerd_fonts: bool,
     list_state: ListState,
     pending_g: bool,
+    // Height of the response body viewport, recorded each render so `G`
+    // can clamp the scroll offset to the actual bottom of the content.
+    response_view_height: u16,
     filter: String,
     filter_active: bool,
     mode: Mode,
@@ -105,6 +108,7 @@ impl App {
             use_nerd_fonts,
             list_state,
             pending_g: false,
+            response_view_height: 0,
             filter: String::new(),
             filter_active: false,
             mode: Mode::Browse,
