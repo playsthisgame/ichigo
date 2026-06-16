@@ -22,8 +22,9 @@ use crate::config::ChainConfig;
 #[command(about = "A CLI HTTP client — store requests in .ichigo/ or ~/.config/ichigo/")]
 #[command(version)]
 struct Cli {
+    /// Subcommand to run; opens the interactive TUI when omitted
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -85,7 +86,8 @@ enum Commands {
         /// Shell to generate completions for
         shell: Shell,
     },
-    /// Open the interactive TUI
+    /// Open the interactive TUI (same as running with no subcommand)
+    #[command(hide = true)]
     Tui,
     /// Makes a copy of an existing config with a new name
     Copy {
@@ -109,15 +111,15 @@ enum Shell {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::New { name, method, url, global } => cmd_new(name, method, url, global),
-        Commands::Run { name, vars , verbose, profile } => cmd_run(name, vars, verbose, profile),
-        Commands::List => cmd_list(),
-        Commands::Show { name } => cmd_show(name),
-        Commands::Delete { name } => cmd_delete(name),
-        Commands::Test { name, vars, iterations, profile } => cmd_test(name, vars, iterations, profile),
-        Commands::Completions { shell } => cmd_completions(shell),
-        Commands::Tui => tui::run(),
-        Commands::Copy { name, new_name , global} => cmd_copy(name, new_name, global),
+        Some(Commands::New { name, method, url, global }) => cmd_new(name, method, url, global),
+        Some(Commands::Run { name, vars , verbose, profile }) => cmd_run(name, vars, verbose, profile),
+        Some(Commands::List) => cmd_list(),
+        Some(Commands::Show { name }) => cmd_show(name),
+        Some(Commands::Delete { name }) => cmd_delete(name),
+        Some(Commands::Test { name, vars, iterations, profile }) => cmd_test(name, vars, iterations, profile),
+        Some(Commands::Completions { shell }) => cmd_completions(shell),
+        Some(Commands::Tui) | None => tui::run(),
+        Some(Commands::Copy { name, new_name , global}) => cmd_copy(name, new_name, global),
     }
 }
 

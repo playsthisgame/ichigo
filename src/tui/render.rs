@@ -29,6 +29,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     let tree_rows = tree_rows_storage.as_deref();
     draw_list(frame, panes[0], &app.entries, tree_rows, &filtered, &mut app.list_state, &app.filter, app.filter_active, app.use_nerd_fonts);
 
+    let mut response_view_height = None;
     match &app.mode {
         Mode::Browse => {
             // Accessing app.list_state and app.entries here is fine: they are
@@ -46,7 +47,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             draw_test_input(frame, panes[1], vars, iterations, *focused, entry_name);
         }
         Mode::Response { status, body, scroll , response_filter, response_filter_active} => {
-            draw_response(frame, panes[1], *status, body, *scroll, response_filter, *response_filter_active);
+            response_view_height = Some(draw_response(frame, panes[1], *status, body, *scroll, response_filter, *response_filter_active));
         }
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
@@ -60,6 +61,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::ConfirmDelete { entry_name, ..} => {
             draw_confirm_delete(frame, panes[1], entry_name);
         }
+    }
+    if let Some(h) = response_view_height {
+        app.response_view_height = h;
     }
 
     draw_help(frame, outer[1], &app.mode);
@@ -548,7 +552,8 @@ fn status_color(status: u16) -> Color {
     else { Color::Red }
 }
 
-fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll: u16, response_filter: &str, response_filter_active: bool) {
+/// Returns the height of the body viewport (inside the borders).
+fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll: u16, response_filter: &str, response_filter_active: bool) -> u16 {
     let (status_color, status_label) = if status == 0 {
         (Color::Red, " Error ".to_string())
     } else if status < 300 {
@@ -611,6 +616,7 @@ fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll:
         .scroll((scroll, 0));
 
     frame.render_widget(paragraph, chunks[1]);
+    chunks[1].height.saturating_sub(2)
 }
 
 
@@ -695,6 +701,10 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         Mode::Response { .. } | Mode::TestResponse { .. } => vec![
             Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("scroll", Style::default().fg(Color::DarkGray)),
+            Span::styled("   gg ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("top", Style::default().fg(Color::DarkGray)),
+            Span::styled("   G ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("bottom", Style::default().fg(Color::DarkGray)),
             Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("filter", Style::default().fg(Color::DarkGray)),
             Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
