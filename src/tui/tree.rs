@@ -1,6 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{collections::{HashMap, HashSet}, fs};
-use crate::config::{list_requests, resolve_config_path, ChainConfig, RequestConfig};
+use crate::config::{global_dir, list_requests, resolve_config_path, ChainConfig, RequestConfig};
 
 // ─── Data ─────────────────────────────────────────────────────────────────────
 
@@ -25,33 +25,56 @@ pub(crate) struct Entry {
     pub(crate) kind: EntryKind,
 }
 
+/// Reads one config off disk and flattens it into an `Entry`.
+///
+/// This is the single place that decides chain-vs-request (`steps:`) and maps a
+/// parsed config into `EntryKind`. Callers that need the *current* contents of a
+/// config — every action path in the TUI — go through here rather than reading
+/// the snapshot in `App::entries`.
+///
+/// `global` is derived from the resolved path rather than taken from the caller,
+/// so a local config that has come to shadow a global one since startup is
+/// labelled correctly.
+pub(crate) fn load_entry(name: &str) -> Result<Entry> {
+    let path = resolve_config_path(name)
+        .with_context(|| format!("Request '{}' not found", name))?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    entry_from_content(name, path.starts_with(global_dir()), &content)
+}
+
+fn entry_from_content(name: &str, global: bool, content: &str) -> Result<Entry> {
+    let kind = if content.contains("steps:") {
+        let chain: ChainConfig = serde_yaml::from_str(content)
+            .with_context(|| format!("Invalid YAML in chain config '{}'", name))?;
+        EntryKind::Chain {
+            steps: chain.steps.iter().map(|s| s.name.clone()).collect(),
+        }
+    } else {
+        let config: RequestConfig = serde_yaml::from_str(content)
+            .with_context(|| format!("Invalid YAML in request config '{}'", name))?;
+        EntryKind::Request {
+            method: config.method,
+            url: config.url,
+            description: config.description,
+            headers: config.headers,
+            query: config.query,
+            body_data: config.body.map(|b| b.data),
+            profiles: config.profiles.unwrap_or_default(),
+        }
+    };
+    Ok(Entry { name: name.to_string(), global, kind })
+}
+
+/// Loads every config in the local and global directories.
+///
+/// Configs that fail to read or parse are skipped rather than aborting the whole
+/// load, so a single malformed file cannot stop the TUI from starting. The
+/// per-entry error surfaces later, with the actual parse message, when the user
+/// tries to run that config.
 pub(crate) fn load_entries() -> Result<Vec<Entry>> {
     let raw = list_requests()?;
-    let mut entries = Vec::new();
-    for r in raw {
-        let path = resolve_config_path(&r.name).unwrap();
-        let content = fs::read_to_string(&path)?;
-        let kind = if content.contains("steps:") {
-            let chain: ChainConfig = serde_yaml::from_str(&content)
-                .unwrap_or(ChainConfig { name: r.name.clone(), steps: vec![], profiles: None });
-            EntryKind::Chain {
-                steps: chain.steps.iter().map(|s| s.name.clone()).collect(),
-            }
-        } else {
-            let config: RequestConfig = serde_yaml::from_str(&content)?;
-            EntryKind::Request {
-                method: config.method,
-                url: config.url,
-                description: config.description,
-                headers: config.headers,
-                query: config.query,
-                body_data: config.body.map(|b| b.data),
-                profiles: config.profiles.unwrap_or_default(),
-            }
-        };
-        entries.push(Entry { name: r.name, global: r.global, kind });
-    }
-    Ok(entries)
+    Ok(raw.iter().filter_map(|r| load_entry(&r.name).ok()).collect())
 }
 
 // ─── Tree model ───────────────────────────────────────────────────────────────
@@ -216,6 +239,56 @@ mod tests {
                 profiles: vec![],
             },
         }
+    }
+
+    #[test]
+    fn load_entry_parses_request() {
+        let yaml = "name: login\nmethod: POST\nurl: https://api/login\n\
+                    headers:\n  Authorization: \"Bearer {{TOKEN}}\"\n\
+                    profiles:\n  - name: dev\n    params:\n      TOKEN: abc\n";
+        let entry = entry_from_content("login", false, yaml).unwrap();
+        assert_eq!(entry.name, "login");
+        assert!(!entry.global);
+        match entry.kind {
+            EntryKind::Request { method, url, profiles, headers, .. } => {
+                assert_eq!(method, "POST");
+                assert_eq!(url, "https://api/login");
+                assert_eq!(headers.get("Authorization").unwrap(), "Bearer {{TOKEN}}");
+                assert_eq!(profiles.len(), 1);
+                assert_eq!(profiles[0].params.get("TOKEN").unwrap(), "abc");
+            }
+            _ => panic!("expected a request entry"),
+        }
+    }
+
+    #[test]
+    fn load_entry_parses_chain() {
+        let yaml = concat!(
+            "name: flow\n",
+            "steps:\n",
+            "  - name: one\n    method: GET\n    url: https://api/1\n",
+            "  - name: two\n    method: GET\n    url: https://api/2\n",
+        );
+        let entry = entry_from_content("flow", true, yaml).unwrap();
+        assert!(entry.global);
+        match entry.kind {
+            EntryKind::Chain { steps } => assert_eq!(steps, vec!["one", "two"]),
+            _ => panic!("expected a chain entry"),
+        }
+    }
+
+    #[test]
+    fn load_entry_rejects_invalid_yaml() {
+        // A malformed request must surface an error rather than being silently
+        // dropped — running it with stale cached values is the bug we're fixing.
+        assert!(entry_from_content("broken", false, "name: x\nmethod: [unclosed\n").is_err());
+        // The chain branch used to swallow parse errors via unwrap_or.
+        assert!(entry_from_content("broken", false, "steps:\n  - name: [unclosed\n").is_err());
+    }
+
+    #[test]
+    fn load_entry_missing_file_errors() {
+        assert!(load_entry("ichigo/no/such/config/should/exist").is_err());
     }
 
     #[test]

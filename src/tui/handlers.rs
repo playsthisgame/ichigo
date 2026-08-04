@@ -183,6 +183,8 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
             }
         }
         KeyCode::Char(' ') => {}
+        // Capital R, because lowercase r already runs the selected config.
+        KeyCode::Char('R') => app.reload_entries(None),
         KeyCode::Char('r') | KeyCode::Enter => {
             if app.using_tree()
                 && let Some(pos) = app.list_state.selected() {

@@ -130,8 +130,11 @@ Keybindings:
 | `gg` / `G` | Jump to top / bottom |
 | `r` / Enter | Run selected request |
 | `t` | Load-test selected request |
+| `R` | Refresh the config list from disk |
 | `q` | Quit |
 | Esc | Go back |
+
+The TUI is meant to be left open. Every run and load test re-reads the config file from disk first, so edits you make in another terminal — rotating a token in a profile, adding a header, changing a URL — take effect on the next run with no restart. Press `R` when you have created, renamed, or deleted config *files* on disk and want them to show up in the list.
 
 If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
 
@@ -222,6 +225,8 @@ ichigo test create-user --iter 50 --profile staging
 ```
 
 Any `{{PLACEHOLDER}}` not covered by the chosen profile is still resolved from `--var` flags or environment variables as normal. In the TUI, a profile picker appears automatically when profiles are present — pick one (or skip) and fill in any remaining variables interactively.
+
+Profile values are re-read from the file every time you run, so a token you rotate in the YAML is picked up on the next run of a long-lived TUI session. Values resolved from **environment variables** are not: a process cannot see exports its parent shell makes after launch, so an env-sourced token stays stale until you restart ichigo. Put values that rotate in a profile.
 
 ## Shell completions
 

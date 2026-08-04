@@ -2,7 +2,7 @@ mod tree;
 mod render;
 mod handlers;
 
-use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
+use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
 
 use anyhow::Result;
 use crossterm::{
@@ -214,8 +214,87 @@ impl App {
         }
     }
 
+    /// Shows a config-load failure in the Response pane. Actions call this and
+    /// then abort — falling back to the cached entry would send the stale values
+    /// this whole change exists to stop sending.
+    fn show_error(&mut self, e: anyhow::Error) {
+        self.mode = Mode::Response {
+            status: 0,
+            body: format!("Error: {e:#}"),
+            scroll: 0,
+            response_filter: String::new(),
+            response_filter_active: false,
+        };
+    }
+
+    /// Re-reads entry `idx` from disk and replaces the cached copy, so profiles
+    /// and `{{VAR}}` placeholders come from the file as it exists *now* rather
+    /// than as it existed when the TUI started.
+    ///
+    /// Returns false when the config could not be loaded; the caller must not
+    /// proceed. The entry keeps its position in `entries`, so `tree` and
+    /// `list_state` stay valid and no rebuild is needed.
+    fn reload_selected(&mut self, idx: usize) -> bool {
+        match load_entry(&self.entries[idx].name) {
+            Ok(entry) => {
+                self.entries[idx] = entry;
+                true
+            }
+            Err(e) => {
+                self.show_error(e);
+                false
+            }
+        }
+    }
+
+    /// Rebuilds the entry list and tree from disk, picking up configs created,
+    /// renamed, or deleted while the TUI was open.
+    ///
+    /// The cursor is restored by *name*, since a refresh shifts entry indices.
+    /// `collapsed_folders` and `filter` are deliberately left untouched: folders
+    /// the user collapsed stay collapsed, and folders appearing for the first
+    /// time are absent from the set and therefore start expanded.
+    fn reload_entries(&mut self, select: Option<&str>) {
+        // With no explicit target, keep the user's place across the refresh.
+        let target = select
+            .map(str::to_string)
+            .or_else(|| self.selected_entry_index().map(|i| self.entries[i].name.clone()));
+
+        let Ok(entries) = load_entries() else { return };
+        self.tree = build_tree(&entries);
+        self.entries = entries;
+
+        let count = self.visible_count();
+        if count == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        let pos = target
+            .and_then(|name| self.entries.iter().position(|e| e.name == name))
+            .and_then(|idx| self.row_position(idx));
+        // The selected config may have been deleted on disk; clamp to a valid
+        // row rather than dropping the selection entirely.
+        let fallback = self.list_state.selected().unwrap_or(0).min(count - 1);
+        self.list_state.select(Some(pos.unwrap_or(fallback)));
+    }
+
+    /// Position of entry `idx` among the visible rows, through whichever
+    /// addressing mode is active — the tree, or the flat filtered list.
+    fn row_position(&self, entry_idx: usize) -> Option<usize> {
+        if self.using_tree() {
+            visible_rows(&self.tree, &self.collapsed_folders)
+                .iter()
+                .position(|row| matches!(row, VisibleRow::Leaf { entry_idx: i, .. } if *i == entry_idx))
+        } else {
+            self.filtered_indices().iter().position(|&i| i == entry_idx)
+        }
+    }
+
     fn try_run_selected(&mut self) {
         let Some(idx) = self.selected_entry_index() else { return };
+        if !self.reload_selected(idx) {
+            return;
+        }
         let entry = &self.entries[idx];
 
         let entry_name = entry.name.clone();
@@ -252,16 +331,12 @@ impl App {
     }
 
     fn start_chain(&mut self, entry_name: &str) {
+        // Already fresh: profiles and step placeholders below both come from this
+        // parse, not from the cached entry.
         let chain = match ChainConfig::load(entry_name) {
             Ok(c) => c,
             Err(e) => {
-                self.mode = Mode::Response {
-                    status: 0,
-                    body: format!("Error: {e}"),
-                    scroll: 0,
-                    response_filter: String::new(),
-                    response_filter_active: false,
-                };
+                self.show_error(e);
                 return;
             }
         };
@@ -300,6 +375,9 @@ impl App {
 
     fn try_test_selected(&mut self) {
         let Some(idx) = self.selected_entry_index() else { return };
+        if !self.reload_selected(idx) {
+            return;
+        }
         let entry = &self.entries[idx];
 
         let entry_name = entry.name.clone();
@@ -369,14 +447,19 @@ impl App {
                 Err(_) => (vec![], true),
             }
         } else {
-            let entry = self.entries.iter().find(|e| e.name == entry_name);
-            match entry.map(|e| &e.kind) {
-                Some(EntryKind::Request { url, headers, query, body_data, .. }) => {
-                    let names = extract_var_names(url, headers, query, body_data.as_deref());
+            // Re-read rather than consulting `self.entries`: the placeholder list
+            // has to match the file the request is about to be built from.
+            match load_entry(&entry_name) {
+                Ok(Entry { kind: EntryKind::Request { url, headers, query, body_data, .. }, .. }) => {
+                    let names = extract_var_names(&url, &headers, &query, body_data.as_deref());
                     let covered = names.iter().all(|n| profile_params.contains_key(n));
                     (names, covered)
                 }
-                _ => (vec![], true),
+                Ok(_) => (vec![], true),
+                Err(e) => {
+                    self.show_error(e);
+                    return;
+                }
             }
         };
 
@@ -641,18 +724,7 @@ impl App {
                 prune_empty_parents(&old_path, &dir_for(global));
             }
 
-        if let Ok(entries) = load_entries() {
-            let idx = entries.iter().position(|e| e.name == name);
-            self.tree = build_tree(&entries);
-            self.entries = entries;
-            if let Some(entry_idx) = idx {
-                let rows = visible_rows(&self.tree, &self.collapsed_folders);
-                let pos = rows.iter().position(|row| {
-                    matches!(row, VisibleRow::Leaf { entry_idx: i, .. } if *i == entry_idx)
-                });
-                self.list_state.select(pos.or(if rows.is_empty() { None } else { Some(0) }));
-            }
-        }
+        self.reload_entries(Some(&name));
         self.mode = Mode::Browse;
     }
 

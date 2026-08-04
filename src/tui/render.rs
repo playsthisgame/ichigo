@@ -645,6 +645,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("delete", Style::default().fg(Color::DarkGray)),
             Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("filter", Style::default().fg(Color::DarkGray)),
+            Span::styled("   R ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("refresh", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ProfileSelect { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
