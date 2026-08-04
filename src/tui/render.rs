@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use super::{App, Mode};
+use super::{App, Mode, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
@@ -40,14 +40,14 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::ProfileSelect { profiles, selected, entry_name, .. } => {
             draw_profile_select(frame, panes[1], profiles, *selected, entry_name);
         }
-        Mode::VarInput { vars, focused, entry_name } => {
+        Mode::VarInput { vars, focused, entry_name, .. } => {
             draw_var_input(frame, panes[1], vars, *focused, entry_name);
         }
         Mode::TestInput { vars, focused, iterations, entry_name } => {
             draw_test_input(frame, panes[1], vars, iterations, *focused, entry_name);
         }
-        Mode::Response { status, body, scroll , response_filter, response_filter_active} => {
-            response_view_height = Some(draw_response(frame, panes[1], *status, body, *scroll, response_filter, *response_filter_active));
+        Mode::Response { kind, body, scroll , response_filter, response_filter_active} => {
+            response_view_height = Some(draw_response(frame, panes[1], kind, body, *scroll, response_filter, *response_filter_active));
         }
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
@@ -553,22 +553,32 @@ fn status_color(status: u16) -> Color {
 }
 
 /// Returns the height of the body viewport (inside the borders).
-fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll: u16, response_filter: &str, response_filter_active: bool) -> u16 {
-    let (status_color, status_label) = if status == 0 {
-        (Color::Red, " Error ".to_string())
-    } else if status < 300 {
-        (Color::Green, format!(" {} ", status))
-    } else if status < 400 {
-        (Color::Cyan, format!(" {} ", status))
-    } else if status < 500 {
-        (Color::Yellow, format!(" {} ", status))
-    } else {
-        (Color::Red, format!(" {} ", status))
+fn draw_response(frame: &mut Frame, area: Rect, kind: &ResponseKind, body: &str, scroll: u16, response_filter: &str, response_filter_active: bool) -> u16 {
+    // A generated command is neither a response nor an error, so it gets its
+    // own heading rather than borrowing a status code it doesn't have.
+    let (heading, badge_color, badge) = match kind {
+        ResponseKind::Error => (" Response ", Color::Red, " Error ".to_string()),
+        ResponseKind::Http(status) => {
+            let color = if *status < 300 {
+                Color::Green
+            } else if *status < 400 {
+                Color::Cyan
+            } else if *status < 500 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            (" Response ", color, format!(" {} ", status))
+        }
+        ResponseKind::Curl { copied: Ok(()) } => (" cURL ", Color::Green, " copied ".to_string()),
+        ResponseKind::Curl { copied: Err(e) } => {
+            (" cURL ", Color::Red, format!(" copy failed: {} ", e))
+        }
     };
 
     let title = Line::from(vec![
-        Span::raw(" Response "),
-        Span::styled(status_label, Style::default().fg(Color::Black).bg(status_color)),
+        Span::raw(heading),
+        Span::styled(badge, Style::default().fg(Color::Black).bg(badge_color)),
     ]);
 
     let show_filter = response_filter_active || !response_filter.is_empty();
@@ -611,7 +621,7 @@ fn draw_response(frame: &mut Frame, area: Rect, status: u16, body: &str, scroll:
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(status_color)),
+                .border_style(Style::default().fg(badge_color)),
         )
         .scroll((scroll, 0));
 
@@ -647,6 +657,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("filter", Style::default().fg(Color::DarkGray)),
             Span::styled("   R ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("refresh", Style::default().fg(Color::DarkGray)),
+            Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("copy cURL", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ProfileSelect { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -809,15 +821,60 @@ fn colorize_json_line(line: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-pub(super) fn copy_to_clipboard(text: &str) {
+/// Clipboard tools tried in order: macOS, then Wayland, then X11.
+const CLIPBOARD_BACKENDS: &[(&str, &[&str])] = &[
+    ("pbcopy", &[]),
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+/// Copies `text` to the system clipboard, returning why it failed if it did.
+///
+/// Backends are probed by trying to spawn them rather than by reading
+/// `$WAYLAND_DISPLAY` / `$DISPLAY`: those lie under tmux and over SSH, and
+/// probing keeps it to a single mechanism.
+pub(super) fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    for (program, args) in CLIPBOARD_BACKENDS {
+        if run_clipboard_backend(program, args, text) {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "no clipboard tool found (tried {})",
+        CLIPBOARD_BACKENDS
+            .iter()
+            .map(|(p, _)| *p)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+fn run_clipboard_backend(program: &str, args: &[&str], text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-    }
+
+    // Silence the child's output: we're inside the alternate screen, and a
+    // backend printing a diagnostic would corrupt the display.
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+
+    let wrote = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(text.as_bytes()).is_ok(),
+        None => false,
+    };
+
+    // Always reap, so a failed backend doesn't leave a zombie behind. A
+    // non-zero exit counts as failure so the next backend gets its turn.
+    let exited_ok = matches!(child.wait(), Ok(status) if status.success());
+    wrote && exited_ok
 }
 
 fn method_color(method: &str) -> Color {

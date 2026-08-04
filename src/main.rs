@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 
 mod config;
+mod curl;
 mod runner;
 mod tester;
 mod tui;

@@ -6,6 +6,9 @@ use colored::Colorize;
 
 use crate::config::RequestConfig;
 
+/// Builds and fires the HTTP request. This function defines what actually goes
+/// on the wire, so `crate::curl::to_curl` mirrors it — keep the two in step,
+/// particularly the query handling and the body's Content-Type header.
 pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>, verbose: bool) -> Result<Response>{
     let url = interpolate(&config.url, vars);
     let method = config.method.to_uppercase();
@@ -68,7 +71,12 @@ pub fn send_request(config: & RequestConfig, vars: &HashMap<String,String>, verb
 
 }
 
-fn interpolate(s: &str, vars: &HashMap<String, String>) -> String {
+/// Substitutes `{{VAR}}` placeholders: the supplied map first, then the process
+/// environment, leaving anything unresolved as a literal `{{VAR}}`.
+///
+/// Shared with `crate::curl` so a generated cURL command substitutes exactly
+/// what a real request would.
+pub(crate) fn interpolate(s: &str, vars: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find("{{") {

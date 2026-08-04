@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::fs;
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
-use super::{App, Mode};
+use super::{App, Mode, PendingAction, ResponseKind};
 use super::tree::{EntryKind, VisibleRow, visible_rows, build_tree, load_entries};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
@@ -197,6 +197,7 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
             app.try_run_selected()
         }
         KeyCode::Char('t') => app.try_test_selected(),
+        KeyCode::Char('y') => app.try_copy_curl_selected(),
         KeyCode::Char('n') => {
             app.mode = Mode::NewRequest {
                 fields: vec![
@@ -360,17 +361,21 @@ pub(super) fn handle_key_var_input(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Enter => {
             // Clone out the data we need; the borrow of app.mode ends
             // when this block exits, letting execute_request take &mut app.
-            let (entry_name, var_map) = match &app.mode {
-                Mode::VarInput { entry_name, vars, .. } => (
+            let (entry_name, var_map, action) = match &app.mode {
+                Mode::VarInput { entry_name, vars, action, .. } => (
                     entry_name.clone(),
                     vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>(),
+                    *action,
                 ),
                 _ => return false,
             };
-            if app.is_chain_entry(&entry_name) {
-                app.execute_chain(&entry_name, &var_map);
-            } else {
-                app.execute_request(&entry_name, &var_map);
+            // Dispatch on the action the form was opened for. Without this,
+            // every request whose profile misses a placeholder would run,
+            // whatever the user actually asked for.
+            match action {
+                PendingAction::Curl => app.render_curl(&entry_name, &var_map),
+                _ if app.is_chain_entry(&entry_name) => app.execute_chain(&entry_name, &var_map),
+                _ => app.execute_request(&entry_name, &var_map),
             }
         }
         KeyCode::Tab => {
@@ -498,7 +503,9 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
                 Mode::TestResponse { results } => format_test_results_text(results),
                 _ => return false,
             };
-            copy_to_clipboard(&text);
+            if let Err(e) = copy_to_clipboard(&text) {
+                app.show_message(ResponseKind::Error, format!("Copy failed: {e}"));
+            }
         }
         KeyCode::Char('f') => {
             if let Mode::Response { response_filter_active, .. } = &mut app.mode {
