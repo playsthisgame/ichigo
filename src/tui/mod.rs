@@ -2,7 +2,7 @@ mod tree;
 mod render;
 mod handlers;
 
-use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
+use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
 
 use anyhow::Result;
 use crossterm::{
@@ -16,18 +16,40 @@ use crate::config::{dir_for, prune_empty_parents, global_config_path, local_conf
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
 
+/// What the profile picker and variable form are collecting input *for*.
+///
+/// Both modes are shared by every action that needs a profile or variables, so
+/// each has to carry its destination: without it, whatever the user typed would
+/// fall through to the single hardcoded terminal step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PendingAction {
+    Run,
+    Test,
+    Curl,
+}
+
+/// What a `Mode::Response` pane is showing. Keeps a real HTTP response, an
+/// error, and generated text distinguishable without overloading a status code.
+pub(crate) enum ResponseKind {
+    Http(u16),
+    Error,
+    /// A generated cURL command, plus the outcome of copying it.
+    Curl { copied: Result<(), String> },
+}
+
 enum Mode {
     Browse,
     ProfileSelect {
         entry_name: String,
         profiles: Vec<crate::config::Profile>,
         selected: usize, // 0 = no profile, 1..=n = profiles[selected-1]
-        for_test: bool,
+        action: PendingAction,
     },
     VarInput {
         entry_name: String,
         vars: Vec<(String, String)>, // (placeholder name, value being typed)
         focused: usize,              // which field the cursor is in
+        action: PendingAction,
     },
     TestInput {
         entry_name: String,
@@ -36,7 +58,7 @@ enum Mode {
         focused: usize, // 0..vars.len() = var fields, vars.len() = iterations field
     },
     Response {
-        status: u16,
+        kind: ResponseKind,
         body: String,
         scroll: u16,
         response_filter: String,
@@ -214,8 +236,93 @@ impl App {
         }
     }
 
+    /// Shows a config-load failure in the Response pane. Actions call this and
+    /// then abort — falling back to the cached entry would send the stale values
+    /// this whole change exists to stop sending.
+    fn show_error(&mut self, e: anyhow::Error) {
+        self.show_message(ResponseKind::Error, format!("Error: {e:#}"));
+    }
+
+    /// Shows plain text in the Response pane — the single place that builds the
+    /// mode, so its five fields aren't spelled out at a dozen call sites.
+    fn show_message(&mut self, kind: ResponseKind, body: String) {
+        self.mode = Mode::Response {
+            kind,
+            body,
+            scroll: 0,
+            response_filter: String::new(),
+            response_filter_active: false,
+        };
+    }
+
+    /// Re-reads entry `idx` from disk and replaces the cached copy, so profiles
+    /// and `{{VAR}}` placeholders come from the file as it exists *now* rather
+    /// than as it existed when the TUI started.
+    ///
+    /// Returns false when the config could not be loaded; the caller must not
+    /// proceed. The entry keeps its position in `entries`, so `tree` and
+    /// `list_state` stay valid and no rebuild is needed.
+    fn reload_selected(&mut self, idx: usize) -> bool {
+        match load_entry(&self.entries[idx].name) {
+            Ok(entry) => {
+                self.entries[idx] = entry;
+                true
+            }
+            Err(e) => {
+                self.show_error(e);
+                false
+            }
+        }
+    }
+
+    /// Rebuilds the entry list and tree from disk, picking up configs created,
+    /// renamed, or deleted while the TUI was open.
+    ///
+    /// The cursor is restored by *name*, since a refresh shifts entry indices.
+    /// `collapsed_folders` and `filter` are deliberately left untouched: folders
+    /// the user collapsed stay collapsed, and folders appearing for the first
+    /// time are absent from the set and therefore start expanded.
+    fn reload_entries(&mut self, select: Option<&str>) {
+        // With no explicit target, keep the user's place across the refresh.
+        let target = select
+            .map(str::to_string)
+            .or_else(|| self.selected_entry_index().map(|i| self.entries[i].name.clone()));
+
+        let Ok(entries) = load_entries() else { return };
+        self.tree = build_tree(&entries);
+        self.entries = entries;
+
+        let count = self.visible_count();
+        if count == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        let pos = target
+            .and_then(|name| self.entries.iter().position(|e| e.name == name))
+            .and_then(|idx| self.row_position(idx));
+        // The selected config may have been deleted on disk; clamp to a valid
+        // row rather than dropping the selection entirely.
+        let fallback = self.list_state.selected().unwrap_or(0).min(count - 1);
+        self.list_state.select(Some(pos.unwrap_or(fallback)));
+    }
+
+    /// Position of entry `idx` among the visible rows, through whichever
+    /// addressing mode is active — the tree, or the flat filtered list.
+    fn row_position(&self, entry_idx: usize) -> Option<usize> {
+        if self.using_tree() {
+            visible_rows(&self.tree, &self.collapsed_folders)
+                .iter()
+                .position(|row| matches!(row, VisibleRow::Leaf { entry_idx: i, .. } if *i == entry_idx))
+        } else {
+            self.filtered_indices().iter().position(|&i| i == entry_idx)
+        }
+    }
+
     fn try_run_selected(&mut self) {
         let Some(idx) = self.selected_entry_index() else { return };
+        if !self.reload_selected(idx) {
+            return;
+        }
         let entry = &self.entries[idx];
 
         let entry_name = entry.name.clone();
@@ -232,7 +339,7 @@ impl App {
         }
 
         if !profiles.is_empty() {
-            self.mode = Mode::ProfileSelect { entry_name, profiles, selected: 0, for_test: false };
+            self.mode = Mode::ProfileSelect { entry_name, profiles, selected: 0, action: PendingAction::Run };
             return;
         }
 
@@ -247,21 +354,17 @@ impl App {
         if vars.is_empty() {
             self.execute_request(&entry_name, &HashMap::new());
         } else {
-            self.mode = Mode::VarInput { entry_name, vars, focused: 0 };
+            self.mode = Mode::VarInput { entry_name, vars, focused: 0, action: PendingAction::Run };
         }
     }
 
     fn start_chain(&mut self, entry_name: &str) {
+        // Already fresh: profiles and step placeholders below both come from this
+        // parse, not from the cached entry.
         let chain = match ChainConfig::load(entry_name) {
             Ok(c) => c,
             Err(e) => {
-                self.mode = Mode::Response {
-                    status: 0,
-                    body: format!("Error: {e}"),
-                    scroll: 0,
-                    response_filter: String::new(),
-                    response_filter_active: false,
-                };
+                self.show_error(e);
                 return;
             }
         };
@@ -273,7 +376,7 @@ impl App {
                 entry_name: entry_name.to_string(),
                 profiles,
                 selected: 0,
-                for_test: false,
+                action: PendingAction::Run,
             };
             return;
         }
@@ -294,25 +397,23 @@ impl App {
                 entry_name: entry_name.to_string(),
                 vars,
                 focused: 0,
+                action: PendingAction::Run,
             };
         }
     }
 
     fn try_test_selected(&mut self) {
         let Some(idx) = self.selected_entry_index() else { return };
+        if !self.reload_selected(idx) {
+            return;
+        }
         let entry = &self.entries[idx];
 
         let entry_name = entry.name.clone();
         let is_chain = matches!(&entry.kind, EntryKind::Chain { .. });
 
         if is_chain {
-            self.mode = Mode::Response {
-                status: 0,
-                body: "Testing chains is not supported.".to_string(),
-                scroll: 0,
-                response_filter: String::new(),
-                response_filter_active: false,
-            };
+            self.show_message(ResponseKind::Error, "Testing chains is not supported.".to_string());
             return;
         }
 
@@ -324,7 +425,7 @@ impl App {
         };
 
         if !profiles.is_empty() {
-            self.mode = Mode::ProfileSelect { entry_name, profiles, selected: 0, for_test: true };
+            self.mode = Mode::ProfileSelect { entry_name, profiles, selected: 0, action: PendingAction::Test };
             return;
         }
 
@@ -339,6 +440,74 @@ impl App {
         self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
     }
 
+    /// Entry point for `y`: generate a cURL command for the selected request.
+    ///
+    /// Reuses the profile picker and variable form by tagging them with
+    /// `PendingAction::Curl`, so the terminal step renders instead of sending.
+    fn try_copy_curl_selected(&mut self) {
+        let Some(idx) = self.selected_entry_index() else { return };
+        if !self.reload_selected(idx) {
+            return;
+        }
+        let entry = &self.entries[idx];
+        let entry_name = entry.name.clone();
+
+        let (var_names, profiles) = match &entry.kind {
+            // A chain threads values extracted from one step into the next;
+            // a single cURL command has no way to express that.
+            EntryKind::Chain { .. } => {
+                self.show_message(
+                    ResponseKind::Error,
+                    "Copying chains as cURL is not supported.".to_string(),
+                );
+                return;
+            }
+            EntryKind::Request { url, headers, query, body_data, profiles, .. } => (
+                extract_var_names(url, headers, query, body_data.as_deref()),
+                profiles.clone(),
+            ),
+        };
+
+        if !profiles.is_empty() {
+            self.mode = Mode::ProfileSelect {
+                entry_name,
+                profiles,
+                selected: 0,
+                action: PendingAction::Curl,
+            };
+            return;
+        }
+
+        let vars: Vec<(String, String)> = var_names
+            .into_iter()
+            .map(|name| {
+                let value = std::env::var(&name).unwrap_or_default();
+                (name, value)
+            })
+            .collect();
+
+        if vars.is_empty() {
+            self.render_curl(&entry_name, &HashMap::new());
+        } else {
+            self.mode = Mode::VarInput { entry_name, vars, focused: 0, action: PendingAction::Curl };
+        }
+    }
+
+    /// Terminal step for `PendingAction::Curl`: build the command, copy it, and
+    /// show it along with whether the copy landed.
+    fn render_curl(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
+        let config = match RequestConfig::load(entry_name) {
+            Ok(c) => c,
+            Err(e) => {
+                self.show_error(e);
+                return;
+            }
+        };
+        let command = crate::curl::to_curl(&config, vars);
+        let copied = render::copy_to_clipboard(&command);
+        self.show_message(ResponseKind::Curl { copied }, command);
+    }
+
     fn is_chain_entry(&self, name: &str) -> bool {
         self.entries
             .iter()
@@ -346,14 +515,14 @@ impl App {
     }
 
     fn confirm_profile_select(&mut self) {
-        let (entry_name, profile_params, for_test) = match &self.mode {
-            Mode::ProfileSelect { entry_name, profiles, selected, for_test } => {
+        let (entry_name, profile_params, action) = match &self.mode {
+            Mode::ProfileSelect { entry_name, profiles, selected, action } => {
                 let params: HashMap<String, String> = if *selected == 0 {
                     HashMap::new()
                 } else {
                     profiles[*selected - 1].params.clone()
                 };
-                (entry_name.clone(), params, *for_test)
+                (entry_name.clone(), params, *action)
             }
             _ => return,
         };
@@ -369,14 +538,19 @@ impl App {
                 Err(_) => (vec![], true),
             }
         } else {
-            let entry = self.entries.iter().find(|e| e.name == entry_name);
-            match entry.map(|e| &e.kind) {
-                Some(EntryKind::Request { url, headers, query, body_data, .. }) => {
-                    let names = extract_var_names(url, headers, query, body_data.as_deref());
+            // Re-read rather than consulting `self.entries`: the placeholder list
+            // has to match the file the request is about to be built from.
+            match load_entry(&entry_name) {
+                Ok(Entry { kind: EntryKind::Request { url, headers, query, body_data, .. }, .. }) => {
+                    let names = extract_var_names(&url, &headers, &query, body_data.as_deref());
                     let covered = names.iter().all(|n| profile_params.contains_key(n));
                     (names, covered)
                 }
-                _ => (vec![], true),
+                Ok(_) => (vec![], true),
+                Err(e) => {
+                    self.show_error(e);
+                    return;
+                }
             }
         };
 
@@ -391,17 +565,19 @@ impl App {
             })
             .collect();
 
-        if for_test {
+        if action == PendingAction::Test {
             self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
         } else if all_covered && vars.iter().all(|(_, v)| !v.is_empty()) {
+            // The profile answered everything, so skip the variable form and go
+            // straight to whatever this action's terminal step is.
             let var_map = vars.into_iter().collect();
-            if is_chain {
-                self.execute_chain(&entry_name, &var_map);
-            } else {
-                self.execute_request(&entry_name, &var_map);
+            match action {
+                PendingAction::Curl => self.render_curl(&entry_name, &var_map),
+                _ if is_chain => self.execute_chain(&entry_name, &var_map),
+                _ => self.execute_request(&entry_name, &var_map),
             }
         } else {
-            self.mode = Mode::VarInput { entry_name, vars, focused: 0 };
+            self.mode = Mode::VarInput { entry_name, vars, focused: 0, action };
         }
     }
 
@@ -410,7 +586,7 @@ impl App {
             .and_then(|config| crate::tester::collect_test_results(&config, vars, iterations))
         {
             Ok(results) => self.mode = Mode::TestResponse { results },
-            Err(e) => self.mode = Mode::Response { status: 0, body: format!("Error: {e}"), scroll: 0, response_filter: String::new(), response_filter_active: false},
+            Err(e) => self.show_message(ResponseKind::Error, format!("Error: {e}")),
         }
     }
 
@@ -432,7 +608,8 @@ impl App {
             Err(e) => (0, format!("Error: {e}")),
         };
 
-        self.mode = Mode::Response { status, body, scroll: 0 , response_filter: String::new(), response_filter_active: false };
+        let kind = if status == 0 { ResponseKind::Error } else { ResponseKind::Http(status) };
+        self.show_message(kind, body);
     }
 
     fn execute_chain(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
@@ -491,13 +668,8 @@ impl App {
             Err(e) => (0, format!("Error: {e}")),
         };
 
-        self.mode = Mode::Response {
-            status,
-            body,
-            scroll: 0,
-            response_filter: String::new(),
-            response_filter_active: false,
-        };
+        let kind = if status == 0 { ResponseKind::Error } else { ResponseKind::Http(status) };
+        self.show_message(kind, body);
     }
 
 
@@ -641,18 +813,7 @@ impl App {
                 prune_empty_parents(&old_path, &dir_for(global));
             }
 
-        if let Ok(entries) = load_entries() {
-            let idx = entries.iter().position(|e| e.name == name);
-            self.tree = build_tree(&entries);
-            self.entries = entries;
-            if let Some(entry_idx) = idx {
-                let rows = visible_rows(&self.tree, &self.collapsed_folders);
-                let pos = rows.iter().position(|row| {
-                    matches!(row, VisibleRow::Leaf { entry_idx: i, .. } if *i == entry_idx)
-                });
-                self.list_state.select(pos.or(if rows.is_empty() { None } else { Some(0) }));
-            }
-        }
+        self.reload_entries(Some(&name));
         self.mode = Mode::Browse;
     }
 

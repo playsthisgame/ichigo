@@ -130,8 +130,18 @@ Keybindings:
 | `gg` / `G` | Jump to top / bottom |
 | `r` / Enter | Run selected request |
 | `t` | Load-test selected request |
+| `y` | Copy selected request as a cURL command |
+| `R` | Refresh the config list from disk |
 | `q` | Quit |
 | Esc | Go back |
+
+The TUI is meant to be left open. Every run and load test re-reads the config file from disk first, so edits you make in another terminal — rotating a token in a profile, adding a header, changing a URL — take effect on the next run with no restart. Press `R` when you have created, renamed, or deleted config *files* on disk and want them to show up in the list.
+
+Pressing `y` turns the selected request into a cURL command and copies it to the clipboard. It runs the same profile picker and variable prompts as a normal run, so the command it produces carries the resolved values — the profile's real token, not `{{TOKEN}}`. The command is shown before it is copied, and `c` re-copies it. Chains cannot be copied this way: a chain feeds values extracted from one step into the next, which a single cURL command has no way to express.
+
+> **The generated command contains your real credentials.** That is what makes it useful, and also what makes it unsafe to paste into a public issue, a pull request, or a shared log. Redact before sharing.
+
+Copying uses whichever clipboard tool is available, tried in order: `pbcopy` (macOS), `wl-copy` (Wayland), `xclip`, then `xsel` (X11). If none is installed, the TUI says so rather than failing silently.
 
 If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
 
@@ -222,6 +232,8 @@ ichigo test create-user --iter 50 --profile staging
 ```
 
 Any `{{PLACEHOLDER}}` not covered by the chosen profile is still resolved from `--var` flags or environment variables as normal. In the TUI, a profile picker appears automatically when profiles are present — pick one (or skip) and fill in any remaining variables interactively.
+
+Profile values are re-read from the file every time you run, so a token you rotate in the YAML is picked up on the next run of a long-lived TUI session. Values resolved from **environment variables** are not: a process cannot see exports its parent shell makes after launch, so an env-sourced token stays stale until you restart ichigo. Put values that rotate in a profile.
 
 ## Shell completions
 
