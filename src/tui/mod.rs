@@ -83,11 +83,23 @@ enum Mode {
         entry_name: String,
         global: bool,
     },
-    // Sub-mode for adding a profile while creating/editing a request. Carries
-    // the whole draft so nothing typed into the form is lost on the way back.
+    // The draft's profiles, for picking one to edit or delete. The single way
+    // into `NewProfile`, so every profile action starts from the same screen.
+    // selected: 0..profiles.len() = a profile, profiles.len() = the "new" row —
+    // which means an empty list opens with "new" already selected.
+    ProfileList {
+        draft: RequestDraft,
+        selected: usize,
+    },
+    // Sub-mode for adding or editing one profile. Carries the whole draft so
+    // nothing typed into the request form is lost on the way back.
     // focused: 0 = profile name, 1+2i = params[i].key, 2+2i = params[i].value
     NewProfile {
         draft: RequestDraft,
+        // Which profile of the draft this edits; None when adding a new one.
+        // Drives replace-vs-push at save time — without it, editing a profile
+        // and keeping its name appends a second profile under the same name.
+        editing: Option<usize>,
         name: String,
         params: Vec<(String, String)>,
         focused: usize,
@@ -772,6 +784,23 @@ impl App {
         }
     }
 
+    /// Opens the selected request's profiles for editing.
+    ///
+    /// Re-reads from disk like every other action path: the profile params fed
+    /// back into the draft are what gets written on save, so a stale snapshot
+    /// here would quietly revert a token rotated in another terminal.
+    fn edit_profiles_selected(&mut self) {
+        let Some((name, global)) = self.selected_request() else { return };
+        match RequestConfig::load(&name) {
+            Ok(config) => {
+                let draft = RequestDraft::from_config(config, Some(name), global);
+                // 0 is the first profile, or the "new" row when there are none.
+                self.mode = Mode::ProfileList { draft, selected: 0 };
+            }
+            Err(e) => self.show_error(e),
+        }
+    }
+
     /// Opens a copy of the selected request in the form, unnamed. Everything
     /// but the name is carried over, so a clone is a whole request rather than
     /// just its method and URL.
@@ -798,9 +827,9 @@ impl App {
     }
 
     fn save_new_profile(&mut self) {
-        let (profile_name, params, mut draft) = match &self.mode {
-            Mode::NewProfile { name, params, draft, .. } => {
-                (name.trim().to_string(), params.clone(), draft.clone())
+        let (profile_name, params, editing, mut draft) = match &self.mode {
+            Mode::NewProfile { name, params, editing, draft, .. } => {
+                (name.trim().to_string(), params.clone(), *editing, draft.clone())
             }
             _ => return,
         };
@@ -818,9 +847,15 @@ impl App {
             .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
             .collect();
 
-        draft.profiles.push(crate::config::Profile { name: profile_name, params: filtered_params });
-
-        self.mode = Mode::NewRequest { draft, error: None };
+        let profile = crate::config::Profile { name: profile_name, params: filtered_params };
+        match upsert_profile(&mut draft.profiles, profile, editing) {
+            Ok(selected) => self.mode = Mode::ProfileList { draft, selected },
+            Err(message) => {
+                if let Mode::NewProfile { error, .. } = &mut self.mode {
+                    *error = Some(message);
+                }
+            }
+        }
     }
 
     fn save_new_request(&mut self) {
@@ -1007,6 +1042,9 @@ impl App {
         if matches!(self.mode, Mode::ImportCurl { .. }) {
             return handlers::handle_key_import_curl(self, key);
         }
+        if matches!(self.mode, Mode::ProfileList { .. }) {
+            return handlers::handle_key_profile_list(self, key);
+        }
         if matches!(self.mode, Mode::NewProfile { .. }) {
             return handlers::handle_key_new_profile(self, key);
         }
@@ -1063,6 +1101,38 @@ fn event_loop(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Places `profile` into `profiles` — replacing the one at `editing`, or
+/// appending when that is `None` — and returns the index it landed at.
+///
+/// A name already taken by a *different* profile is refused. Two profiles under
+/// one name would leave the picker ambiguous and the second one unreachable,
+/// and `--profile <name>` on the CLI no better off. Editing a profile without
+/// renaming it is not a clash, which is why `editing` is needed here at all.
+fn upsert_profile(
+    profiles: &mut Vec<crate::config::Profile>,
+    profile: crate::config::Profile,
+    editing: Option<usize>,
+) -> Result<usize, String> {
+    let clashes = profiles
+        .iter()
+        .enumerate()
+        .any(|(i, p)| p.name == profile.name && Some(i) != editing);
+    if clashes {
+        return Err(format!("A profile named '{}' already exists", profile.name));
+    }
+
+    match editing {
+        Some(i) if i < profiles.len() => {
+            profiles[i] = profile;
+            Ok(i)
+        }
+        _ => {
+            profiles.push(profile);
+            Ok(profiles.len() - 1)
+        }
+    }
+}
 
 // Scans all string fields of a config for {{NAME}} placeholders, preserving
 // the order they first appear and deduplicating. Mirrors the logic in utils::interpolate.
@@ -1240,5 +1310,80 @@ mod tests {
         assert_eq!(draft.query.get("page").unwrap(), "2");
         assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
         assert_eq!(draft.body.expect("body").data, r#"{"a":1}"#);
+    }
+
+    fn profile(name: &str, params: &[(&str, &str)]) -> crate::config::Profile {
+        crate::config::Profile {
+            name: name.to_string(),
+            params: params
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_new_profile_is_appended() {
+        let mut profiles = vec![profile("dev", &[])];
+        let at = upsert_profile(&mut profiles, profile("prod", &[("HOST", "api")]), None)
+            .expect("no clash");
+        assert_eq!(at, 1);
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[1].name, "prod");
+    }
+
+    /// The bug this feature exists to fix: editing a profile used to push a
+    /// second one, so a request ended up with two `dev` profiles and the picker
+    /// could only ever reach the first.
+    #[test]
+    fn editing_a_profile_replaces_it_rather_than_appending() {
+        let mut profiles = vec![profile("dev", &[("TOKEN", "old")]), profile("prod", &[])];
+        let at = upsert_profile(
+            &mut profiles,
+            profile("dev", &[("TOKEN", "new")]),
+            Some(0),
+        )
+        .expect("keeping its own name is not a clash");
+
+        assert_eq!(at, 0);
+        assert_eq!(profiles.len(), 2, "no duplicate appended");
+        assert_eq!(profiles[0].params.get("TOKEN").unwrap(), "new");
+        assert_eq!(profiles[1].name, "prod", "the others are undisturbed");
+    }
+
+    #[test]
+    fn a_profile_can_be_renamed() {
+        let mut profiles = vec![profile("dev", &[("HOST", "localhost")])];
+        let at = upsert_profile(&mut profiles, profile("local", &[("HOST", "localhost")]), Some(0))
+            .expect("no clash");
+        assert_eq!(at, 0);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "local");
+    }
+
+    #[test]
+    fn a_name_another_profile_already_has_is_refused() {
+        let mut profiles = vec![profile("dev", &[]), profile("prod", &[])];
+
+        let err = upsert_profile(&mut profiles, profile("prod", &[]), None)
+            .expect_err("adding a second `prod`");
+        assert!(err.contains("prod"), "the error names the profile: {err}");
+
+        let err = upsert_profile(&mut profiles, profile("prod", &[]), Some(0))
+            .expect_err("renaming `dev` onto `prod`");
+        assert!(err.contains("prod"));
+
+        assert_eq!(profiles.len(), 2, "nothing was written on either refusal");
+        assert_eq!(profiles[0].name, "dev");
+    }
+
+    /// `editing` indexes a list that a delete may have shortened. Falling back
+    /// to append keeps a stale index from panicking or overwriting a neighbour.
+    #[test]
+    fn an_out_of_range_edit_index_appends() {
+        let mut profiles = vec![profile("dev", &[])];
+        let at = upsert_profile(&mut profiles, profile("prod", &[]), Some(9)).expect("no clash");
+        assert_eq!(at, 1);
+        assert_eq!(profiles.len(), 2);
     }
 }

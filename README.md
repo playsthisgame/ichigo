@@ -190,6 +190,7 @@ Keybindings:
 | `y` | Copy selected request as a cURL command |
 | `i` | Import a pasted cURL command as a new request |
 | `n` / `e` / `c` | New / edit / clone a request |
+| `p` | Edit the selected request's profiles |
 | `d` | Delete selected request |
 | `R` | Refresh the config list from disk |
 | `q` | Quit |
@@ -306,6 +307,29 @@ ichigo test create-user --iter 50 --profile staging
 ```
 
 Any `{{PLACEHOLDER}}` not covered by the chosen profile is still resolved from `--var` flags or environment variables as normal. In the TUI, a profile picker appears automatically when profiles are present — pick one (or skip) and fill in any remaining variables interactively.
+
+#### Editing profiles in the TUI
+
+Press `p` on a request to manage its profiles without leaving the TUI:
+
+| Key | Action |
+| --- | ------ |
+| `j` / `k` | Move between profiles |
+| Enter | Edit the selected profile (or `+ new profile` to add one) |
+| `n` | Add a profile |
+| `d` | Delete the selected profile |
+| Esc | Back to the request form |
+
+Params appear under whichever profile is selected, so a request with several
+environments does not print every token at once. Inside a profile, Tab moves
+between fields and `Ctrl+a` adds a param.
+
+Profile changes are held with the rest of the request until you save it: Esc
+returns you to the request form, and **Enter there writes the file**. Escaping
+out of that form discards the profile edits along with everything else, so you
+can back out of a change you started by mistake. Two profiles cannot share a
+name — the second is refused rather than saved, since a duplicate would be
+unreachable from both the picker and `--profile`.
 
 Profile values are re-read from the file every time you run, so a token you rotate in the YAML is picked up on the next run of a long-lived TUI session. Values resolved from **environment variables** are not: a process cannot see exports its parent shell makes after launch, so an env-sourced token stays stale until you restart ichigo. Put values that rotate in a profile.
 

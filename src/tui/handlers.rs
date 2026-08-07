@@ -31,14 +31,12 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                 Mode::NewRequest { draft, .. } => Some(draft.clone()),
                 _ => None,
             };
+            // Into the list rather than straight to a blank profile: it is the
+            // only door to NewProfile, so add/edit/delete all start alike. An
+            // empty list opens on the "new" row, so this is still one Enter
+            // away from the old behaviour.
             if let Some(draft) = draft {
-                app.mode = Mode::NewProfile {
-                    draft,
-                    name: String::new(),
-                    params: Vec::new(),
-                    focused: 0,
-                    error: None,
-                };
+                app.mode = Mode::ProfileList { draft, selected: 0 };
             }
         }
         KeyCode::Char(c) => {
@@ -98,12 +96,89 @@ pub(super) fn handle_key_import_curl(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// The draft's profiles. Rows are `0..profiles.len()` plus a trailing "new"
+/// row, so `selected == profiles.len()` means "add one" — an empty list opens
+/// there and Enter creates straight away.
+pub(super) fn handle_key_profile_list(app: &mut App, key: KeyEvent) -> bool {
+    let Mode::ProfileList { draft, selected } = &mut app.mode else { return false };
+    let new_row = draft.profiles.len();
+
+    match key.code {
+        // Back to the form. Profile edits live in the draft until the request
+        // itself is saved, so leaving here writes nothing.
+        KeyCode::Esc => {
+            app.mode = Mode::NewRequest { draft: draft.clone(), error: None };
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if *selected < new_row {
+                *selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            *selected = selected.saturating_sub(1);
+        }
+        KeyCode::Char('n') => {
+            app.mode = Mode::NewProfile {
+                draft: draft.clone(),
+                editing: None,
+                name: String::new(),
+                params: Vec::new(),
+                focused: 0,
+                error: None,
+            };
+        }
+        KeyCode::Char('d') => {
+            if *selected < new_row {
+                draft.profiles.remove(*selected);
+                // The list just got shorter; keep the cursor on a real row.
+                *selected = (*selected).min(draft.profiles.len());
+            }
+        }
+        KeyCode::Enter => {
+            let idx = *selected;
+            let draft = draft.clone();
+            app.mode = match draft.profiles.get(idx) {
+                Some(profile) => {
+                    // A profile's params are a HashMap, which has no order of
+                    // its own; sort so the fields do not shuffle between edits.
+                    let mut params: Vec<(String, String)> = profile
+                        .params
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    params.sort_by(|a, b| a.0.cmp(&b.0));
+                    Mode::NewProfile {
+                        name: profile.name.clone(),
+                        editing: Some(idx),
+                        draft,
+                        params,
+                        focused: 0,
+                        error: None,
+                    }
+                }
+                None => Mode::NewProfile {
+                    draft,
+                    editing: None,
+                    name: String::new(),
+                    params: Vec::new(),
+                    focused: 0,
+                    error: None,
+                },
+            };
+        }
+        _ => {}
+    }
+    false
+}
+
 pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
-            // Return to NewRequest without saving the profile
-            if let Mode::NewProfile { draft, .. } = &app.mode {
-                app.mode = Mode::NewRequest { draft: draft.clone(), error: None };
+            // Back to the list without saving. `selected` returns to the
+            // profile being edited, or to the "new" row when adding one.
+            if let Mode::NewProfile { draft, editing, .. } = &app.mode {
+                let selected = editing.unwrap_or(draft.profiles.len());
+                app.mode = Mode::ProfileList { draft: draft.clone(), selected };
             }
         }
         KeyCode::Tab => {
@@ -230,6 +305,7 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('e') => app.edit_selected(),
         KeyCode::Char('c') => app.clone_selected(),
+        KeyCode::Char('p') => app.edit_profiles_selected(),
         KeyCode::Char('d') => {
             let Some(idx) = app.selected_entry_index() else { return false };
             let entry = &app.entries[idx];

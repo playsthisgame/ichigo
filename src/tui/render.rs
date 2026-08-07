@@ -59,8 +59,11 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
         }
-        Mode::NewProfile { name, params, focused, error, .. } => {
-            draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref());
+        Mode::ProfileList { draft, selected } => {
+            draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1);
+        }
+        Mode::NewProfile { name, params, focused, error, editing, .. } => {
+            draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref(), editing.is_some());
         }
         Mode::ConfirmDelete { entry_name, ..} => {
             draw_confirm_delete(frame, panes[1], entry_name);
@@ -352,6 +355,7 @@ fn draw_new_profile(
     params: &[(String, String)],
     focused: usize,
     error: Option<&str>,
+    is_edit: bool,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
 
@@ -413,7 +417,85 @@ fn draw_new_profile(
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
-            .title(" New Profile ")
+            .title(if is_edit { " Edit Profile " } else { " New Profile " })
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+/// The draft's profiles, one block each, with a trailing "new profile" row at
+/// index `profiles.len()`.
+fn draw_profile_list(
+    frame: &mut Frame,
+    area: Rect,
+    profiles: &[crate::config::Profile],
+    selected: usize,
+    request_name: &str,
+) {
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+
+    for (i, profile) in profiles.iter().enumerate() {
+        let is_selected = i == selected;
+        let marker = if is_selected { "  ▶ " } else { "    " };
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(Color::Magenta)),
+            Span::styled(
+                profile.name.clone(),
+                Style::default()
+                    .fg(if is_selected { Color::White } else { Color::Magenta })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   {} var{}", profile.params.len(), if profile.params.len() == 1 { "" } else { "s" }),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+
+        // Params only for the selected profile: showing every one turns a
+        // handful of environments into a wall of secrets.
+        if is_selected {
+            let mut params: Vec<(&String, &String)> = profile.params.iter().collect();
+            params.sort_by(|a, b| a.0.cmp(b.0));
+            for (k, v) in params {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("      {}: ", k), Style::default().fg(Color::DarkGray)),
+                    Span::styled(v.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    let new_selected = selected >= profiles.len();
+    lines.push(Line::from(vec![
+        Span::styled(
+            if new_selected { "  ▶ " } else { "    " },
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(
+            "+ new profile",
+            Style::default()
+                .fg(if new_selected { Color::White } else { Color::Green })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    if profiles.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  No profiles yet. A profile bundles {{VAR}} values under a name,",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  so you can switch environments without retyping them.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(format!(" Profiles — {} ", request_name))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
     );
@@ -749,6 +831,18 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
+        Mode::ProfileList { .. } => vec![
+            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("edit", Style::default().fg(Color::DarkGray)),
+            Span::styled("   j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("navigate", Style::default().fg(Color::DarkGray)),
+            Span::styled("   n ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("new", Style::default().fg(Color::DarkGray)),
+            Span::styled("   d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("delete", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("back to request", Style::default().fg(Color::DarkGray)),
+        ],
         Mode::NewProfile { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("save profile", Style::default().fg(Color::DarkGray)),
@@ -812,6 +906,7 @@ const HELP_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
         &[
             ("n", "new"),
             ("e", "edit"),
+            ("p", "profiles"),
             ("c", "clone"),
             ("d", "delete"),
             ("R", "refresh"),
