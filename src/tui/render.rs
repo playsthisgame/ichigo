@@ -3,7 +3,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     symbols,
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use super::{App, Mode, ResponseKind};
@@ -52,8 +52,11 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
         }
-        Mode::NewRequest { fields, focused, profiles, original_name, global, error } => {
-            draw_new_request(frame, panes[1], fields, *focused, profiles, original_name.is_some(), *global, error.as_deref());
+        Mode::NewRequest { draft, error } => {
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.profiles, draft.original_name.is_some(), draft.global, error.as_deref());
+        }
+        Mode::ImportCurl { buffer, error } => {
+            draw_import_curl(frame, panes[1], buffer, error.as_deref());
         }
         Mode::NewProfile { name, params, focused, error, .. } => {
             draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref());
@@ -286,6 +289,53 @@ fn draw_new_request(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&str>) {
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  Paste a cURL command, then Ctrl+s to import",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+    ];
+
+    if buffer.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+            Span::styled("█", Style::default().fg(Color::White)),
+        ]));
+    } else {
+        // The cursor sits at the end of the last line: the buffer is only ever
+        // appended to, so there is nowhere else for it to be.
+        let last = buffer.lines().count().saturating_sub(1);
+        for (i, line) in buffer.lines().enumerate() {
+            let text = if i == last { format!("{}█", line) } else { line.to_string() };
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(text, Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    if let Some(err) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("  error: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Import cURL ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Green)),
+        );
     frame.render_widget(paragraph, area);
 }
 
@@ -659,6 +709,16 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("refresh", Style::default().fg(Color::DarkGray)),
             Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("copy cURL", Style::default().fg(Color::DarkGray)),
+            Span::styled("   i ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("import cURL", Style::default().fg(Color::DarkGray)),
+        ],
+        Mode::ImportCurl { .. } => vec![
+            Span::styled(" Ctrl+s ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("import", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("newline", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ProfileSelect { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),

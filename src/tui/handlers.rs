@@ -2,8 +2,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
 use std::fs;
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
-use super::{App, Mode, PendingAction, ResponseKind};
-use super::tree::{EntryKind, VisibleRow, visible_rows, build_tree, load_entries};
+use super::{App, Mode, PendingAction, RequestDraft, ResponseKind};
+use super::tree::{VisibleRow, visible_rows, build_tree, load_entries};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
@@ -11,35 +11,29 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
             app.mode = Mode::Browse;
         }
         KeyCode::Tab => {
-            if let Mode::NewRequest { fields, focused, .. } = &mut app.mode {
-                *focused = (*focused + 1) % fields.len();
+            if let Mode::NewRequest { draft, .. } = &mut app.mode {
+                draft.focused = (draft.focused + 1) % draft.fields.len();
             }
         }
         KeyCode::BackTab => {
-            if let Mode::NewRequest { fields, focused, .. } = &mut app.mode {
-                let len = fields.len();
-                *focused = focused.checked_sub(1).unwrap_or(len - 1);
+            if let Mode::NewRequest { draft, .. } = &mut app.mode {
+                let len = draft.fields.len();
+                draft.focused = draft.focused.checked_sub(1).unwrap_or(len - 1);
             }
         }
         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if let Mode::NewRequest { global, .. } = &mut app.mode {
-                *global = !*global;
+            if let Mode::NewRequest { draft, .. } = &mut app.mode {
+                draft.global = !draft.global;
             }
         }
         KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            let snapshot = match &app.mode {
-                Mode::NewRequest { fields, focused, profiles, original_name, global, .. } => {
-                    Some((fields.clone(), *focused, profiles.clone(), original_name.clone(), *global))
-                }
+            let draft = match &app.mode {
+                Mode::NewRequest { draft, .. } => Some(draft.clone()),
                 _ => None,
             };
-            if let Some((fields, focused, profiles, original_name, global)) = snapshot {
+            if let Some(draft) = draft {
                 app.mode = Mode::NewProfile {
-                    request_fields: fields,
-                    request_focused: focused,
-                    request_profiles: profiles,
-                    request_original_name: original_name,
-                    request_global: global,
+                    draft,
                     name: String::new(),
                     params: Vec::new(),
                     focused: 0,
@@ -48,14 +42,16 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char(c) => {
-            if let Mode::NewRequest { fields, focused, error, .. } = &mut app.mode {
-                fields[*focused].1.push(c);
+            if let Mode::NewRequest { draft, error } = &mut app.mode {
+                let focused = draft.focused;
+                draft.fields[focused].1.push(c);
                 *error = None;
             }
         }
         KeyCode::Backspace => {
-            if let Mode::NewRequest { fields, focused, error, .. } = &mut app.mode {
-                fields[*focused].1.pop();
+            if let Mode::NewRequest { draft, error } = &mut app.mode {
+                let focused = draft.focused;
+                draft.fields[focused].1.pop();
                 *error = None;
             }
         }
@@ -67,19 +63,47 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// The import buffer.
+///
+/// Enter inserts a newline rather than confirming: a terminal without bracketed
+/// paste delivers a pasted multi-line command as characters with Enters between
+/// the lines, so treating Enter as "confirm" would parse the first line alone.
+/// Ctrl+s confirms instead.
+pub(super) fn handle_key_import_curl(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::Browse,
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.confirm_import_curl();
+        }
+        KeyCode::Enter => {
+            if let Mode::ImportCurl { buffer, error } = &mut app.mode {
+                buffer.push('\n');
+                *error = None;
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Mode::ImportCurl { buffer, error } = &mut app.mode {
+                buffer.push(c);
+                *error = None;
+            }
+        }
+        KeyCode::Backspace => {
+            if let Mode::ImportCurl { buffer, error } = &mut app.mode {
+                buffer.pop();
+                *error = None;
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
             // Return to NewRequest without saving the profile
-            if let Mode::NewProfile { request_fields, request_focused, request_profiles, request_original_name, request_global, .. } = &app.mode {
-                app.mode = Mode::NewRequest {
-                    fields: request_fields.clone(),
-                    focused: *request_focused,
-                    profiles: request_profiles.clone(),
-                    original_name: request_original_name.clone(),
-                    global: *request_global,
-                    error: None,
-                };
+            if let Mode::NewProfile { draft, .. } = &app.mode {
+                app.mode = Mode::NewRequest { draft: draft.clone(), error: None };
             }
         }
         KeyCode::Tab => {
@@ -199,60 +223,13 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
         KeyCode::Char('t') => app.try_test_selected(),
         KeyCode::Char('y') => app.try_copy_curl_selected(),
         KeyCode::Char('n') => {
-            app.mode = Mode::NewRequest {
-                fields: vec![
-                    ("name".to_string(), String::new()),
-                    ("method".to_string(), "GET".to_string()),
-                    ("url".to_string(), String::new()),
-                    ("description".to_string(), String::new()),
-                ],
-                focused: 0,
-                profiles: Vec::new(),
-                original_name: None,
-                global: false,
-                error: None,
-            };
+            app.mode = Mode::NewRequest { draft: RequestDraft::blank(), error: None };
         }
-        KeyCode::Char('e') => {
-            let Some(idx) = app.selected_entry_index() else { return false };
-            let entry = &app.entries[idx];
-            let entry_global = entry.global;
-            if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
-                let name = entry.name.clone();
-                app.mode = Mode::NewRequest {
-                    fields: vec![
-                        ("name".to_string(), name.clone()),
-                        ("method".to_string(), method.clone()),
-                        ("url".to_string(), url.clone()),
-                        ("description".to_string(), description.clone().unwrap_or_default()),
-                    ],
-                    focused: 0,
-                    profiles: profiles.clone(),
-                    original_name: Some(name),
-                    global: entry_global,
-                    error: None,
-                };
-            }
+        KeyCode::Char('i') => {
+            app.mode = Mode::ImportCurl { buffer: String::new(), error: None };
         }
-        KeyCode::Char('c') => {
-            let Some(idx) = app.selected_entry_index() else { return false };
-            let entry = &app.entries[idx];
-            if let EntryKind::Request { method, url, description, profiles, .. } = &entry.kind {
-                app.mode = Mode::NewRequest {
-                    fields: vec![
-                        ("name".to_string(), String::new()),
-                        ("method".to_string(), method.clone()),
-                        ("url".to_string(), url.clone()),
-                        ("description".to_string(), description.clone().unwrap_or_default()),
-                    ],
-                    focused: 0,
-                    profiles: profiles.clone(),
-                    original_name: None,
-                    global: false,
-                    error: None,
-                };
-            }
-        }
+        KeyCode::Char('e') => app.edit_selected(),
+        KeyCode::Char('c') => app.clone_selected(),
         KeyCode::Char('d') => {
             let Some(idx) = app.selected_entry_index() else { return false };
             let entry = &app.entries[idx];
