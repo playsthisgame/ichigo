@@ -1,4 +1,4 @@
-# ichigo
+# 🍓 ichigo 🍓
 
 A CLI HTTP client. Store named request configs in your project or globally, then run them by name.
 
