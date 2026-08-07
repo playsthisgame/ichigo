@@ -65,6 +65,16 @@ enum Mode {
         scroll: u16,
         response_filter: String,
         response_filter_active: bool,
+        // Index into the *filtered* lines, not the body's. Any change to the
+        // filter has to reset it, or it points at a line that is no longer
+        // shown and `y` copies something the pane never displayed.
+        cursor: usize,
+        // Where a visual selection started; None when not selecting. The
+        // selection runs between it and `cursor` in either direction.
+        anchor: Option<usize>,
+        // Transient feedback ("copied 2 lines"), shown beside the status badge
+        // and cleared by the next keypress.
+        status: Option<String>,
     },
     TestResponse {
         results: crate::tester::TestResults,
@@ -82,6 +92,14 @@ enum Mode {
     ConfirmDelete {
         entry_name: String,
         global: bool,
+    },
+    // The draft's headers as an editable key/value list.
+    // focused: 2i = pairs[i].name, 2i+1 = pairs[i].value
+    EditHeaders {
+        draft: RequestDraft,
+        pairs: Vec<(String, String)>,
+        focused: usize,
+        error: Option<String>,
     },
     // The draft's profiles, for picking one to edit or delete. The single way
     // into `NewProfile`, so every profile action starts from the same screen.
@@ -161,6 +179,10 @@ impl RequestDraft {
             body: config.body,
             extract: config.extract,
         }
+    }
+
+    pub(crate) fn headers(&self) -> &HashMap<String, String> {
+        &self.headers
     }
 }
 
@@ -328,6 +350,9 @@ impl App {
             scroll: 0,
             response_filter: String::new(),
             response_filter_active: false,
+            cursor: 0,
+            anchor: None,
+            status: None,
         };
     }
 
@@ -784,6 +809,27 @@ impl App {
         }
     }
 
+    /// Opens the selected request's headers for editing.
+    ///
+    /// Exists alongside the request form's `Ctrl+e` because a plain key in
+    /// Browse is the one binding no terminal or multiplexer can intercept.
+    /// Re-reads from disk like every other action path.
+    fn edit_headers_selected(&mut self) {
+        let Some((name, global)) = self.selected_request() else { return };
+        match RequestConfig::load(&name) {
+            Ok(config) => {
+                let draft = RequestDraft::from_config(config, Some(name), global);
+                self.mode = Mode::EditHeaders {
+                    pairs: header_pairs(&draft),
+                    draft,
+                    focused: 0,
+                    error: None,
+                };
+            }
+            Err(e) => self.show_error(e),
+        }
+    }
+
     /// Opens the selected request's profiles for editing.
     ///
     /// Re-reads from disk like every other action path: the profile params fed
@@ -1042,6 +1088,9 @@ impl App {
         if matches!(self.mode, Mode::ImportCurl { .. }) {
             return handlers::handle_key_import_curl(self, key);
         }
+        if matches!(self.mode, Mode::EditHeaders { .. }) {
+            return handlers::handle_key_edit_headers(self, key);
+        }
         if matches!(self.mode, Mode::ProfileList { .. }) {
             return handlers::handle_key_profile_list(self, key);
         }
@@ -1101,6 +1150,86 @@ fn event_loop(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Folds edited header pairs back into a draft.
+///
+/// Rows with a blank name are dropped, so an added-then-abandoned row is not an
+/// error. Two rows naming the same header are refused *case-insensitively* —
+/// HTTP header names do not distinguish case, so `Accept` and `accept` are one
+/// header, and a `HashMap` would silently keep whichever landed last.
+///
+/// A `Content-Type` row is moved into `body.content_type` when the draft has a
+/// body, never left in `headers`. That is the same normalization `from_curl`
+/// applies and for the same reason: `to_curl` re-derives the header from the
+/// body, so a config holding both emits it twice.
+fn apply_headers(draft: &mut RequestDraft, pairs: Vec<(String, String)>) -> Result<(), String> {
+    let mut kept: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if kept.iter().any(|(k, _): &(String, String)| k.eq_ignore_ascii_case(&name)) {
+            return Err(format!("Duplicate header '{name}'"));
+        }
+        kept.push((name, value.trim().to_string()));
+    }
+
+    if let (Some(body), Some(pos)) = (
+        draft.body.as_mut(),
+        kept.iter().position(|(k, _)| k.eq_ignore_ascii_case("content-type")),
+    ) {
+        let (_, value) = kept.remove(pos);
+        if !value.is_empty() {
+            body.content_type = value;
+        }
+    }
+
+    draft.headers = kept.into_iter().collect();
+    Ok(())
+}
+
+/// The draft's headers as an ordered, editable list.
+///
+/// Sorted because a `HashMap` has no order of its own — without this the rows
+/// would shuffle every time the editor is opened.
+fn header_pairs(draft: &RequestDraft) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = draft
+        .headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+}
+
+/// The response lines the filter leaves visible.
+///
+/// What the pane draws, what `G` clamps the cursor against, and what a copy
+/// puts on the clipboard are all this list. It exists because those three had
+/// drifted: the predicate was spelled out separately at each site and the copy
+/// path never got one, so filtering to two lines and pressing `c` handed you
+/// the whole body.
+pub(super) fn visible_response_lines<'a>(body: &'a str, filter: &str) -> Vec<&'a str> {
+    let q = filter.to_lowercase();
+    body.lines()
+        .filter(|line| q.is_empty() || line.to_lowercase().contains(&q))
+        .collect()
+}
+
+/// The inclusive line range a visual selection covers, in view order.
+///
+/// `anchor` may sit either side of the cursor — dragging a selection upward is
+/// as ordinary as dragging it down — so the two are sorted rather than assumed.
+/// With no anchor the range is the cursor line alone, which is what makes `y`
+/// with nothing selected copy one line instead of nothing.
+pub(super) fn selection_range(cursor: usize, anchor: Option<usize>) -> (usize, usize) {
+    match anchor {
+        Some(a) if a <= cursor => (a, cursor),
+        Some(a) => (cursor, a),
+        None => (cursor, cursor),
+    }
+}
 
 /// Places `profile` into `profiles` — replacing the one at `editing`, or
 /// appending when that is `None` — and returns the index it landed at.
@@ -1310,6 +1439,117 @@ mod tests {
         assert_eq!(draft.query.get("page").unwrap(), "2");
         assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
         assert_eq!(draft.body.expect("body").data, r#"{"a":1}"#);
+    }
+
+    fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn headers_are_replaced_wholesale_so_a_removed_row_is_gone() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        assert!(draft.headers.contains_key("Accept"));
+
+        apply_headers(&mut draft, pairs(&[("X-Only", "1")])).expect("valid");
+
+        assert_eq!(draft.headers.len(), 1);
+        assert!(!draft.headers.contains_key("Accept"), "removed row survived");
+        assert_eq!(draft.headers.get("X-Only").unwrap(), "1");
+    }
+
+    #[test]
+    fn a_blank_name_is_dropped_rather_than_stored() {
+        let mut draft = RequestDraft::blank();
+        apply_headers(&mut draft, pairs(&[("Accept", "a"), ("  ", "orphan"), ("", "")]))
+            .expect("blank rows are not an error");
+        assert_eq!(draft.headers.len(), 1);
+    }
+
+    #[test]
+    fn names_and_values_are_trimmed() {
+        let mut draft = RequestDraft::blank();
+        apply_headers(&mut draft, pairs(&[("  Accept  ", "  application/json  ")])).unwrap();
+        assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
+    }
+
+    /// HTTP header names are case-insensitive, so these are one header. A
+    /// `HashMap` would keep both and send whichever it felt like.
+    #[test]
+    fn a_duplicate_name_is_refused_ignoring_case() {
+        let mut draft = RequestDraft::blank();
+        let err = apply_headers(&mut draft, pairs(&[("Accept", "a"), ("accept", "b")]))
+            .expect_err("same header twice");
+        assert!(err.contains("accept"), "the error names the header: {err}");
+        assert!(draft.headers.is_empty(), "nothing applied on refusal");
+    }
+
+    /// CLAUDE.md's rule: a request with a body keeps its content type in
+    /// `body.content_type` and never in `headers`, because `to_curl` re-derives
+    /// the header from the body and would otherwise emit it twice.
+    #[test]
+    fn a_content_type_row_moves_into_the_body() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        apply_headers(&mut draft, pairs(&[("Content-Type", "text/plain"), ("Accept", "a")]))
+            .unwrap();
+
+        assert_eq!(draft.body.as_ref().unwrap().content_type, "text/plain");
+        assert!(
+            !draft.headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")),
+            "content type left in headers: {:?}",
+            draft.headers
+        );
+        assert_eq!(draft.headers.get("Accept").unwrap(), "a");
+    }
+
+    /// With no body there is nothing to re-derive it from, so it stays a header.
+    #[test]
+    fn a_content_type_row_stays_a_header_when_there_is_no_body() {
+        let mut draft = RequestDraft::blank();
+        apply_headers(&mut draft, pairs(&[("Content-Type", "text/plain")])).unwrap();
+        assert_eq!(draft.headers.get("Content-Type").unwrap(), "text/plain");
+    }
+
+    const BODY: &str = "alpha\nBETA line\ngamma\nbeta again\ndelta";
+
+    #[test]
+    fn an_empty_filter_shows_every_line() {
+        assert_eq!(visible_response_lines(BODY, "").len(), 5);
+    }
+
+    #[test]
+    fn filtering_is_case_insensitive_and_by_substring() {
+        assert_eq!(
+            visible_response_lines(BODY, "beta"),
+            vec!["BETA line", "beta again"]
+        );
+    }
+
+    /// The pane, `G`, and copy all read this one list. Copy used to take the
+    /// whole body instead, so filtering to two lines and pressing `c` handed
+    /// over all five.
+    #[test]
+    fn a_filtered_copy_is_only_the_visible_lines() {
+        let copied = visible_response_lines(BODY, "beta").join("\n");
+        assert_eq!(copied, "BETA line\nbeta again");
+        assert!(!copied.contains("alpha"));
+    }
+
+    #[test]
+    fn with_no_anchor_the_range_is_the_cursor_line_alone() {
+        assert_eq!(selection_range(3, None), (3, 3));
+    }
+
+    #[test]
+    fn a_selection_dragged_upward_covers_the_same_lines_as_one_dragged_down() {
+        assert_eq!(selection_range(1, Some(4)), (1, 4));
+        assert_eq!(selection_range(4, Some(1)), (1, 4));
+    }
+
+    #[test]
+    fn a_selection_is_inclusive_of_both_ends() {
+        let lines = visible_response_lines(BODY, "");
+        let (from, to) = selection_range(2, Some(1));
+        assert_eq!(lines[from..=to], ["BETA line", "gamma"]);
     }
 
     fn profile(name: &str, params: &[(&str, &str)]) -> crate::config::Profile {

@@ -190,6 +190,7 @@ Keybindings:
 | `y` | Copy selected request as a cURL command |
 | `i` | Import a pasted cURL command as a new request |
 | `n` / `e` / `c` | New / edit / clone a request |
+| `h` | Edit the selected request's headers |
 | `p` | Edit the selected request's profiles |
 | `d` | Delete selected request |
 | `R` | Refresh the config list from disk |
@@ -202,7 +203,31 @@ dismisses it.
 
 The TUI is meant to be left open. Every run and load test re-reads the config file from disk first, so edits you make in another terminal — rotating a token in a profile, adding a header, changing a URL — take effect on the next run with no restart. Press `R` when you have created, renamed, or deleted config *files* on disk and want them to show up in the list.
 
-Pressing `y` turns the selected request into a cURL command and copies it to the clipboard. It runs the same profile picker and variable prompts as a normal run, so the command it produces carries the resolved values — the profile's real token, not `{{TOKEN}}`. The command is shown before it is copied, and `c` re-copies it. Chains cannot be copied this way: a chain feeds values extracted from one step into the next, which a single cURL command has no way to express.
+#### Copying part of a response
+
+The response pane has a cursor line, so you can take just the lines you want
+without fighting your terminal's text selection:
+
+| Key | Action |
+| --- | ------ |
+| `j` / `k` | Move the cursor (the view scrolls to follow) |
+| `y` | Copy the cursor line |
+| `V` | Start a line selection; `j`/`k` extend it, `y` copies it |
+| Esc | Cancel the selection (again to leave the pane) |
+| `f` | Filter to matching lines |
+| `c` | Copy everything the pane is showing |
+
+Copying this way beats dragging with the mouse: a terminal's selection is
+linear, so a drag that spans more than one row also takes the request list and
+the pane borders on the rows in between. `y` copies the lines themselves.
+
+`c` copies **what the pane shows**. With a filter active that is the matching
+lines only, which is often the quickest route to a couple of scattered
+fields — filter to `secret` and `c` gives you both token lines with nothing
+in between. Clearing the filter puts the cursor back at the top, since the
+line it pointed at may no longer be on screen.
+
+Pressing `y` in the *request list* turns the selected request into a cURL command and copies it to the clipboard. It runs the same profile picker and variable prompts as a normal run, so the command it produces carries the resolved values — the profile's real token, not `{{TOKEN}}`. The command is shown before it is copied, and `c` re-copies it. Chains cannot be copied this way: a chain feeds values extracted from one step into the next, which a single cURL command has no way to express.
 
 > **The generated command contains your real credentials.** That is what makes it useful, and also what makes it unsafe to paste into a public issue, a pull request, or a shared log. Redact before sharing.
 
@@ -307,6 +332,33 @@ ichigo test create-user --iter 50 --profile staging
 ```
 
 Any `{{PLACEHOLDER}}` not covered by the chosen profile is still resolved from `--var` flags or environment variables as normal. In the TUI, a profile picker appears automatically when profiles are present — pick one (or skip) and fill in any remaining variables interactively.
+
+#### Editing headers in the TUI
+
+Press `h` on a request, or `Ctrl+e` while editing one, to edit its headers:
+
+| Key | Action |
+| --- | ------ |
+| Tab / Shift-Tab | Move between name and value fields |
+| `Ctrl+a` | Add a header |
+| `Ctrl+d` | Remove the header under the cursor |
+| Enter | Apply to the request |
+| Esc | Discard the header edits |
+
+> `Ctrl+h` also works, but only in terminals that send it. Many terminals, tmux
+> configs, and shells bind Ctrl+H to backward-delete-char and send a plain
+> Backspace instead, in which case the key just deletes a character. `h` from
+> the request list is the binding nothing can intercept.
+
+Applying only updates the request in memory — Enter on the request form is what
+writes the file, so Esc out of that form drops the header changes too.
+
+Two headers with the same name are refused, compared without regard to case:
+HTTP treats `Accept` and `accept` as one header, so keeping both would mean
+sending whichever won a coin toss. If the request has a body, a `Content-Type`
+header is stored as the body's `content_type` rather than as a header — ichigo
+derives the header from the body when it sends, and holding both would put it
+on the wire twice.
 
 #### Editing profiles in the TUI
 

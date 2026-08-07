@@ -47,17 +47,23 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestInput { vars, focused, iterations, entry_name } => {
             draw_test_input(frame, panes[1], vars, iterations, *focused, entry_name);
         }
-        Mode::Response { kind, body, scroll , response_filter, response_filter_active} => {
-            response_view_height = Some(draw_response(frame, panes[1], kind, body, *scroll, response_filter, *response_filter_active));
+        Mode::Response { kind, body, scroll, response_filter, response_filter_active, cursor, anchor, status } => {
+            response_view_height = Some(draw_response(
+                frame, panes[1], kind, body, *scroll, response_filter,
+                *response_filter_active, *cursor, *anchor, status.as_deref(),
+            ));
         }
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
         }
         Mode::NewRequest { draft, error } => {
-            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.profiles, draft.original_name.is_some(), draft.global, error.as_deref());
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.profiles, draft.headers(), draft.original_name.is_some(), draft.global, error.as_deref());
         }
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
+        }
+        Mode::EditHeaders { pairs, focused, error, .. } => {
+            draw_edit_headers(frame, panes[1], pairs, *focused, error.as_deref());
         }
         Mode::ProfileList { draft, selected } => {
             draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1);
@@ -221,6 +227,7 @@ fn draw_new_request(
     fields: &[(String, String)],
     focused: usize,
     profiles: &[crate::config::Profile],
+    headers: &std::collections::HashMap<String, String>,
     is_edit: bool,
     global: bool,
     error: Option<&str>,
@@ -262,6 +269,32 @@ fn draw_new_request(
         Span::styled(global_check, Style::default().fg(global_color).add_modifier(Modifier::BOLD)),
         Span::styled("  Ctrl+g to toggle", Style::default().fg(Color::DarkGray)),
     ]));
+    lines.push(Line::raw(""));
+
+    // Headers are edited in their own pane, but shown here so the form is not
+    // silent about a part of the request it carries.
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  headers",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  Ctrl+e to edit", Style::default().fg(Color::DarkGray)),
+    ]));
+    if headers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    none",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let mut sorted: Vec<(&String, &String)> = headers.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in sorted {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}: ", k), Style::default().fg(Color::Cyan)),
+                Span::styled(v.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
     lines.push(Line::raw(""));
 
     if !profiles.is_empty() {
@@ -420,6 +453,71 @@ fn draw_new_profile(
             .title(if is_edit { " Edit Profile " } else { " New Profile " })
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+/// The draft's headers as name/value field pairs.
+/// focused: 2i = pairs[i].name, 2i+1 = pairs[i].value
+fn draw_edit_headers(
+    frame: &mut Frame,
+    area: Rect,
+    pairs: &[(String, String)],
+    focused: usize,
+    error: Option<&str>,
+) {
+    let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+
+    for (i, (name, value)) in pairs.iter().enumerate() {
+        let name_focused = focused == 2 * i;
+        let value_focused = focused == 2 * i + 1;
+
+        lines.push(Line::from(Span::styled(
+            format!("  header {} name", i + 1),
+            Style::default()
+                .fg(if name_focused { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )));
+        let display = if name_focused { format!("{}█", name) } else { name.clone() };
+        lines.push(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+            Span::styled(display, Style::default().fg(if name_focused { Color::White } else { Color::DarkGray })),
+        ]));
+
+        lines.push(Line::from(Span::styled(
+            format!("  header {} value", i + 1),
+            Style::default()
+                .fg(if value_focused { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )));
+        let display = if value_focused { format!("{}█", value) } else { value.clone() };
+        lines.push(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
+            Span::styled(display, Style::default().fg(if value_focused { Color::White } else { Color::DarkGray })),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    if pairs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No headers. Ctrl+a adds one.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::raw(""));
+    }
+
+    if let Some(err) = error {
+        lines.push(Line::from(Span::styled(
+            format!("  error: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Headers ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -691,7 +789,19 @@ fn status_color(status: u16) -> Color {
 }
 
 /// Returns the height of the body viewport (inside the borders).
-fn draw_response(frame: &mut Frame, area: Rect, kind: &ResponseKind, body: &str, scroll: u16, response_filter: &str, response_filter_active: bool) -> u16 {
+#[allow(clippy::too_many_arguments)]
+fn draw_response(
+    frame: &mut Frame,
+    area: Rect,
+    kind: &ResponseKind,
+    body: &str,
+    scroll: u16,
+    response_filter: &str,
+    response_filter_active: bool,
+    cursor: usize,
+    anchor: Option<usize>,
+    status: Option<&str>,
+) -> u16 {
     // A generated command is neither a response nor an error, so it gets its
     // own heading rather than borrowing a status code it doesn't have.
     let (heading, badge_color, badge) = match kind {
@@ -714,10 +824,23 @@ fn draw_response(frame: &mut Frame, area: Rect, kind: &ResponseKind, body: &str,
         }
     };
 
-    let title = Line::from(vec![
+    let mut title_spans = vec![
         Span::raw(heading),
         Span::styled(badge, Style::default().fg(Color::Black).bg(badge_color)),
-    ]);
+    ];
+    if anchor.is_some() {
+        title_spans.push(Span::styled(
+            " VISUAL ",
+            Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(status) = status {
+        title_spans.push(Span::styled(
+            format!(" {status} "),
+            Style::default().fg(Color::Black).bg(Color::Green),
+        ));
+    }
+    let title = Line::from(title_spans);
 
     let show_filter = response_filter_active || !response_filter.is_empty();
     let chunks = if show_filter {
@@ -747,11 +870,22 @@ fn draw_response(frame: &mut Frame, area: Rect, kind: &ResponseKind, body: &str,
         frame.render_widget(filter_widget, chunks[0]);
     }
 
-    let q = response_filter.to_lowercase();
-    let lines: Vec<Line<'static>> = body
-        .lines()
-        .filter(|line| q.is_empty() || line.to_lowercase().contains(&q))
+    let (from, to) = super::selection_range(cursor, anchor);
+    let lines: Vec<Line<'static>> = super::visible_response_lines(body, response_filter)
+        .into_iter()
         .map(colorize_json_line)
+        .enumerate()
+        .map(|(i, line)| {
+            // A base style on the Line paints behind the spans, so the JSON
+            // colouring survives the highlight rather than being replaced.
+            if anchor.is_some() && i >= from && i <= to {
+                line.style(Style::default().bg(Color::Blue))
+            } else if anchor.is_none() && i == cursor {
+                line.style(Style::default().bg(Color::DarkGray))
+            } else {
+                line
+            }
+        })
         .collect();
 
     let paragraph = Paragraph::new(lines)
@@ -822,12 +956,26 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         Mode::NewRequest { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("save", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("next/prev field", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Ctrl+g ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("toggle global", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Ctrl+p ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("add profile", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ^e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("headers", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ^p ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("profiles", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ^g ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("global", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
+        Mode::EditHeaders { .. } => vec![
+            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("apply", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ^a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("add header", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ^d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("remove header", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
@@ -859,17 +1007,28 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("   n/Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
+        // While selecting, the hints are only the keys that finish or abandon
+        // the selection — everything else is noise with a half-made one on
+        // screen.
+        Mode::Response { anchor: Some(_), .. } => vec![
+            Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("extend", Style::default().fg(Color::DarkGray)),
+            Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("copy selection", Style::default().fg(Color::DarkGray)),
+            Span::styled("   V/Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
         Mode::Response { .. } | Mode::TestResponse { .. } => vec![
             Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("scroll", Style::default().fg(Color::DarkGray)),
-            Span::styled("   gg ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("top", Style::default().fg(Color::DarkGray)),
-            Span::styled("   G ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("bottom", Style::default().fg(Color::DarkGray)),
+            Span::styled("move", Style::default().fg(Color::DarkGray)),
+            Span::styled("   V ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("select", Style::default().fg(Color::DarkGray)),
+            Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("copy line", Style::default().fg(Color::DarkGray)),
             Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("filter", Style::default().fg(Color::DarkGray)),
             Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy", Style::default().fg(Color::DarkGray)),
+            Span::styled("copy all", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("back", Style::default().fg(Color::DarkGray)),
             Span::styled("   q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -906,6 +1065,7 @@ const HELP_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
         &[
             ("n", "new"),
             ("e", "edit"),
+            ("h", "headers"),
             ("p", "profiles"),
             ("c", "clone"),
             ("d", "delete"),
