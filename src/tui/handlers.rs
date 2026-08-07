@@ -240,6 +240,7 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
             let count = app.filtered_indices().len();
             app.list_state.select(if count == 0 { None } else { Some(0) });
         }
+        KeyCode::Char('?') => app.show_help = true,
         _ => {}
     }
     false

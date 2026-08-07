@@ -166,6 +166,11 @@ struct App {
     response_view_height: u16,
     filter: String,
     filter_active: bool,
+    // The `?` keymap overlay. A flag rather than a `Mode` variant because it
+    // draws *over* whatever pane is up and dismisses back to it — as a mode it
+    // would have to remember which of the nine it interrupted, and every action
+    // path would gain a state that reaches none of them.
+    show_help: bool,
     mode: Mode,
 }
 
@@ -191,6 +196,7 @@ impl App {
             response_view_height: 0,
             filter: String::new(),
             filter_active: false,
+            show_help: false,
             mode: Mode::Browse,
         })
     }
@@ -973,6 +979,13 @@ impl App {
 
     // Returns true when the event loop should exit.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        // Any key dismisses the overlay and is swallowed doing so. Letting the
+        // key through would mean `d` closes help *and* opens the delete
+        // confirmation for whatever happened to be selected behind it.
+        if self.show_help {
+            self.show_help = false;
+            return false;
+        }
         if self.filter_active && matches!(self.mode, Mode::Browse) {
             return handlers::handle_key_filter(self, key);
         }
