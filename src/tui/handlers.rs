@@ -31,17 +31,34 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                 Mode::NewRequest { draft, .. } => Some(draft.clone()),
                 _ => None,
             };
+            // Into the list rather than straight to a blank profile: it is the
+            // only door to NewProfile, so add/edit/delete all start alike. An
+            // empty list opens on the "new" row, so this is still one Enter
+            // away from the old behaviour.
             if let Some(draft) = draft {
-                app.mode = Mode::NewProfile {
+                app.mode = Mode::ProfileList { draft, selected: 0 };
+            }
+        }
+        // Ctrl+e is the documented key. Ctrl+h is kept because it is the better
+        // mnemonic, but it cannot be the only one: plenty of terminals and tmux
+        // configs bind Ctrl+H to backward-delete-char and send 0x7F, which
+        // arrives as a plain Backspace and silently deletes a character
+        // instead.
+        KeyCode::Char('e' | 'h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::NewRequest { draft, .. } = &app.mode {
+                let draft = draft.clone();
+                app.mode = Mode::EditHeaders {
+                    pairs: super::header_pairs(&draft),
                     draft,
-                    name: String::new(),
-                    params: Vec::new(),
                     focused: 0,
                     error: None,
                 };
             }
         }
-        KeyCode::Char(c) => {
+        // Modifiers are checked so an unbound Ctrl+<letter> does nothing rather
+        // than typing the letter — crossterm reports those as Char + CONTROL,
+        // so without this Ctrl+h inserted a literal 'h'.
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Mode::NewRequest { draft, error } = &mut app.mode {
                 let focused = draft.focused;
                 draft.fields[focused].1.push(c);
@@ -98,12 +115,177 @@ pub(super) fn handle_key_import_curl(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+/// The draft's headers. Two focusable fields per header — `2i` is the name,
+/// `2i+1` the value — so Tab walks name, value, name, value.
+///
+/// Edits land in the draft only when Enter succeeds; Esc drops them, and the
+/// request itself is still unwritten until saved from the form.
+pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            if let Mode::EditHeaders { draft, .. } = &app.mode {
+                app.mode = Mode::NewRequest { draft: draft.clone(), error: None };
+            }
+        }
+        KeyCode::Tab => {
+            if let Mode::EditHeaders { pairs, focused, .. } = &mut app.mode {
+                let total = 2 * pairs.len();
+                if total > 0 {
+                    *focused = (*focused + 1) % total;
+                }
+            }
+        }
+        KeyCode::BackTab => {
+            if let Mode::EditHeaders { pairs, focused, .. } = &mut app.mode {
+                let total = 2 * pairs.len();
+                if total > 0 {
+                    *focused = focused.checked_sub(1).unwrap_or(total - 1);
+                }
+            }
+        }
+        KeyCode::Char('a') if ctrl => {
+            if let Mode::EditHeaders { pairs, focused, error, .. } = &mut app.mode {
+                *focused = 2 * pairs.len();
+                pairs.push((String::new(), String::new()));
+                *error = None;
+            }
+        }
+        KeyCode::Char('d') if ctrl => {
+            if let Mode::EditHeaders { pairs, focused, error, .. } = &mut app.mode {
+                let idx = *focused / 2;
+                if idx < pairs.len() {
+                    pairs.remove(idx);
+                    // The list just got shorter; keep focus on a field that
+                    // still exists (0 when the last header is gone).
+                    *focused = (*focused).min((2 * pairs.len()).saturating_sub(1));
+                    *error = None;
+                }
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            if let Mode::EditHeaders { pairs, focused, error, .. } = &mut app.mode {
+                let idx = *focused / 2;
+                let is_value = *focused % 2 == 1;
+                if let Some((k, v)) = pairs.get_mut(idx) {
+                    if is_value { v.push(c) } else { k.push(c) }
+                    *error = None;
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Mode::EditHeaders { pairs, focused, error, .. } = &mut app.mode {
+                let idx = *focused / 2;
+                let is_value = *focused % 2 == 1;
+                if let Some((k, v)) = pairs.get_mut(idx) {
+                    if is_value { v.pop() } else { k.pop() };
+                    *error = None;
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let taken = match &app.mode {
+                Mode::EditHeaders { draft, pairs, .. } => Some((draft.clone(), pairs.clone())),
+                _ => None,
+            };
+            let Some((mut draft, pairs)) = taken else { return false };
+            match super::apply_headers(&mut draft, pairs) {
+                Ok(()) => app.mode = Mode::NewRequest { draft, error: None },
+                Err(message) => {
+                    if let Mode::EditHeaders { error, .. } = &mut app.mode {
+                        *error = Some(message);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// The draft's profiles. Rows are `0..profiles.len()` plus a trailing "new"
+/// row, so `selected == profiles.len()` means "add one" — an empty list opens
+/// there and Enter creates straight away.
+pub(super) fn handle_key_profile_list(app: &mut App, key: KeyEvent) -> bool {
+    let Mode::ProfileList { draft, selected } = &mut app.mode else { return false };
+    let new_row = draft.profiles.len();
+
+    match key.code {
+        // Back to the form. Profile edits live in the draft until the request
+        // itself is saved, so leaving here writes nothing.
+        KeyCode::Esc => {
+            app.mode = Mode::NewRequest { draft: draft.clone(), error: None };
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            if *selected < new_row {
+                *selected += 1;
+            }
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            *selected = selected.saturating_sub(1);
+        }
+        KeyCode::Char('n') => {
+            app.mode = Mode::NewProfile {
+                draft: draft.clone(),
+                editing: None,
+                name: String::new(),
+                params: Vec::new(),
+                focused: 0,
+                error: None,
+            };
+        }
+        KeyCode::Char('d') => {
+            if *selected < new_row {
+                draft.profiles.remove(*selected);
+                // The list just got shorter; keep the cursor on a real row.
+                *selected = (*selected).min(draft.profiles.len());
+            }
+        }
+        KeyCode::Enter => {
+            let idx = *selected;
+            let draft = draft.clone();
+            app.mode = match draft.profiles.get(idx) {
+                Some(profile) => {
+                    // A profile's params are a HashMap, which has no order of
+                    // its own; sort so the fields do not shuffle between edits.
+                    let mut params: Vec<(String, String)> = profile
+                        .params
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    params.sort_by(|a, b| a.0.cmp(&b.0));
+                    Mode::NewProfile {
+                        name: profile.name.clone(),
+                        editing: Some(idx),
+                        draft,
+                        params,
+                        focused: 0,
+                        error: None,
+                    }
+                }
+                None => Mode::NewProfile {
+                    draft,
+                    editing: None,
+                    name: String::new(),
+                    params: Vec::new(),
+                    focused: 0,
+                    error: None,
+                },
+            };
+        }
+        _ => {}
+    }
+    false
+}
+
 pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
-            // Return to NewRequest without saving the profile
-            if let Mode::NewProfile { draft, .. } = &app.mode {
-                app.mode = Mode::NewRequest { draft: draft.clone(), error: None };
+            // Back to the list without saving. `selected` returns to the
+            // profile being edited, or to the "new" row when adding one.
+            if let Mode::NewProfile { draft, editing, .. } = &app.mode {
+                let selected = editing.unwrap_or(draft.profiles.len());
+                app.mode = Mode::ProfileList { draft: draft.clone(), selected };
             }
         }
         KeyCode::Tab => {
@@ -230,6 +412,8 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('e') => app.edit_selected(),
         KeyCode::Char('c') => app.clone_selected(),
+        KeyCode::Char('p') => app.edit_profiles_selected(),
+        KeyCode::Char('h') => app.edit_headers_selected(),
         KeyCode::Char('d') => {
             let Some(idx) = app.selected_entry_index() else { return false };
             let entry = &app.entries[idx];
@@ -274,23 +458,35 @@ pub(super) fn handle_key_filter(app: &mut App, key: KeyEvent) -> bool {
 }
 
 pub(super) fn handle_key_response_filter(app: &mut App, key: KeyEvent) -> bool {
-    if let Mode::Response { response_filter, response_filter_active, scroll, .. } = &mut app.mode {
+    if let Mode::Response {
+        response_filter, response_filter_active, scroll, cursor, anchor, ..
+    } = &mut app.mode
+    {
+        // Every edit to the filter changes which lines are visible, and the
+        // cursor and anchor index *those*. Carrying them over would leave the
+        // cursor on an unrelated line and a selection spanning lines the user
+        // never saw, so both reset with the view.
+        let mut reset = || {
+            *scroll = 0;
+            *cursor = 0;
+            *anchor = None;
+        };
         match key.code {
             KeyCode::Esc => {
                 response_filter.clear();
                 *response_filter_active = false;
-                *scroll = 0;
+                reset();
             }
             KeyCode::Enter => {
                 *response_filter_active = false;
             }
             KeyCode::Char(c) => {
                 response_filter.push(c);
-                *scroll = 0;
+                reset();
             }
             KeyCode::Backspace => {
                 response_filter.pop();
-                *scroll = 0;
+                reset();
             }
             _ => {}
         }
@@ -439,24 +635,34 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
     use super::render::copy_to_clipboard;
     let was_pending_g = app.pending_g;
     app.pending_g = false;
+    let view_height = app.response_view_height;
+
+    // Feedback from the previous key has been read by now.
+    if let Mode::Response { status, .. } = &mut app.mode {
+        *status = None;
+    }
+
     match code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
-            app.mode = Mode::Browse;
-        }
-        KeyCode::Char('j') | KeyCode::Down => {
-            if let Mode::Response { scroll, .. } = &mut app.mode {
-                *scroll = scroll.saturating_add(1);
+            // Esc drops a selection first and leaves the pane only once there
+            // is none, so cancelling a mis-started selection does not also
+            // throw away the response it was made in.
+            let selecting = matches!(app.mode, Mode::Response { anchor: Some(_), .. });
+            if selecting {
+                if let Mode::Response { anchor, .. } = &mut app.mode {
+                    *anchor = None;
+                }
+            } else {
+                app.mode = Mode::Browse;
             }
         }
-        KeyCode::Char('k') | KeyCode::Up => {
-            if let Mode::Response { scroll, .. } = &mut app.mode {
-                *scroll = scroll.saturating_sub(1);
-            }
-        }
+        KeyCode::Char('j') | KeyCode::Down => move_cursor(app, 1, view_height),
+        KeyCode::Char('k') | KeyCode::Up => move_cursor(app, -1, view_height),
         KeyCode::Char('g') => {
             if was_pending_g {
-                if let Mode::Response { scroll, .. } = &mut app.mode {
+                if let Mode::Response { scroll, cursor, .. } = &mut app.mode {
+                    *cursor = 0;
                     *scroll = 0;
                 }
             } else {
@@ -464,25 +670,69 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
             }
         }
         KeyCode::Char('G') => {
-            let view_height = app.response_view_height;
-            if let Mode::Response { scroll, body, response_filter, .. } = &mut app.mode {
-                let q = response_filter.to_lowercase();
-                let line_count = body
-                    .lines()
-                    .filter(|line| q.is_empty() || line.to_lowercase().contains(&q))
-                    .count()
-                    .min(u16::MAX as usize) as u16;
-                *scroll = line_count.saturating_sub(view_height);
+            if let Mode::Response { scroll, cursor, body, response_filter, .. } = &mut app.mode {
+                let count = super::visible_response_lines(body, response_filter).len();
+                *cursor = count.saturating_sub(1);
+                let last = count.min(u16::MAX as usize) as u16;
+                *scroll = last.saturating_sub(view_height);
             }
         }
+        // Start or drop a line selection at the cursor.
+        KeyCode::Char('V') => {
+            if let Mode::Response { anchor, cursor, .. } = &mut app.mode {
+                *anchor = match anchor {
+                    Some(_) => None,
+                    None => Some(*cursor),
+                };
+            }
+        }
+        KeyCode::Char('y') => {
+            let picked = match &app.mode {
+                Mode::Response { body, response_filter, cursor, anchor, .. } => {
+                    let lines = super::visible_response_lines(body, response_filter);
+                    let (from, to) = super::selection_range(*cursor, *anchor);
+                    lines
+                        .get(from..=to.min(lines.len().saturating_sub(1)))
+                        .map(|slice| (slice.join("\n"), slice.len()))
+                }
+                _ => None,
+            };
+            let Some((text, count)) = picked else { return false };
+            match copy_to_clipboard(&text) {
+                Ok(()) => {
+                    if let Mode::Response { anchor, status, .. } = &mut app.mode {
+                        *anchor = None;
+                        *status = Some(format!(
+                            "copied {} line{}",
+                            count,
+                            if count == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
+                Err(e) => app.show_message(ResponseKind::Error, format!("Copy failed: {e}")),
+            }
+        }
+        // Copies what the pane shows, so a filtered view copies the lines you
+        // can see rather than the whole body behind them.
         KeyCode::Char('c') => {
             let text = match &app.mode {
-                Mode::Response { body, .. } => body.clone(),
+                Mode::Response { body, response_filter, .. } => {
+                    super::visible_response_lines(body, response_filter).join("\n")
+                }
                 Mode::TestResponse { results } => format_test_results_text(results),
                 _ => return false,
             };
-            if let Err(e) = copy_to_clipboard(&text) {
-                app.show_message(ResponseKind::Error, format!("Copy failed: {e}"));
+            match copy_to_clipboard(&text) {
+                Ok(()) => {
+                    if let Mode::Response { status, response_filter, .. } = &mut app.mode {
+                        *status = Some(if response_filter.is_empty() {
+                            "copied response".to_string()
+                        } else {
+                            "copied filtered lines".to_string()
+                        });
+                    }
+                }
+                Err(e) => app.show_message(ResponseKind::Error, format!("Copy failed: {e}")),
             }
         }
         KeyCode::Char('f') => {
@@ -493,4 +743,27 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
         _ => {}
     }
     false
+}
+
+/// Moves the response cursor by `delta`, scrolling only far enough to keep it
+/// on screen. The pane scrolls to follow the cursor rather than the other way
+/// round, so a selection cannot be extended past the edge of the view.
+fn move_cursor(app: &mut App, delta: isize, view_height: u16) {
+    let Mode::Response { body, response_filter, cursor, scroll, .. } = &mut app.mode else {
+        return;
+    };
+    let count = super::visible_response_lines(body, response_filter).len();
+    if count == 0 {
+        return;
+    }
+    let last = count - 1;
+    *cursor = cursor.saturating_add_signed(delta).min(last);
+
+    let view = view_height.max(1) as usize;
+    let top = *scroll as usize;
+    if *cursor < top {
+        *scroll = *cursor as u16;
+    } else if *cursor >= top + view {
+        *scroll = (*cursor + 1 - view).min(u16::MAX as usize) as u16;
+    }
 }
