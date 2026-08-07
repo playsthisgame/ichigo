@@ -32,7 +32,11 @@ The project is a single-binary Rust CLI. Four top-level source files plus the `s
 
 **`src/utils.rs`** — `send_request()` builds a blocking `reqwest` client and fires the HTTP request. `interpolate()` does `{{VAR}}` substitution: it checks the provided `vars` map first, then falls back to environment variables, leaving unresolved placeholders as-is (`{{VAR}}`).
 
-**`src/curl.rs`** — `to_curl()` renders a `RequestConfig` + resolved vars as a paste-ready cURL command. Pure string work, no IO, unit tested. It takes the same two inputs as `send_request` and **must stay in step with it** — a command that disagrees with what ichigo sends is worse than none. Substitution is shared via `utils::interpolate`; the duplicated rules (and the real drift risk) are query folding into the URL and the body's `Content-Type` header. Values are single-quoted unconditionally, with `'` escaped as `'\''`.
+**`src/curl.rs`** — Converts between a `RequestConfig` and a cURL command in both directions. Pure string work, no IO, unit tested.
+
+`to_curl()` renders a config + resolved vars as a paste-ready command. It takes the same two inputs as `send_request` and **must stay in step with it** — a command that disagrees with what ichigo sends is worse than none. Substitution is shared via `utils::interpolate`; the duplicated rules (and the real drift risk) are query folding into the URL and the body's `Content-Type` header. Values are single-quoted unconditionally, with `'` escaped as `'\''`.
+
+`from_curl()` is its inverse: it tokenizes with shell quoting rules (`'…'`, `"…"`, `$'…'`, `\`-continuations) and maps flags onto config fields. Two rules make the pair agree, and both are normalizations rather than transcription: a `Content-Type` header on a command with a body is stored as `body.content_type` and *never* in `headers` (`to_curl` re-derives it, so a config holding both emits the header twice), and a query string is lifted off the URL into `query` unless a key repeats or the URL carries `{{VAR}}`. The flag table is **deny-by-default** — an unrecognized flag is an error naming it, because a parser that skips what it does not understand turns `curl -F file=@x URL` into a bodyless GET and the user finds out against a real server. The round-trip tests at the bottom of the file are what keep the two directions honest; that is why both live in one module.
 
 **`src/runner.rs`** — Executes a single `RequestConfig` (or one step of a chain). Handles profile variable injection, prints the response (status + body), and extracts values from the JSON response using dot-notation paths (e.g. `$.token` → `token`). Returns extracted variables so the caller can pass them to the next chain step.
 
@@ -51,9 +55,14 @@ The project is a single-binary Rust CLI. Four top-level source files plus the `s
 - `TestInput` → fill vars + iteration count before a load test
 - `Response` / `TestResponse` → show results, supports `f` to filter response lines
 - `NewRequest` / `NewProfile` → create/edit requests and their profiles in-TUI
+- `ImportCurl` → paste buffer for importing a cURL command
 - `ConfirmDelete` → confirm before deleting
 
 Variable placeholder names are extracted by `extract_var_names` (scans url, headers, query, body for `{{...}}`) to build the `VarInput` field list. The TUI clipboard copy (`c` key) uses `pbcopy` and is macOS-only.
+
+**`RequestDraft`.** `NewRequest` and `NewProfile` both hold a `RequestDraft` — the four editable fields plus the headers, query, body, and extract the form does *not* edit. Those are carried in the draft rather than re-read from disk at save time, because an imported or cloned request has no file to re-read; recovering them from disk silently dropped them (which is why `c` used to clone only a request's method and URL). Build a draft through `RequestDraft::blank()` or `from_config()`; `edit_selected` / `clone_selected` / `confirm_import_curl` are the three entry points.
+
+**Pasting.** The event loop enables bracketed paste (`EnableBracketedPaste` on entry, `DisableBracketedPaste` on exit — skip the latter and the terminal keeps emitting paste markers) and handles `Event::Paste`, which only `ImportCurl` accepts. Enter in that pane inserts a newline and `Ctrl+s` confirms, precisely because a terminal *without* bracketed paste delivers a multi-line paste as characters with Enters between the lines; binding Enter to confirm would parse only the first line.
 
 **Pending actions.** `ProfileSelect` and `VarInput` are shared by every action that needs a profile or variables, so each carries a `PendingAction` (`Run` / `Test` / `Curl`) naming its destination. Both `confirm_profile_select` and `handle_key_var_input`'s Enter dispatch on it. A new action must set it at *every* construction site of both modes — miss the `VarInput` one and the action silently falls through to running the request, because that is where the pipeline used to be hardcoded. `Mode::Response` likewise carries a `ResponseKind` (`Http(u16)` / `Error` / `Curl`) instead of encoding "not a response" as status `0`; build it through `App::show_message` / `show_error` rather than spelling out the variant.
 

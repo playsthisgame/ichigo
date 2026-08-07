@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Read};
 
 mod config;
 mod curl;
@@ -43,6 +44,10 @@ enum Commands {
         /// Save to ~/.config/ichigo/ instead of .ichigo/
         #[arg(short, long)]
         global: bool,
+        /// Build the request from a cURL command read from stdin
+        /// (e.g. `pbpaste | ichigo new api/login --from-curl`)
+        #[arg(long, conflicts_with_all = ["url", "method"])]
+        from_curl: bool,
     },
     /// Execute a configured request
     Run {
@@ -112,7 +117,9 @@ enum Shell {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Some(Commands::New { name, method, url, global }) => cmd_new(name, method, url, global),
+        Some(Commands::New { name, method, url, global, from_curl }) => {
+            cmd_new(name, method, url, global, from_curl)
+        }
         Some(Commands::Run { name, vars , verbose, profile }) => cmd_run(name, vars, verbose, profile),
         Some(Commands::List) => cmd_list(),
         Some(Commands::Show { name }) => cmd_show(name),
@@ -124,7 +131,13 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_new(name: String, method: String, url: Option<String>, global: bool) -> Result<()> {
+fn cmd_new(
+    name: String,
+    method: String,
+    url: Option<String>,
+    global: bool,
+    from_curl: bool,
+) -> Result<()> {
     let path = if global {
         global_config_path(&name)
     } else {
@@ -135,15 +148,29 @@ fn cmd_new(name: String, method: String, url: Option<String>, global: bool) -> R
         anyhow::bail!("Request '{}' already exists at {}", name, path.display());
     }
 
+    // Build the contents before touching the filesystem, so a command that
+    // fails to parse leaves nothing behind — not even the directory.
+    let contents = if from_curl {
+        let mut input = String::new();
+        io::stdin()
+            .read_to_string(&mut input)
+            .context("Failed to read the cURL command from stdin")?;
+        let mut config = curl::from_curl(&input)?;
+        config.name = name.clone();
+        serde_yaml::to_string(&config)
+            .with_context(|| format!("Failed to serialize request '{}'", name))?
+    } else {
+        let url = url.unwrap_or_else(|| "https://example.com".to_string());
+        build_template(&name, &method.to_uppercase(), &url)
+    };
+
     let dir = path.parent().unwrap();
     if !dir.exists() {
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create directory {}", dir.display()))?;
     }
 
-    let url = url.unwrap_or_else(|| "https://example.com".to_string());
-    let method = method.to_uppercase();
-    fs::write(&path, build_template(&name, &method, &url))?;
+    fs::write(&path, contents)?;
 
     println!("{} {}", "Created".green().bold(), path.display());
     Ok(())
@@ -367,6 +394,13 @@ _ichigo() {
                 run|show|delete|test|copy)
                     _arguments '1: :_ichigo_configs'
                     ;;
+                new)
+                    _arguments \
+                        '--from-curl[Build the request from a cURL command on stdin]' \
+                        '(-m --method)'{-m,--method}'[HTTP method]:method:(GET POST PUT PATCH DELETE HEAD OPTIONS)' \
+                        '(-u --url)'{-u,--url}'[Target URL]:url:' \
+                        '(-g --global)'{-g,--global}'[Save to ~/.config/ichigo/]'
+                    ;;
                 completions)
                     _arguments '1: :(zsh bash fish)'
                     ;;
@@ -393,6 +427,9 @@ const BASH_COMPLETION: &str = r#"_ichigo_completions() {
                 done < <(find "$base" -name "*.yaml" 2>/dev/null)
             done
             COMPREPLY=($(compgen -W "${configs[*]}" -- "$cur"))
+            ;;
+        new)
+            COMPREPLY=($(compgen -W "--from-curl --method --url --global" -- "$cur"))
             ;;
         completions)
             COMPREPLY=($(compgen -W "zsh bash fish" -- "$cur"))
@@ -425,4 +462,12 @@ complete -c ichigo -n "__fish_seen_subcommand_from $config_cmds" \
     -a "(__ichigo_configs)"
 complete -c ichigo -n "__fish_seen_subcommand_from completions" \
     -a "zsh bash fish"
+complete -c ichigo -n "__fish_seen_subcommand_from new" \
+    -l from-curl -d "Build the request from a cURL command on stdin"
+complete -c ichigo -n "__fish_seen_subcommand_from new" \
+    -s m -l method -d "HTTP method" -x -a "GET POST PUT PATCH DELETE HEAD OPTIONS"
+complete -c ichigo -n "__fish_seen_subcommand_from new" \
+    -s u -l url -d "Target URL" -x
+complete -c ichigo -n "__fish_seen_subcommand_from new" \
+    -s g -l global -d "Save to ~/.config/ichigo/"
 "#;

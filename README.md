@@ -58,6 +58,60 @@ Flags:
 - `-m, --method` — HTTP method (default: `GET`)
 - `-u, --url` — target URL
 - `-g, --global` — save to `~/.config/ichigo/` instead of `.ichigo/`
+- `--from-curl` — build the request from a cURL command read from stdin
+
+#### Creating a request from a cURL command
+
+Anything that hands you a cURL command — a browser's "Copy as cURL", an API doc,
+a teammate's bug report — can become a config directly:
+
+```sh
+pbpaste | ichigo new api/login --from-curl
+```
+
+```sh
+ichigo new api/login --from-curl <<'EOF'
+curl -X POST 'https://api.example.com/login' \
+  -H 'Content-Type: application/json' \
+  --data-raw '{"user":"ada"}'
+EOF
+```
+
+The command is read from stdin rather than taken as an argument, so you never
+have to re-escape its quotes. `--from-curl` cannot be combined with `--method`
+or `--url`, since the command already supplies both.
+
+What the parser does with each flag:
+
+| | |
+| --- | --- |
+| **Mapped** | `--url`, `-X/--request`, `-H/--header`, `-d/--data/--data-raw/--data-ascii/--data-binary`, `--data-urlencode`, `--json`, `-G/--get`, `-I/--head`, `-u/--user`, `-b/--cookie`, `-A/--user-agent`, `-e/--referer` |
+| **Ignored** | `-s`, `-S`, `-v`, `-i`, `-k`, `-L`, `-f`, `-o`, `-w`, `--compressed`, `--max-time`, `--connect-timeout`, `--retry`, `--limit-rate` — these describe how curl behaves, not what it sends |
+| **Refused** | `-F/--form` (multipart), `@file` data references, and any flag not listed above |
+
+An unrecognized flag is an error naming the flag, not a silent skip: a config
+that quietly drops half of what you pasted is worse than one that refuses to be
+created. If ichigo refuses a flag you need, the command is unchanged in your
+clipboard.
+
+Some details worth knowing:
+
+- The method follows curl's own rules — an explicit `-X` wins, `-I` means HEAD,
+  a body means POST, everything else is GET.
+- A query string on the URL is split into the `query` map. If a key repeats
+  (`?tag=a&tag=b`), the query stays on the URL instead, since the map holds one
+  value per key.
+- A `Content-Type` header becomes the body's `content_type`. A body with no
+  content type gets curl's default, `application/x-www-form-urlencoded`.
+- `--compressed` is dropped rather than stored as an `Accept-Encoding` header —
+  ichigo's HTTP client negotiates encoding itself, so storing the header would
+  make the config claim something it does not do.
+- `-u user:pass` becomes the `Authorization: Basic …` header curl would send.
+
+> **An imported config holds the literal values from the command**, including
+> whatever token or cookie was in it. Before committing `.ichigo/` to a repo,
+> replace those with `{{VAR}}` placeholders and put the real values in a
+> [profile](#profiles) or an environment variable.
 
 ### `run`
 
@@ -131,6 +185,8 @@ Keybindings:
 | `r` / Enter | Run selected request |
 | `t` | Load-test selected request |
 | `y` | Copy selected request as a cURL command |
+| `i` | Import a pasted cURL command as a new request |
+| `n` / `e` / `c` | New / edit / clone a request |
 | `R` | Refresh the config list from disk |
 | `q` | Quit |
 | Esc | Go back |
@@ -142,6 +198,16 @@ Pressing `y` turns the selected request into a cURL command and copies it to the
 > **The generated command contains your real credentials.** That is what makes it useful, and also what makes it unsafe to paste into a public issue, a pull request, or a shared log. Redact before sharing.
 
 Copying uses whichever clipboard tool is available, tried in order: `pbcopy` (macOS), `wl-copy` (Wayland), `xclip`, then `xsel` (X11). If none is installed, the TUI says so rather than failing silently.
+
+Pressing `i` does the reverse: it opens a pane you paste a cURL command into.
+Press `Ctrl+s` to import it, and the new-request form opens with the method,
+URL, headers, query, and body already filled in — you supply the name, and
+nothing is written until you save. Enter inserts a newline rather than
+importing, so a multi-line paste works even in terminals that do not support
+bracketed paste. If the command uses something ichigo cannot store, the pane
+reports which flag and keeps your text so you can edit it. The
+[`--from-curl` section](#creating-a-request-from-a-curl-command) covers exactly
+which flags are mapped, ignored, and refused.
 
 If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
 

@@ -6,7 +6,9 @@ use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, bui
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyEvent},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -68,30 +70,86 @@ enum Mode {
         results: crate::tester::TestResults,
     },
     NewRequest {
-        fields: Vec<(String, String)>, // (label, value): name, method, url, description
-        focused: usize,
-        profiles: Vec<crate::config::Profile>,
-        original_name: Option<String>, // Some(name) when editing an existing request
-        global: bool,
+        draft: RequestDraft,
+        error: Option<String>,
+    },
+    // Paste buffer for importing a cURL command. Confirming parses it and hands
+    // the result to `NewRequest`; nothing reaches disk until that form is saved.
+    ImportCurl {
+        buffer: String,
         error: Option<String>,
     },
     ConfirmDelete {
         entry_name: String,
         global: bool,
     },
-    // Sub-mode for adding a profile while creating/editing a request.
+    // Sub-mode for adding a profile while creating/editing a request. Carries
+    // the whole draft so nothing typed into the form is lost on the way back.
     // focused: 0 = profile name, 1+2i = params[i].key, 2+2i = params[i].value
     NewProfile {
-        request_fields: Vec<(String, String)>,
-        request_focused: usize,
-        request_profiles: Vec<crate::config::Profile>,
-        request_original_name: Option<String>,
-        request_global: bool,
+        draft: RequestDraft,
         name: String,
         params: Vec<(String, String)>,
         focused: usize,
         error: Option<String>,
     },
+}
+
+/// The request being created or edited in `NewRequest`.
+///
+/// The form edits four fields; a config has more. The rest live here rather
+/// than being re-read from disk at save time, because an imported or cloned
+/// request has no file to re-read — its headers and body exist only in this
+/// draft, and recovering them from disk would silently drop them.
+#[derive(Clone, Default)]
+pub(crate) struct RequestDraft {
+    // (label, value): name, method, url, description
+    pub(crate) fields: Vec<(String, String)>,
+    pub(crate) focused: usize,
+    pub(crate) profiles: Vec<crate::config::Profile>,
+    // Some(name) when editing an existing request; None when creating one.
+    pub(crate) original_name: Option<String>,
+    pub(crate) global: bool,
+    // Carried through the form untouched.
+    headers: HashMap<String, String>,
+    query: HashMap<String, String>,
+    body: Option<crate::config::Body>,
+    extract: Option<HashMap<String, String>>,
+}
+
+impl RequestDraft {
+    fn blank() -> Self {
+        Self {
+            fields: vec![
+                ("name".to_string(), String::new()),
+                ("method".to_string(), "GET".to_string()),
+                ("url".to_string(), String::new()),
+                ("description".to_string(), String::new()),
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// Builds a draft from a config — an existing request being edited or
+    /// cloned, or one parsed out of a pasted cURL command.
+    fn from_config(config: RequestConfig, original_name: Option<String>, global: bool) -> Self {
+        Self {
+            fields: vec![
+                ("name".to_string(), original_name.clone().unwrap_or_default()),
+                ("method".to_string(), config.method),
+                ("url".to_string(), config.url),
+                ("description".to_string(), config.description.unwrap_or_default()),
+            ],
+            focused: 0,
+            profiles: config.profiles.unwrap_or_default(),
+            original_name,
+            global,
+            headers: config.headers,
+            query: config.query,
+            body: config.body,
+            extract: config.extract,
+        }
+    }
 }
 
 // ─── App state ────────────────────────────────────────────────────────────────
@@ -673,17 +731,71 @@ impl App {
     }
 
 
+    /// Parses the pasted command and hands the result to the new-request form.
+    ///
+    /// On failure the buffer is kept: re-pasting a long command because a flag
+    /// was unsupported would be the worst part of the feature.
+    fn confirm_import_curl(&mut self) {
+        let Mode::ImportCurl { buffer, .. } = &self.mode else { return };
+        match crate::curl::from_curl(buffer) {
+            Ok(config) => {
+                let draft = RequestDraft::from_config(config, None, false);
+                self.mode = Mode::NewRequest { draft, error: None };
+            }
+            Err(e) => {
+                if let Mode::ImportCurl { error, .. } = &mut self.mode {
+                    *error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
+    /// Opens the selected request in the form for editing.
+    ///
+    /// Reads the config from disk rather than from the cached entry: the draft
+    /// carries headers, query, body, and extract through to the save, and
+    /// `Entry` does not hold all of them. Chains have no form and are ignored.
+    fn edit_selected(&mut self) {
+        let Some((name, global)) = self.selected_request() else { return };
+        match RequestConfig::load(&name) {
+            Ok(config) => {
+                let draft = RequestDraft::from_config(config, Some(name), global);
+                self.mode = Mode::NewRequest { draft, error: None };
+            }
+            Err(e) => self.show_error(e),
+        }
+    }
+
+    /// Opens a copy of the selected request in the form, unnamed. Everything
+    /// but the name is carried over, so a clone is a whole request rather than
+    /// just its method and URL.
+    fn clone_selected(&mut self) {
+        let Some((name, _)) = self.selected_request() else { return };
+        match RequestConfig::load(&name) {
+            Ok(config) => {
+                let draft = RequestDraft::from_config(config, None, false);
+                self.mode = Mode::NewRequest { draft, error: None };
+            }
+            Err(e) => self.show_error(e),
+        }
+    }
+
+    /// The selected entry's name and location, when it is a request rather than
+    /// a chain or a folder row.
+    fn selected_request(&self) -> Option<(String, bool)> {
+        let idx = self.selected_entry_index()?;
+        let entry = &self.entries[idx];
+        match entry.kind {
+            EntryKind::Request { .. } => Some((entry.name.clone(), entry.global)),
+            EntryKind::Chain { .. } => None,
+        }
+    }
+
     fn save_new_profile(&mut self) {
-        let (profile_name, params, req_fields, req_focused, mut req_profiles, req_original_name, req_global) = match &self.mode {
-            Mode::NewProfile { name, params, request_fields, request_focused, request_profiles, request_original_name, request_global, .. } => (
-                name.trim().to_string(),
-                params.clone(),
-                request_fields.clone(),
-                *request_focused,
-                request_profiles.clone(),
-                request_original_name.clone(),
-                *request_global,
-            ),
+        let (profile_name, params, mut draft) = match &self.mode {
+            Mode::NewProfile { name, params, draft, .. } => {
+                (name.trim().to_string(), params.clone(), draft.clone())
+            }
             _ => return,
         };
 
@@ -700,31 +812,21 @@ impl App {
             .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
             .collect();
 
-        req_profiles.push(crate::config::Profile { name: profile_name, params: filtered_params });
+        draft.profiles.push(crate::config::Profile { name: profile_name, params: filtered_params });
 
-        self.mode = Mode::NewRequest {
-            fields: req_fields,
-            focused: req_focused,
-            profiles: req_profiles,
-            original_name: req_original_name,
-            global: req_global,
-            error: None,
-        };
+        self.mode = Mode::NewRequest { draft, error: None };
     }
 
     fn save_new_request(&mut self) {
-        let (name, method, url, description, profiles, original_name, global) = match &self.mode {
-            Mode::NewRequest { fields, profiles, original_name, global, .. } => (
-                fields[0].1.trim().to_string(),
-                fields[1].1.trim().to_uppercase(),
-                fields[2].1.trim().to_string(),
-                fields[3].1.trim().to_string(),
-                profiles.clone(),
-                original_name.clone(),
-                *global,
-            ),
+        let draft = match &self.mode {
+            Mode::NewRequest { draft, .. } => draft.clone(),
             _ => return,
         };
+        let name = draft.fields[0].1.trim().to_string();
+        let method = draft.fields[1].1.trim().to_uppercase();
+        let url = draft.fields[2].1.trim().to_string();
+        let description = draft.fields[3].1.trim().to_string();
+        let RequestDraft { profiles, original_name, global, headers, query, body, extract, .. } = draft;
 
         let set_error = |mode: &mut Mode, msg: &str| {
             if let Mode::NewRequest { error, .. } = mode {
@@ -763,13 +865,6 @@ impl App {
             set_error(&mut self.mode, &format!("'{}' already exists", name));
             return;
         }
-
-        // When editing, preserve headers/query/body/extract from the original file.
-        let (headers, query, body, extract) = original_name
-            .as_deref()
-            .and_then(|orig| RequestConfig::load(orig).ok())
-            .map(|c| (c.headers, c.query, c.body, c.extract))
-            .unwrap_or_default();
 
         let config = RequestConfig {
             name: name.clone(),
@@ -817,6 +912,65 @@ impl App {
         self.mode = Mode::Browse;
     }
 
+    /// Delivers a bracketed paste to whichever field has focus.
+    ///
+    /// Enabling bracketed paste means pasted text arrives here instead of as a
+    /// run of `Char` events, so every text field has to be served — miss one and
+    /// pasting into it becomes a silent no-op.
+    fn handle_paste(&mut self, text: &str) {
+        // Only the import buffer is multi-line; everywhere else a pasted newline
+        // would be invisible at best.
+        let single_line = || text.replace(['\r', '\n'], " ");
+
+        if self.filter_active && matches!(self.mode, Mode::Browse) {
+            self.filter.push_str(&single_line());
+            let count = self.visible_count();
+            self.list_state.select(if count == 0 { None } else { Some(0) });
+            return;
+        }
+
+        match &mut self.mode {
+            Mode::ImportCurl { buffer, error } => {
+                buffer.push_str(text);
+                *error = None;
+            }
+            Mode::NewRequest { draft, error } => {
+                let focused = draft.focused;
+                draft.fields[focused].1.push_str(&single_line());
+                *error = None;
+            }
+            Mode::NewProfile { name, params, focused, error, .. } => {
+                *error = None;
+                if *focused == 0 {
+                    name.push_str(&single_line());
+                } else {
+                    let idx = (*focused - 1) / 2;
+                    let is_value = (*focused - 1) % 2 == 1;
+                    if let Some((k, v)) = params.get_mut(idx) {
+                        if is_value { v.push_str(&single_line()) } else { k.push_str(&single_line()) }
+                    }
+                }
+            }
+            Mode::VarInput { vars, focused, .. } => {
+                if let Some((_, value)) = vars.get_mut(*focused) {
+                    value.push_str(&single_line());
+                }
+            }
+            Mode::TestInput { vars, focused, iterations, .. } => {
+                if *focused < vars.len() {
+                    vars[*focused].1.push_str(&single_line());
+                } else {
+                    // The iterations field only ever accepts digits.
+                    iterations.extend(text.chars().filter(char::is_ascii_digit));
+                }
+            }
+            Mode::Response { response_filter, response_filter_active: true, .. } => {
+                response_filter.push_str(&single_line());
+            }
+            _ => {}
+        }
+    }
+
     // Returns true when the event loop should exit.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if self.filter_active && matches!(self.mode, Mode::Browse) {
@@ -836,6 +990,9 @@ impl App {
         }
         if matches!(self.mode, Mode::NewRequest { .. }) {
             return handlers::handle_key_new_request(self, key);
+        }
+        if matches!(self.mode, Mode::ImportCurl { .. }) {
+            return handlers::handle_key_import_curl(self, key);
         }
         if matches!(self.mode, Mode::NewProfile { .. }) {
             return handlers::handle_key_new_profile(self, key);
@@ -857,14 +1014,17 @@ pub fn run() -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Bracketed paste makes a multi-line paste arrive as one event instead of a
+    // stream of keystrokes with Enters in it. It must be turned back off on
+    // every exit path, or the terminal keeps emitting paste markers.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
     result
@@ -876,10 +1036,14 @@ fn event_loop(
 ) -> Result<()> {
     loop {
         terminal.draw(|frame| render::draw(frame, app))?;
-        if let Event::Key(key) = event::read()?
-            && app.handle_key(key)
-        {
-            break;
+        match event::read()? {
+            Event::Key(key) => {
+                if app.handle_key(key) {
+                    break;
+                }
+            }
+            Event::Paste(text) => app.handle_paste(&text),
+            _ => {}
         }
     }
     Ok(())
@@ -997,5 +1161,71 @@ mod tests {
         let names = chain_var_names(&[s1, s2]);
         // Only the truly user-supplied variable remains, listed once.
         assert_eq!(names, vec!["USER_ID".to_string()]);
+    }
+
+    fn full_config() -> RequestConfig {
+        let mut c = step("https://api/x");
+        c.method = "POST".to_string();
+        c.description = Some("desc".to_string());
+        c.headers.insert("Accept".to_string(), "application/json".to_string());
+        c.query.insert("page".to_string(), "2".to_string());
+        c.body = Some(Body {
+            content_type: "application/json".to_string(),
+            data: r#"{"a":1}"#.to_string(),
+        });
+        c.extract = Some(HashMap::from([("TOKEN".to_string(), "$.token".to_string())]));
+        c.profiles = Some(vec![crate::config::Profile {
+            name: "dev".to_string(),
+            params: HashMap::new(),
+        }]);
+        c
+    }
+
+    /// The form edits four fields; everything else has to survive the trip
+    /// through it. Saving used to recover these from the original file, which
+    /// silently dropped them for a request that has no file yet.
+    #[test]
+    fn draft_carries_the_fields_the_form_does_not_edit() {
+        let draft = RequestDraft::from_config(full_config(), Some("api/x".to_string()), false);
+
+        assert_eq!(draft.fields[0].1, "api/x");
+        assert_eq!(draft.fields[1].1, "POST");
+        assert_eq!(draft.fields[2].1, "https://api/x");
+        assert_eq!(draft.fields[3].1, "desc");
+        assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
+        assert_eq!(draft.query.get("page").unwrap(), "2");
+        assert_eq!(draft.body.expect("body").data, r#"{"a":1}"#);
+        assert_eq!(draft.extract.expect("extract").get("TOKEN").unwrap(), "$.token");
+        assert_eq!(draft.profiles.len(), 1);
+    }
+
+    /// A clone is a whole request, not just its method and URL — and it has no
+    /// file on disk to recover the rest from.
+    #[test]
+    fn a_clone_draft_keeps_everything_but_the_name() {
+        let draft = RequestDraft::from_config(full_config(), None, false);
+
+        assert_eq!(draft.fields[0].1, "", "a clone starts unnamed");
+        assert!(draft.original_name.is_none());
+        assert_eq!(draft.headers.len(), 1);
+        assert!(draft.body.is_some());
+        assert!(draft.extract.is_some());
+    }
+
+    /// A draft built from a parsed cURL command reaches the form intact.
+    #[test]
+    fn an_imported_draft_carries_the_parsed_request() {
+        let config = crate::curl::from_curl(
+            r#"curl -X POST 'https://api/x?page=2' -H 'Accept: application/json' --data-raw '{"a":1}'"#,
+        )
+        .expect("parses");
+        let draft = RequestDraft::from_config(config, None, false);
+
+        assert_eq!(draft.fields[0].1, "", "the user names an imported request");
+        assert_eq!(draft.fields[1].1, "POST");
+        assert_eq!(draft.fields[2].1, "https://api/x");
+        assert_eq!(draft.query.get("page").unwrap(), "2");
+        assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
+        assert_eq!(draft.body.expect("body").data, r#"{"a":1}"#);
     }
 }
