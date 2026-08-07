@@ -3,17 +3,18 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     symbols,
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use super::{App, Mode, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
+    let full = frame.area();
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
-        .split(frame.area());
+        .split(full);
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
@@ -70,6 +71,11 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     draw_help(frame, outer[1], &app.mode);
+
+    // Last, so it lands on top of both panes and the hint line.
+    if app.show_help {
+        draw_help_overlay(frame, full);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,35 +688,22 @@ fn draw_response(frame: &mut Frame, area: Rect, kind: &ResponseKind, body: &str,
 
 fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
     let spans: Vec<Span<'static>> = match mode {
+        // Deliberately short. The full keymap lives behind `?`; listing all
+        // fifteen bindings here ran to 155 columns, which an 80-column terminal
+        // truncates without a mark, hiding the last five outright.
         Mode::Browse => vec![
-            Span::styled(" q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("quit", Style::default().fg(Color::DarkGray)),
-            Span::styled("   j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("navigate", Style::default().fg(Color::DarkGray)),
-            Span::styled("   gg ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("top", Style::default().fg(Color::DarkGray)),
-            Span::styled("   G ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("bottom", Style::default().fg(Color::DarkGray)),
-            Span::styled("   r/Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" r ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("run", Style::default().fg(Color::DarkGray)),
             Span::styled("   t ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("test", Style::default().fg(Color::DarkGray)),
             Span::styled("   n ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("new", Style::default().fg(Color::DarkGray)),
-            Span::styled("   e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("edit", Style::default().fg(Color::DarkGray)),
-            Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy", Style::default().fg(Color::DarkGray)),
-            Span::styled("   d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("delete", Style::default().fg(Color::DarkGray)),
             Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("filter", Style::default().fg(Color::DarkGray)),
-            Span::styled("   R ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("refresh", Style::default().fg(Color::DarkGray)),
-            Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy cURL", Style::default().fg(Color::DarkGray)),
-            Span::styled("   i ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("import cURL", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("help", Style::default().fg(Color::DarkGray)),
+            Span::styled("   q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("quit", Style::default().fg(Color::DarkGray)),
         ],
         Mode::ImportCurl { .. } => vec![
             Span::styled(" Ctrl+s ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -790,6 +783,118 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         ],
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The three columns of the `?` overlay, grouped by what you are trying to do
+/// rather than listed flat — a flat list styles `gg` and `i` identically, when
+/// one is muscle memory and the other is a whole feature.
+const HELP_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
+    (
+        "Navigate",
+        &[
+            ("j/k", "up/down"),
+            ("gg/G", "top/bottom"),
+            ("Space", "fold"),
+            ("f", "filter"),
+        ],
+    ),
+    (
+        "Run",
+        &[
+            ("r/Enter", "run"),
+            ("t", "load test"),
+            ("y", "copy cURL"),
+            ("i", "import cURL"),
+        ],
+    ),
+    (
+        "Manage",
+        &[
+            ("n", "new"),
+            ("e", "edit"),
+            ("c", "clone"),
+            ("d", "delete"),
+            ("R", "refresh"),
+        ],
+    ),
+];
+
+const HELP_KEY_WIDTH: usize = 8;
+// Wide enough that the longest label ("import cURL") still clears the next column.
+const HELP_LABEL_WIDTH: usize = 13;
+const HELP_WIDTH: u16 = (2 + 3 * (HELP_KEY_WIDTH + HELP_LABEL_WIDTH)) as u16;
+
+fn draw_help_overlay(frame: &mut Frame, area: Rect) {
+    let rows = HELP_COLUMNS.iter().map(|(_, keys)| keys.len()).max().unwrap_or(0);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows + 4);
+
+    let mut header = vec![Span::raw("  ")];
+    for (title, _) in HELP_COLUMNS {
+        header.push(Span::styled(
+            format!("{:<width$}", title, width = HELP_KEY_WIDTH + HELP_LABEL_WIDTH),
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::from(header));
+    lines.push(Line::raw(""));
+
+    for row in 0..rows {
+        let mut spans = vec![Span::raw("  ")];
+        for (_, keys) in HELP_COLUMNS {
+            match keys.get(row) {
+                Some((key, label)) => {
+                    spans.push(Span::styled(
+                        format!("{:<width$}", key, width = HELP_KEY_WIDTH),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+                    spans.push(Span::styled(
+                        format!("{:<width$}", label, width = HELP_LABEL_WIDTH),
+                        Style::default().fg(Color::White),
+                    ));
+                }
+                // Columns are ragged; pad so the next one still lines up.
+                None => spans.push(Span::raw(" ".repeat(HELP_KEY_WIDTH + HELP_LABEL_WIDTH))),
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("  quit          ", Style::default().fg(Color::DarkGray)),
+        Span::styled("any key", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("  close this", Style::default().fg(Color::DarkGray)),
+    ]));
+
+    let height = lines.len() as u16 + 2; // + borders
+    let popup = centered_rect(HELP_WIDTH, height, area);
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Keys ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+
+    // Clear first: the pane underneath has already been drawn into these cells.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(widget, popup);
+}
+
+/// Centers a `width` × `height` box in `area`, shrinking to fit rather than
+/// overflowing when the terminal is smaller than the box.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
 }
 
 fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {

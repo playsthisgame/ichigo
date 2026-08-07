@@ -1,4 +1,4 @@
-# ichigo
+# 🍓 ichigo 🍓
 
 A CLI HTTP client. Store named request configs in your project or globally, then run them by name.
 
@@ -180,16 +180,24 @@ Keybindings:
 
 | Key | Action |
 | --- | ------ |
+| `?` | Show the full keymap |
 | `j` / `k` | Navigate list |
 | `gg` / `G` | Jump to top / bottom |
+| Space | Expand / collapse a folder |
+| `f` | Filter the list |
 | `r` / Enter | Run selected request |
 | `t` | Load-test selected request |
 | `y` | Copy selected request as a cURL command |
 | `i` | Import a pasted cURL command as a new request |
 | `n` / `e` / `c` | New / edit / clone a request |
+| `d` | Delete selected request |
 | `R` | Refresh the config list from disk |
 | `q` | Quit |
 | Esc | Go back |
+
+The hint line at the bottom of the screen carries only the handful of keys you
+reach for most; press `?` for the full keymap, grouped by what it does. Any key
+dismisses it.
 
 The TUI is meant to be left open. Every run and load test re-reads the config file from disk first, so edits you make in another terminal — rotating a token in a profile, adding a header, changing a URL — take effect on the next run with no restart. Press `R` when you have created, renamed, or deleted config *files* on disk and want them to show up in the list.
 
