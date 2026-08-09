@@ -427,22 +427,62 @@ confused for one another. The file is optional, as is every key in it, and it is
 global only: there is no project-local override, since these are preferences
 about how *you* type rather than about a project.
 
+### All options
+
+Every option ichigo currently understands. There is exactly one so far; the
+table is the reference as the list grows.
+
+| Option | Type | Default | What it does |
+| ------ | ---- | ------- | ------------ |
+| `keys.insert_escape` | string, exactly two characters | unset — `Esc` only | A two-key sequence that leaves insert mode in a TUI text field, the equivalent of vim's `inoremap jk <Esc>`. See [Editing text fields](#editing-text-fields). |
+
+A complete file, with every option set:
+
 ```toml
 [keys]
-# Two-key sequence that leaves insert mode in a TUI text field, the
-# equivalent of vim's `inoremap jk <Esc>`. Omit to leave Esc as the
-# only way out.
 insert_escape = "jk"
 ```
 
-The sequence must be exactly two characters. The first one is typed into the
-field as normal and un-typed when the second completes the sequence within a
-second — so `j`, a pause to think, then `k` leaves you with a literal `jk`, the
-same as vim's `timeoutlen`. Typing `jk` quickly *does* escape, which is why the
-usual advice is to pick a digraph you never type.
+Any option you leave out keeps its default, and an empty file — or no file at
+all — means every default. A section header whose options you have all omitted
+can be left out too.
 
-ichigo opens on an error message if the file cannot be read, rather than
-silently falling back to defaults; press Esc to carry on with them.
+### `keys.insert_escape`
+
+The sequence must be exactly two characters; ichigo refuses anything else rather
+than guessing. The first character is typed into the field as normal and
+un-typed when the second completes the sequence within a second — so `j`, a
+pause to think, then `k` leaves you with a literal `jk`, the same as vim's
+`timeoutlen`. Typing `jk` quickly *does* escape, which is why the usual advice
+is to pick a digraph you never type.
+
+### When the file is wrong
+
+Unknown keys are an error, not a shrug — `insert_esc` will not silently do
+nothing while you wonder why your keymap is dead:
+
+```
+Config: Invalid TOML in ~/.config/ichigo/config.toml: unknown field `insert_esc`,
+expected `insert_escape` for key `keys` at line 1 column 1
+```
+
+The same goes for a value ichigo cannot use, such as a sequence of the wrong
+length. Either way the TUI opens on the message and runs on defaults; press Esc
+to carry on with them. One consequence worth knowing: because unknown keys are
+refused, a file written for a newer ichigo will not load on an older one.
+
+### Preferences that are not in this file
+
+Nerd Font icons in the TUI are detected from your terminal, and overridden with
+an environment variable rather than a config key:
+
+```sh
+ICHIGO_ICONS=1 ichigo tui   # force icons on
+ICHIGO_ICONS=0 ichigo tui   # force them off
+```
+
+Unset, ichigo turns them on for terminals known to ship a Nerd Font (Kitty,
+WezTerm, Ghostty, iTerm2), including through tmux.
 
 ## Shell completions
 
