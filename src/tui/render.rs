@@ -6,8 +6,64 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use super::edit::Edit;
 use super::{App, Mode, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
+
+/// One text field's value with the caret drawn where it sits.
+///
+/// Insert mode gets a thin bar between characters, normal mode a block *over*
+/// the character it is on — the same shapes a terminal cursor takes, which is
+/// the only signal of which mode a field is in. Nothing else says so, and
+/// nothing else needs to.
+fn field_spans(value: &str, edit: Option<&Edit>, color: Color) -> Vec<Span<'static>> {
+    let text = Style::default().fg(color);
+    let Some(edit) = edit else {
+        return vec![Span::styled(value.to_string(), text)];
+    };
+
+    // The caret can outlive the value it was measured against — a draft that
+    // went through another pane, a row deleted at the focused index — so it is
+    // clamped here rather than trusted.
+    let caret = value
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(value.len()))
+        .take_while(|i| *i <= edit.caret)
+        .last()
+        .unwrap_or(0);
+    let (before, after) = value.split_at(caret);
+    let cursor = Style::default().fg(Color::Black).bg(Color::White);
+
+    let mut spans = vec![Span::styled(before.to_string(), text)];
+    match (edit.insert, after.chars().next()) {
+        (true, _) => {
+            spans.push(Span::styled("│", Style::default().fg(Color::White)));
+            spans.push(Span::styled(after.to_string(), text));
+        }
+        // Normal mode past the end of the line happens only on an empty value;
+        // `Edit` pulls the caret back onto a character otherwise.
+        (false, None) => spans.push(Span::styled("█", Style::default().fg(Color::White))),
+        (false, Some(under)) => {
+            spans.push(Span::styled(under.to_string(), cursor));
+            spans.push(Span::styled(after[under.len_utf8()..].to_string(), text));
+        }
+    }
+    spans
+}
+
+/// The caret to draw in a field: `Some` only for the focused one.
+fn caret(is_focused: bool, edit: &Edit) -> Option<&Edit> {
+    is_focused.then_some(edit)
+}
+
+/// A `  > value` input row, dimmed unless it is the one holding the caret.
+fn input_line(value: &str, caret: Option<&Edit>) -> Line<'static> {
+    let color = if caret.is_some() { Color::White } else { Color::DarkGray };
+    let mut spans = vec![Span::styled("  > ", Style::default().fg(Color::DarkGray))];
+    spans.extend(field_spans(value, caret, color));
+    Line::from(spans)
+}
 
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     let full = frame.area();
@@ -41,11 +97,11 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::ProfileSelect { profiles, selected, entry_name, .. } => {
             draw_profile_select(frame, panes[1], profiles, *selected, entry_name);
         }
-        Mode::VarInput { vars, focused, entry_name, .. } => {
-            draw_var_input(frame, panes[1], vars, *focused, entry_name);
+        Mode::VarInput { vars, focused, edit, entry_name, .. } => {
+            draw_var_input(frame, panes[1], vars, *focused, edit, entry_name);
         }
-        Mode::TestInput { vars, focused, iterations, entry_name } => {
-            draw_test_input(frame, panes[1], vars, iterations, *focused, entry_name);
+        Mode::TestInput { vars, focused, iterations, edit, entry_name } => {
+            draw_test_input(frame, panes[1], vars, iterations, *focused, edit, entry_name);
         }
         Mode::Response { kind, body, scroll, response_filter, response_filter_active, cursor, anchor, status } => {
             response_view_height = Some(draw_response(
@@ -57,19 +113,19 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             draw_test_results(frame, panes[1], results);
         }
         Mode::NewRequest { draft, error } => {
-            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.profiles, draft.headers(), draft.original_name.is_some(), draft.global, error.as_deref());
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.original_name.is_some(), draft.global, error.as_deref());
         }
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
         }
-        Mode::EditHeaders { pairs, focused, error, .. } => {
-            draw_edit_headers(frame, panes[1], pairs, *focused, error.as_deref());
+        Mode::EditHeaders { pairs, focused, edit, error, .. } => {
+            draw_edit_headers(frame, panes[1], pairs, *focused, edit, error.as_deref());
         }
         Mode::ProfileList { draft, selected } => {
             draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1);
         }
-        Mode::NewProfile { name, params, focused, error, editing, .. } => {
-            draw_new_profile(frame, panes[1], name, params, *focused, error.as_deref(), editing.is_some());
+        Mode::NewProfile { name, params, focused, edit, error, editing, .. } => {
+            draw_new_profile(frame, panes[1], name, params, *focused, edit, error.as_deref(), editing.is_some());
         }
         Mode::ConfirmDelete { entry_name, ..} => {
             draw_confirm_delete(frame, panes[1], entry_name);
@@ -226,6 +282,7 @@ fn draw_new_request(
     area: Rect,
     fields: &[(String, String)],
     focused: usize,
+    edit: &Edit,
     profiles: &[crate::config::Profile],
     headers: &std::collections::HashMap<String, String>,
     is_edit: bool,
@@ -249,13 +306,7 @@ fn draw_new_request(
         }
         lines.push(Line::from(label_spans));
 
-        let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
-        let display = if is_focused { format!("{}█", value) } else { value.clone() };
-        let input = Span::styled(
-            display,
-            Style::default().fg(if is_focused { Color::White } else { Color::DarkGray }),
-        );
-        lines.push(Line::from(vec![prompt, input]));
+        lines.push(input_line(value, caret(is_focused, edit)));
         lines.push(Line::raw(""));
     }
 
@@ -381,12 +432,14 @@ fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&
     frame.render_widget(paragraph, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_new_profile(
     frame: &mut Frame,
     area: Rect,
     name: &str,
     params: &[(String, String)],
     focused: usize,
+    edit: &Edit,
     error: Option<&str>,
     is_edit: bool,
 ) {
@@ -403,11 +456,7 @@ fn draw_new_profile(
         ),
         Span::styled(" *", Style::default().fg(Color::Red)),
     ]));
-    let display = if name_focused { format!("{}█", name) } else { name.to_string() };
-    lines.push(Line::from(vec![
-        Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-        Span::styled(display, Style::default().fg(if name_focused { Color::White } else { Color::DarkGray })),
-    ]));
+    lines.push(input_line(name, caret(name_focused, edit)));
     lines.push(Line::raw(""));
 
     // Param pairs: focused index 1+2i = key, 2+2i = value
@@ -421,11 +470,7 @@ fn draw_new_profile(
                 .fg(if key_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        let display = if key_focused { format!("{}█", key) } else { key.clone() };
-        lines.push(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-            Span::styled(display, Style::default().fg(if key_focused { Color::White } else { Color::DarkGray })),
-        ]));
+        lines.push(input_line(key, caret(key_focused, edit)));
 
         lines.push(Line::from(Span::styled(
             format!("  param {} value", i + 1),
@@ -433,11 +478,7 @@ fn draw_new_profile(
                 .fg(if val_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        let display = if val_focused { format!("{}█", value) } else { value.clone() };
-        lines.push(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-            Span::styled(display, Style::default().fg(if val_focused { Color::White } else { Color::DarkGray })),
-        ]));
+        lines.push(input_line(value, caret(val_focused, edit)));
         lines.push(Line::raw(""));
     }
 
@@ -464,6 +505,7 @@ fn draw_edit_headers(
     area: Rect,
     pairs: &[(String, String)],
     focused: usize,
+    edit: &Edit,
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
@@ -478,11 +520,7 @@ fn draw_edit_headers(
                 .fg(if name_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        let display = if name_focused { format!("{}█", name) } else { name.clone() };
-        lines.push(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-            Span::styled(display, Style::default().fg(if name_focused { Color::White } else { Color::DarkGray })),
-        ]));
+        lines.push(input_line(name, caret(name_focused, edit)));
 
         lines.push(Line::from(Span::styled(
             format!("  header {} value", i + 1),
@@ -490,11 +528,7 @@ fn draw_edit_headers(
                 .fg(if value_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        let display = if value_focused { format!("{}█", value) } else { value.clone() };
-        lines.push(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-            Span::styled(display, Style::default().fg(if value_focused { Color::White } else { Color::DarkGray })),
-        ]));
+        lines.push(input_line(value, caret(value_focused, edit)));
         lines.push(Line::raw(""));
     }
 
@@ -605,6 +639,7 @@ fn draw_var_input(
     area: Rect,
     vars: &[(String, String)],
     focused: usize,
+    edit: &Edit,
     entry_name: &str,
 ) {
     let title = format!(" Variables — {} ", entry_name);
@@ -619,15 +654,7 @@ fn draw_var_input(
                 .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-
-        let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
-        // Append a block cursor character to the focused field's text.
-        let display = if is_focused { format!("{}█", value) } else { value.clone() };
-        let input = Span::styled(
-            display,
-            Style::default().fg(if is_focused { Color::White } else { Color::DarkGray }),
-        );
-        lines.push(Line::from(vec![prompt, input]));
+        lines.push(input_line(value, caret(is_focused, edit)));
         lines.push(Line::raw(""));
     }
 
@@ -646,6 +673,7 @@ fn draw_test_input(
     vars: &[(String, String)],
     iterations: &str,
     focused: usize,
+    edit: &Edit,
     entry_name: &str,
 ) {
     let title = format!(" Test — {} ", entry_name);
@@ -659,13 +687,7 @@ fn draw_test_input(
                 .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
-        let display = if is_focused { format!("{}█", value) } else { value.clone() };
-        let input = Span::styled(
-            display,
-            Style::default().fg(if is_focused { Color::White } else { Color::DarkGray }),
-        );
-        lines.push(Line::from(vec![prompt, input]));
+        lines.push(input_line(value, caret(is_focused, edit)));
         lines.push(Line::raw(""));
     }
 
@@ -676,13 +698,7 @@ fn draw_test_input(
             .fg(if iter_focused { Color::Yellow } else { Color::DarkGray })
             .add_modifier(Modifier::BOLD),
     )));
-    let prompt = Span::styled("  > ", Style::default().fg(Color::DarkGray));
-    let display = if iter_focused { format!("{}█", iterations) } else { iterations.to_string() };
-    let input = Span::styled(
-        display,
-        Style::default().fg(if iter_focused { Color::White } else { Color::DarkGray }),
-    );
-    lines.push(Line::from(vec![prompt, input]));
+    lines.push(input_line(iterations, caret(iter_focused, edit)));
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()

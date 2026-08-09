@@ -45,13 +45,13 @@ pub(crate) fn load_entry(name: &str) -> Result<Entry> {
 
 fn entry_from_content(name: &str, global: bool, content: &str) -> Result<Entry> {
     let kind = if content.contains("steps:") {
-        let chain: ChainConfig = serde_yaml::from_str(content)
+        let chain: ChainConfig = serde_yaml_ng::from_str(content)
             .with_context(|| format!("Invalid YAML in chain config '{}'", name))?;
         EntryKind::Chain {
             steps: chain.steps.iter().map(|s| s.name.clone()).collect(),
         }
     } else {
-        let config: RequestConfig = serde_yaml::from_str(content)
+        let config: RequestConfig = serde_yaml_ng::from_str(content)
             .with_context(|| format!("Invalid YAML in request config '{}'", name))?;
         EntryKind::Request {
             method: config.method,

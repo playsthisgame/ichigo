@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde_json = "1"
 anyhow = "1"
@@ -24,6 +23,8 @@ colored = "2"
 colored_json = "5"
 ratatui = "0.29"
 crossterm = "0.28"
+serde_yaml_ng = "0.10.0"
+basic-toml = "0.1.10"
 
 # The profile that 'dist' will build with
 [profile.dist]
