@@ -157,7 +157,7 @@ fn cmd_new(
             .context("Failed to read the cURL command from stdin")?;
         let mut config = curl::from_curl(&input)?;
         config.name = name.clone();
-        serde_yaml::to_string(&config)
+        serde_yaml_ng::to_string(&config)
             .with_context(|| format!("Failed to serialize request '{}'", name))?
     } else {
         let url = url.unwrap_or_else(|| "https://example.com".to_string());
@@ -341,7 +341,7 @@ fn cmd_copy(name: String, new_name: String, global: bool) -> Result<()> {
     } else {
         let mut config = RequestConfig::load(&name)?;
         config.name = new_name;
-        let content = serde_yaml::to_string(&config)?;
+        let content = serde_yaml_ng::to_string(&config)?;
         fs::write(&new_path, &content)?;
     }
 

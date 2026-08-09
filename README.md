@@ -33,6 +33,10 @@ Configs live in one of two places:
 
 When a name exists in both, the local one wins.
 
+Your own preferences are separate: `~/.config/ichigo/config.toml`. It sits in
+the same directory but is TOML, so it is never mistaken for a request. See
+[Configuring ichigo](#configuring-ichigo).
+
 ## Commands
 
 ```text
@@ -202,6 +206,36 @@ reach for most; press `?` for the full keymap, grouped by what it does. Any key
 dismisses it.
 
 The TUI is meant to be left open. Every run and load test re-reads the config file from disk first, so edits you make in another terminal — rotating a token in a profile, adding a header, changing a URL — take effect on the next run with no restart. Press `R` when you have created, renamed, or deleted config *files* on disk and want them to show up in the list.
+
+#### Editing text fields
+
+Every form field in the TUI — a URL, a header value, a profile param — is a
+small vim-style editor rather than an append-only box.
+
+Fields start in **insert** mode. `Esc` drops to **normal** mode, where the
+usual motions work; a second `Esc` leaves the pane. The caret shows which mode
+you are in: a thin bar between characters for insert, a block over a character
+for normal.
+
+| Key | Action |
+| --- | ------ |
+| ← → , Home / End | Move the caret (either mode) |
+| Backspace / Delete | Delete a character (either mode) |
+| `h` / `l` | Left / right |
+| `w` / `b` / `e` | Word forward / back / end (`W` `B` `E` skip punctuation) |
+| `0` / `^` / `$` | Start of line / first non-blank / end |
+| `i` / `a` / `I` / `A` | Insert before / after the caret, at the start / end |
+| `x` / `s` | Delete the character under the caret, with / without inserting |
+| `D` / `C` / `S` | Delete to end of line, change to end of line, change the line |
+| `u` | Undo the last change |
+
+`u` steps back one *change* at a time, not one keystroke: everything typed
+between entering insert mode and leaving it undoes together, so one `u` reverses
+the whole URL you just typed rather than its last character. The history belongs
+to the field, and moving focus starts a new one — Tab away and back and there is
+nothing left to undo. There is no redo.
+
+If you map `jk` (or similar) to `Esc` in vim, see [Configuring ichigo](#configuring-ichigo).
 
 #### Copying part of a response
 
@@ -384,6 +418,31 @@ name — the second is refused rather than saved, since a duplicate would be
 unreachable from both the picker and `--profile`.
 
 Profile values are re-read from the file every time you run, so a token you rotate in the YAML is picked up on the next run of a long-lived TUI session. Values resolved from **environment variables** are not: a process cannot see exports its parent shell makes after launch, so an env-sourced token stays stale until you restart ichigo. Put values that rotate in a profile.
+
+## Configuring ichigo
+
+Your preferences live at `~/.config/ichigo/config.toml` — TOML, unlike the
+requests themselves, so the two can share a directory without ever being
+confused for one another. The file is optional, as is every key in it, and it is
+global only: there is no project-local override, since these are preferences
+about how *you* type rather than about a project.
+
+```toml
+[keys]
+# Two-key sequence that leaves insert mode in a TUI text field, the
+# equivalent of vim's `inoremap jk <Esc>`. Omit to leave Esc as the
+# only way out.
+insert_escape = "jk"
+```
+
+The sequence must be exactly two characters. The first one is typed into the
+field as normal and un-typed when the second completes the sequence within a
+second — so `j`, a pause to think, then `k` leaves you with a literal `jk`, the
+same as vim's `timeoutlen`. Typing `jk` quickly *does* escape, which is why the
+usual advice is to pick a digraph you never type.
+
+ichigo opens on an error message if the file cannot be read, rather than
+silently falling back to defaults; press Esc to carry on with them.
 
 ## Shell completions
 

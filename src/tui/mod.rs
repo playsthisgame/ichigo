@@ -1,7 +1,9 @@
 mod tree;
 mod render;
 mod handlers;
+mod edit;
 
+use edit::Edit;
 use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
 
 use anyhow::Result;
@@ -14,7 +16,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 use std::{collections::{HashMap, HashSet}, fs, io};
-use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, RequestConfig};
+use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig};
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
 
@@ -51,6 +53,7 @@ enum Mode {
         entry_name: String,
         vars: Vec<(String, String)>, // (placeholder name, value being typed)
         focused: usize,              // which field the cursor is in
+        edit: Edit,                  // the caret within that field
         action: PendingAction,
     },
     TestInput {
@@ -58,6 +61,7 @@ enum Mode {
         vars: Vec<(String, String)>,
         iterations: String,
         focused: usize, // 0..vars.len() = var fields, vars.len() = iterations field
+        edit: Edit,
     },
     Response {
         kind: ResponseKind,
@@ -99,6 +103,7 @@ enum Mode {
         draft: RequestDraft,
         pairs: Vec<(String, String)>,
         focused: usize,
+        edit: Edit,
         error: Option<String>,
     },
     // The draft's profiles, for picking one to edit or delete. The single way
@@ -121,8 +126,62 @@ enum Mode {
         name: String,
         params: Vec<(String, String)>,
         focused: usize,
+        edit: Edit,
         error: Option<String>,
     },
+}
+
+/// Constructors for the modes that open on a text field.
+///
+/// They exist for the caret: each of these modes carries one `Edit` for
+/// whichever field has focus, and a form can open on a value that arrived
+/// prefilled — from a profile, the environment, or the config on disk. Building
+/// them by hand meant repeating that anchoring at seven call sites and getting
+/// a caret of 0 on a filled field wherever it was forgotten.
+impl Mode {
+    /// A response pane showing `body`. Reach it through `App::show_message` /
+    /// `show_error` unless there is no `App` yet, as at startup.
+    fn message(kind: ResponseKind, body: String) -> Self {
+        Mode::Response {
+            kind,
+            body,
+            scroll: 0,
+            response_filter: String::new(),
+            response_filter_active: false,
+            cursor: 0,
+            anchor: None,
+            status: None,
+        }
+    }
+
+    fn var_input(entry_name: String, vars: Vec<(String, String)>, action: PendingAction) -> Self {
+        let edit = Edit::at_end(vars.first().map_or("", |(_, v)| v.as_str()));
+        Mode::VarInput { entry_name, vars, focused: 0, edit, action }
+    }
+
+    /// Opens on the first variable, or on the iteration count when the request
+    /// has none.
+    fn test_input(entry_name: String, vars: Vec<(String, String)>) -> Self {
+        let iterations = "10".to_string();
+        let edit = Edit::at_end(vars.first().map_or(iterations.as_str(), |(_, v)| v.as_str()));
+        Mode::TestInput { entry_name, vars, iterations, focused: 0, edit }
+    }
+
+    fn edit_headers(draft: RequestDraft) -> Self {
+        let pairs = header_pairs(&draft);
+        let edit = Edit::at_end(pairs.first().map_or("", |(name, _)| name.as_str()));
+        Mode::EditHeaders { draft, pairs, focused: 0, edit, error: None }
+    }
+
+    fn new_profile(
+        draft: RequestDraft,
+        editing: Option<usize>,
+        name: String,
+        params: Vec<(String, String)>,
+    ) -> Self {
+        let edit = Edit::at_end(&name);
+        Mode::NewProfile { draft, editing, name, params, focused: 0, edit, error: None }
+    }
 }
 
 /// The request being created or edited in `NewRequest`.
@@ -136,6 +195,10 @@ pub(crate) struct RequestDraft {
     // (label, value): name, method, url, description
     pub(crate) fields: Vec<(String, String)>,
     pub(crate) focused: usize,
+    // The caret in `fields[focused]`. Travels with the draft so a trip through
+    // the headers or profiles pane comes back to the same spot in the same
+    // field.
+    edit: Edit,
     pub(crate) profiles: Vec<crate::config::Profile>,
     // Some(name) when editing an existing request; None when creating one.
     pub(crate) original_name: Option<String>,
@@ -163,9 +226,11 @@ impl RequestDraft {
     /// Builds a draft from a config — an existing request being edited or
     /// cloned, or one parsed out of a pasted cURL command.
     fn from_config(config: RequestConfig, original_name: Option<String>, global: bool) -> Self {
+        let name = original_name.clone().unwrap_or_default();
         Self {
+            edit: Edit::at_end(&name),
             fields: vec![
-                ("name".to_string(), original_name.clone().unwrap_or_default()),
+                ("name".to_string(), name),
                 ("method".to_string(), config.method),
                 ("url".to_string(), config.url),
                 ("description".to_string(), config.description.unwrap_or_default()),
@@ -183,6 +248,16 @@ impl RequestDraft {
 
     pub(crate) fn headers(&self) -> &HashMap<String, String> {
         &self.headers
+    }
+
+    /// Moves focus and puts the caret at the end of the field it lands on.
+    ///
+    /// The draft keeps one caret for whichever field has focus, so every focus
+    /// change has to re-anchor it — otherwise Tab carries an offset from the
+    /// previous field into a shorter one.
+    fn focus(&mut self, idx: usize) {
+        self.focused = idx;
+        self.edit = Edit::at_end(&self.fields[idx].1);
     }
 }
 
@@ -205,6 +280,9 @@ struct App {
     // would have to remember which of the nine it interrupted, and every action
     // path would gain a state that reaches none of them.
     show_help: bool,
+    // Read once at launch from `config.toml`. Not reloaded mid-session: a keymap
+    // changing under a half-typed field would be worse than not reloading it.
+    keys: Keys,
     mode: Mode,
 }
 
@@ -220,6 +298,13 @@ impl App {
         if initial_count > 0 {
             list_state.select(Some(0));
         }
+        // A broken user config opens the TUI on the message and runs on
+        // defaults, rather than either refusing to start over a preference or
+        // silently ignoring a keymap someone is waiting to see work.
+        let (keys, mode) = match Keys::load() {
+            Ok(keys) => (keys, Mode::Browse),
+            Err(e) => (Keys::default(), Mode::message(ResponseKind::Error, format!("Config: {e:#}"))),
+        };
         Ok(Self {
             entries,
             tree,
@@ -231,7 +316,8 @@ impl App {
             filter: String::new(),
             filter_active: false,
             show_help: false,
-            mode: Mode::Browse,
+            keys,
+            mode,
         })
     }
 
@@ -344,16 +430,7 @@ impl App {
     /// Shows plain text in the Response pane — the single place that builds the
     /// mode, so its five fields aren't spelled out at a dozen call sites.
     fn show_message(&mut self, kind: ResponseKind, body: String) {
-        self.mode = Mode::Response {
-            kind,
-            body,
-            scroll: 0,
-            response_filter: String::new(),
-            response_filter_active: false,
-            cursor: 0,
-            anchor: None,
-            status: None,
-        };
+        self.mode = Mode::message(kind, body);
     }
 
     /// Re-reads entry `idx` from disk and replaces the cached copy, so profiles
@@ -455,7 +532,7 @@ impl App {
         if vars.is_empty() {
             self.execute_request(&entry_name, &HashMap::new());
         } else {
-            self.mode = Mode::VarInput { entry_name, vars, focused: 0, action: PendingAction::Run };
+            self.mode = Mode::var_input(entry_name, vars, PendingAction::Run);
         }
     }
 
@@ -494,12 +571,7 @@ impl App {
         if vars.is_empty() {
             self.execute_chain(entry_name, &HashMap::new());
         } else {
-            self.mode = Mode::VarInput {
-                entry_name: entry_name.to_string(),
-                vars,
-                focused: 0,
-                action: PendingAction::Run,
-            };
+            self.mode = Mode::var_input(entry_name.to_string(), vars, PendingAction::Run);
         }
     }
 
@@ -538,7 +610,7 @@ impl App {
             })
             .collect();
 
-        self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
+        self.mode = Mode::test_input(entry_name, vars);
     }
 
     /// Entry point for `y`: generate a cURL command for the selected request.
@@ -590,7 +662,7 @@ impl App {
         if vars.is_empty() {
             self.render_curl(&entry_name, &HashMap::new());
         } else {
-            self.mode = Mode::VarInput { entry_name, vars, focused: 0, action: PendingAction::Curl };
+            self.mode = Mode::var_input(entry_name, vars, PendingAction::Curl);
         }
     }
 
@@ -667,7 +739,7 @@ impl App {
             .collect();
 
         if action == PendingAction::Test {
-            self.mode = Mode::TestInput { entry_name, vars, iterations: "10".to_string(), focused: 0 };
+            self.mode = Mode::test_input(entry_name, vars);
         } else if all_covered && vars.iter().all(|(_, v)| !v.is_empty()) {
             // The profile answered everything, so skip the variable form and go
             // straight to whatever this action's terminal step is.
@@ -678,7 +750,7 @@ impl App {
                 _ => self.execute_request(&entry_name, &var_map),
             }
         } else {
-            self.mode = Mode::VarInput { entry_name, vars, focused: 0, action };
+            self.mode = Mode::var_input(entry_name, vars, action);
         }
     }
 
@@ -819,12 +891,7 @@ impl App {
         match RequestConfig::load(&name) {
             Ok(config) => {
                 let draft = RequestDraft::from_config(config, Some(name), global);
-                self.mode = Mode::EditHeaders {
-                    pairs: header_pairs(&draft),
-                    draft,
-                    focused: 0,
-                    error: None,
-                };
+                self.mode = Mode::edit_headers(draft);
             }
             Err(e) => self.show_error(e),
         }
@@ -971,7 +1038,7 @@ impl App {
             return;
         }
 
-        match serde_yaml::to_string(&config) {
+        match serde_yaml_ng::to_string(&config) {
             Ok(yaml) => {
                 if let Err(e) = fs::write(&path, yaml) {
                     set_error(&mut self.mode, &format!("Failed to write file: {e}"));
@@ -1023,32 +1090,33 @@ impl App {
             }
             Mode::NewRequest { draft, error } => {
                 let focused = draft.focused;
-                draft.fields[focused].1.push_str(&single_line());
+                edit::insert_str(&mut draft.fields[focused].1, &mut draft.edit, &single_line());
                 *error = None;
             }
-            Mode::NewProfile { name, params, focused, error, .. } => {
+            Mode::NewProfile { name, params, focused, edit, error, .. } => {
                 *error = None;
-                if *focused == 0 {
-                    name.push_str(&single_line());
-                } else {
-                    let idx = (*focused - 1) / 2;
-                    let is_value = (*focused - 1) % 2 == 1;
-                    if let Some((k, v)) = params.get_mut(idx) {
-                        if is_value { v.push_str(&single_line()) } else { k.push_str(&single_line()) }
-                    }
+                if let Some(value) = profile_field(name, params, *focused) {
+                    edit::insert_str(value, edit, &single_line());
                 }
             }
-            Mode::VarInput { vars, focused, .. } => {
+            Mode::EditHeaders { pairs, focused, edit, error, .. } => {
+                *error = None;
+                if let Some(value) = pair_field(pairs, *focused) {
+                    edit::insert_str(value, edit, &single_line());
+                }
+            }
+            Mode::VarInput { vars, focused, edit, .. } => {
                 if let Some((_, value)) = vars.get_mut(*focused) {
-                    value.push_str(&single_line());
+                    edit::insert_str(value, edit, &single_line());
                 }
             }
-            Mode::TestInput { vars, focused, iterations, .. } => {
+            Mode::TestInput { vars, focused, iterations, edit, .. } => {
                 if *focused < vars.len() {
-                    vars[*focused].1.push_str(&single_line());
+                    edit::insert_str(&mut vars[*focused].1, edit, &single_line());
                 } else {
                     // The iterations field only ever accepts digits.
-                    iterations.extend(text.chars().filter(char::is_ascii_digit));
+                    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
+                    edit::insert_str(iterations, edit, &digits);
                 }
             }
             Mode::Response { response_filter, response_filter_active: true, .. } => {
@@ -1201,6 +1269,27 @@ fn header_pairs(draft: &RequestDraft) -> Vec<(String, String)> {
         .collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     pairs
+}
+
+/// The header row a `Mode::EditHeaders` focus index points at: `2i` is
+/// `pairs[i]`'s name, `2i+1` its value. `None` once focus outruns the list,
+/// which a deleted row can leave it doing for one keystroke.
+fn pair_field(pairs: &mut [(String, String)], focused: usize) -> Option<&mut String> {
+    let (name, value) = pairs.get_mut(focused / 2)?;
+    Some(if focused % 2 == 1 { value } else { name })
+}
+
+/// The profile field a `Mode::NewProfile` focus index points at: `0` is the
+/// name, then `1+2i` / `2+2i` are `params[i]`'s key and value.
+fn profile_field<'a>(
+    name: &'a mut String,
+    params: &'a mut [(String, String)],
+    focused: usize,
+) -> Option<&'a mut String> {
+    match focused.checked_sub(1) {
+        None => Some(name),
+        Some(offset) => pair_field(params, offset),
+    }
 }
 
 /// The response lines the filter leaves visible.
