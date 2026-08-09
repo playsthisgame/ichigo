@@ -1203,6 +1203,41 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Style applied to a `{{VAR}}` placeholder wherever one is shown verbatim.
+const VAR_STYLE: Style = Style::new()
+    .fg(Color::Magenta)
+    .add_modifier(Modifier::BOLD);
+
+/// Splits `text` into spans so `{{VAR}}` placeholders render in [`VAR_STYLE`]
+/// and everything else keeps `base`.
+///
+/// The scan matches `extract_var_names` in `mod.rs` — the pane must highlight
+/// exactly what the `VarInput` prompt will ask for, so an unterminated `{{`
+/// is left as ordinary text here just as it is skipped there.
+fn var_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+
+        if start > 0 {
+            spans.push(Span::styled(rest[..start].to_string(), base));
+        }
+        spans.push(Span::styled(
+            format!("{{{{{}}}}}", &after[..end]),
+            VAR_STYLE,
+        ));
+        rest = &after[end + 2..];
+    }
+
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), base));
+    }
+    spans
+}
+
 fn colorize_json_value(val: &str) -> Vec<Span<'static>> {
     let (content, trailing) = val.strip_suffix(',').map_or((val, ""), |s| (s, ","));
 
@@ -1485,10 +1520,9 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
             header.extend(folder_name_spans(&entry.name));
             lines.push(Line::from(header));
             lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                Span::styled(" url    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(url.clone(), Style::default().fg(Color::Cyan)),
-            ]));
+            let mut url_line = vec![Span::styled(" url    ", Style::default().fg(Color::DarkGray))];
+            url_line.extend(var_spans(url, Style::default().fg(Color::Cyan)));
+            lines.push(Line::from(url_line));
             if let Some(desc) = description
                 && !desc.is_empty()
             {
@@ -1504,10 +1538,10 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
                     Style::default().fg(Color::DarkGray),
                 )));
                 for (k, v) in headers {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {}: ", k), Style::default().fg(Color::Yellow)),
-                        Span::raw(v.clone()),
-                    ]));
+                    let mut row =
+                        vec![Span::styled(format!("  {}: ", k), Style::default().fg(Color::Yellow))];
+                    row.extend(var_spans(v, Style::default()));
+                    lines.push(Line::from(row));
                 }
             }
             if !query.is_empty() {
@@ -1517,14 +1551,69 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
                     Style::default().fg(Color::DarkGray),
                 )));
                 for (k, v) in query {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {}: ", k), Style::default().fg(Color::Yellow)),
-                        Span::raw(v.clone()),
-                    ]));
+                    let mut row =
+                        vec![Span::styled(format!("  {}: ", k), Style::default().fg(Color::Yellow))];
+                    row.extend(var_spans(v, Style::default()));
+                    lines.push(Line::from(row));
                 }
             }
         }
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(text, is_placeholder)` per span, which is all the callers care about.
+    fn split(text: &str) -> Vec<(String, bool)> {
+        var_spans(text, Style::default())
+            .into_iter()
+            .map(|s| (s.content.to_string(), s.style == VAR_STYLE))
+            .collect()
+    }
+
+    #[test]
+    fn splits_placeholders_from_surrounding_text() {
+        assert_eq!(
+            split("https://{{HOST}}/v1/{{ID}}"),
+            vec![
+                ("https://".to_string(), false),
+                ("{{HOST}}".to_string(), true),
+                ("/v1/".to_string(), false),
+                ("{{ID}}".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_text_stays_one_span() {
+        assert_eq!(split("Bearer token"), vec![("Bearer token".to_string(), false)]);
+    }
+
+    #[test]
+    fn placeholder_may_be_the_whole_value() {
+        assert_eq!(split("{{TOKEN}}"), vec![("{{TOKEN}}".to_string(), true)]);
+    }
+
+    // An unterminated `{{` is not a variable to `extract_var_names`, so it must
+    // not look like one here either.
+    #[test]
+    fn unterminated_open_is_not_highlighted() {
+        assert_eq!(split("a {{B"), vec![("a {{B".to_string(), false)]);
+        assert_eq!(
+            split("{{A}} then {{B"),
+            vec![
+                ("{{A}}".to_string(), true),
+                (" then {{B".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_value_yields_no_spans() {
+        assert!(split("").is_empty());
+    }
 }
