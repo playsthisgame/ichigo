@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::fs;
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
 use super::edit::{self, Applied, Edit};
-use super::{App, Focus, Mode, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field};
+use super::{App, Focus, Mode, PairKind, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field};
 use super::tree::{VisibleRow, visible_rows, build_tree, load_entries};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        // Tab covers the action rows too, so global/headers/profiles are found
-        // by walking the form rather than by knowing a chord.
+        // Tab covers the action rows too, so global/headers/query/profiles are
+        // found by walking the form rather than by knowing a chord.
         KeyCode::Tab => {
             if let Mode::NewRequest { draft, .. } = &mut app.mode {
                 let next = (draft.focused + 1) % draft.rows();
@@ -48,7 +48,17 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
         // instead.
         KeyCode::Char('e' | 'h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Mode::NewRequest { draft, .. } = &app.mode {
-                app.mode = Mode::edit_headers(draft.clone());
+                app.mode = Mode::edit_pairs(PairKind::Headers, draft.clone());
+            }
+        }
+        // Query params. Ctrl+q is the mnemonic, and unlike Ctrl+h it is safe to
+        // press: raw mode clears IXON, so the terminal driver no longer eats it
+        // as XON/XOFF flow control. It is still only an accelerator — the Tab
+        // row is the path that nothing can intercept, which is why the query
+        // pane, like headers, is reachable without knowing this chord at all.
+        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::NewRequest { draft, .. } = &app.mode {
+                app.mode = Mode::edit_pairs(PairKind::Query, draft.clone());
             }
         }
         // Enter saves from a text field and does the row's thing on an action
@@ -68,14 +78,14 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                 }
                 // Cloned out first: the new mode owns the draft, so it cannot
                 // be built while `app.mode` is still borrowed.
-                Focus::Headers | Focus::Profiles => {
+                Focus::Headers | Focus::Query | Focus::Profiles => {
                     let Mode::NewRequest { draft, .. } = &app.mode else { return false };
                     let draft = draft.clone();
-                    app.mode = if target == Focus::Headers {
-                        Mode::edit_headers(draft)
-                    } else {
+                    app.mode = match target {
+                        Focus::Headers => Mode::edit_pairs(PairKind::Headers, draft),
+                        Focus::Query => Mode::edit_pairs(PairKind::Query, draft),
                         // 0 is the first profile, or the "new" row when empty.
-                        Mode::ProfileList { draft, selected: 0 }
+                        _ => Mode::ProfileList { draft, selected: 0 },
                     };
                 }
             }
@@ -152,11 +162,11 @@ pub(super) fn handle_key_import_curl(app: &mut App, key: KeyEvent) -> bool {
 ///
 /// Edits land in the draft only when Enter succeeds; Esc drops them, and the
 /// request itself is still unwritten until saved from the form.
-pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
+pub(super) fn handle_key_edit_pairs(app: &mut App, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Tab => {
-            if let Mode::EditHeaders { pairs, focused, edit, .. } = &mut app.mode {
+            if let Mode::EditPairs { pairs, focused, edit, .. } = &mut app.mode {
                 let total = 2 * pairs.len();
                 if total > 0 {
                     *focused = (*focused + 1) % total;
@@ -165,7 +175,7 @@ pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::BackTab => {
-            if let Mode::EditHeaders { pairs, focused, edit, .. } = &mut app.mode {
+            if let Mode::EditPairs { pairs, focused, edit, .. } = &mut app.mode {
                 let total = 2 * pairs.len();
                 if total > 0 {
                     *focused = focused.checked_sub(1).unwrap_or(total - 1);
@@ -174,7 +184,7 @@ pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('a') if ctrl => {
-            if let Mode::EditHeaders { pairs, focused, edit, error, .. } = &mut app.mode {
+            if let Mode::EditPairs { pairs, focused, edit, error, .. } = &mut app.mode {
                 *focused = 2 * pairs.len();
                 pairs.push((String::new(), String::new()));
                 *edit = Edit::default();
@@ -182,7 +192,7 @@ pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char('d') if ctrl => {
-            if let Mode::EditHeaders { pairs, focused, edit, error, .. } = &mut app.mode {
+            if let Mode::EditPairs { pairs, focused, edit, error, .. } = &mut app.mode {
                 let idx = *focused / 2;
                 if idx < pairs.len() {
                     pairs.remove(idx);
@@ -196,14 +206,16 @@ pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter => {
             let taken = match &app.mode {
-                Mode::EditHeaders { draft, pairs, .. } => Some((draft.clone(), pairs.clone())),
+                Mode::EditPairs { kind, draft, pairs, .. } => {
+                    Some((*kind, draft.clone(), pairs.clone()))
+                }
                 _ => None,
             };
-            let Some((mut draft, pairs)) = taken else { return false };
-            match super::apply_headers(&mut draft, pairs) {
+            let Some((kind, mut draft, pairs)) = taken else { return false };
+            match kind.apply(&mut draft, pairs) {
                 Ok(()) => app.mode = Mode::NewRequest { draft, error: None },
                 Err(message) => {
-                    if let Mode::EditHeaders { error, .. } = &mut app.mode {
+                    if let Mode::EditPairs { error, .. } = &mut app.mode {
                         *error = Some(message);
                     }
                 }
@@ -212,18 +224,18 @@ pub(super) fn handle_key_edit_headers(app: &mut App, key: KeyEvent) -> bool {
         _ => {
             let keys = app.keys;
             let mut leaving = None;
-            if let Mode::EditHeaders { draft, pairs, focused, edit, error } = &mut app.mode {
+            if let Mode::EditPairs { draft, pairs, focused, edit, error, .. } = &mut app.mode {
                 let focused = *focused;
                 if let Some(value) = pair_field(pairs, focused) {
                     match edit::apply(value, edit, key, keys) {
                         Applied::Yes => *error = None,
-                        // Back to the form without saving: header edits live in
-                        // the draft until the request itself is written.
+                        // Back to the form without saving: these edits live
+                        // in the draft until the request itself is written.
                         Applied::Exit => leaving = Some(draft.clone()),
                         Applied::No => {}
                     }
                 } else if matches!(key.code, KeyCode::Esc) {
-                    // An empty header list has no field to hold a mode, so Esc
+                    // An empty list has no field to hold a mode, so Esc
                     // leaves straight away rather than waiting for a second one.
                     leaving = Some(draft.clone());
                 }

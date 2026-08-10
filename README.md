@@ -386,44 +386,58 @@ Shift-Tab walk it, and the walk covers more than the four text fields:
 | `name`, `method`, `url`, `description` | Save the request |
 | `[ ] global` | Toggle between `.ichigo/` and `~/.config/ichigo/` |
 | `headers` | Open the headers pane |
+| `query params` | Open the query params pane |
 | `profiles` | Open the profiles pane |
 
 So every part of a request is reachable by tabbing through the form — there is
-no chord to know in advance. `Ctrl+g`, `Ctrl+e`, and `Ctrl+p` still jump
-straight to those three from anywhere in the form.
+no chord to know in advance. `Ctrl+g`, `Ctrl+e`, `Ctrl+q`, and `Ctrl+p` still
+jump straight to those four from anywhere in the form.
 
 The four text fields are editors (see [Editing text fields](#editing-text-fields)),
 which is why Esc takes two presses there — the first leaves insert mode, the
-second leaves the form. On the three rows below them there is no text to edit,
+second leaves the form. On the four rows below them there is no text to edit,
 so one Esc leaves.
 
-#### Editing headers in the TUI
+#### Editing headers and query params in the TUI
 
-Tab to `headers` in the request form and press Enter, or press `Ctrl+e` from
-anywhere in the form:
+Headers and query params are edited in the same pane. Tab to `headers` or
+`query params` in the request form and press Enter, or use `Ctrl+e` and
+`Ctrl+q` from anywhere in the form:
 
 | Key | Action |
 | --- | ------ |
 | Tab / Shift-Tab | Move between name and value fields |
-| `Ctrl+a` | Add a header |
-| `Ctrl+d` | Remove the header under the cursor |
+| `Ctrl+a` | Add a row |
+| `Ctrl+d` | Remove the row under the cursor |
 | Enter | Apply to the request |
-| Esc | Discard the header edits |
+| Esc | Discard the edits |
 
-> `Ctrl+h` also works, but only in terminals that send it. Many terminals, tmux
-> configs, and shells bind Ctrl+H to backward-delete-char and send a plain
-> Backspace instead, in which case the key just deletes a character. Tab to the
-> `headers` row and press Enter if you want the path nothing can intercept.
+> `Ctrl+h` also opens headers, but only in terminals that send it. Many
+> terminals, tmux configs, and shells bind Ctrl+H to backward-delete-char and
+> send a plain Backspace instead, in which case the key just deletes a
+> character. Tab to the row and press Enter if you want the path nothing can
+> intercept.
 
 Applying only updates the request in memory — Enter on the request form is what
-writes the file, so Esc out of that form drops the header changes too.
+writes the file, so Esc out of that form drops the changes too.
 
-Two headers with the same name are refused, compared without regard to case:
-HTTP treats `Accept` and `accept` as one header, so keeping both would mean
-sending whichever won a coin toss. If the request has a body, a `Content-Type`
-header is stored as the body's `content_type` rather than as a header — ichigo
-derives the header from the body when it sends, and holding both would put it
-on the wire twice.
+Blank-named rows are dropped rather than treated as an error, so a row you add
+and then think better of costs nothing. Names and values are trimmed.
+
+The two panes differ in one rule, and it follows the protocol rather than the
+UI. **Two headers with the same name are refused without regard to case**: HTTP
+treats `Accept` and `accept` as one header, so keeping both would mean sending
+whichever won a coin toss. **Two query params are compared exactly**, so `page`
+and `Page` are different params and both are kept — a query key means whatever
+the server says it means, and refusing that pair would reject a request that is
+perfectly legal to send. An exact repeat is still refused, since only one of the
+two could survive.
+
+If the request has a body, a `Content-Type` **header** is stored as the body's
+`content_type` rather than as a header — ichigo derives the header from the body
+when it sends, and holding both would put it on the wire twice. That rule is
+headers-only: a query param that happens to be named `Content-Type` is just a
+param.
 
 #### Editing profiles in the TUI
 
