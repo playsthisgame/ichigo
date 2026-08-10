@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 use super::edit::Edit;
-use super::{App, Mode, ResponseKind};
+use super::{App, Mode, PairKind, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
 
 /// One text field's value with the caret drawn where it sits.
@@ -57,7 +57,7 @@ fn caret(is_focused: bool, edit: &Edit) -> Option<&Edit> {
     is_focused.then_some(edit)
 }
 
-/// One of the request form's three action rows — global, headers, profiles.
+/// One of the request form's four action rows — global, headers, query, profiles.
 ///
 /// These are Tab stops with no text in them, so focus cannot be a caret. It is
 /// the `▸` marker plus the label going green, matching the way a focused
@@ -151,13 +151,13 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             draw_test_results(frame, panes[1], results);
         }
         Mode::NewRequest { draft, error } => {
-            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.original_name.is_some(), draft.global, error.as_deref());
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.original_name.is_some(), draft.global, error.as_deref());
         }
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
         }
-        Mode::EditHeaders { pairs, focused, edit, error, .. } => {
-            draw_edit_headers(frame, panes[1], pairs, *focused, edit, error.as_deref());
+        Mode::EditPairs { kind, pairs, focused, edit, error, .. } => {
+            draw_edit_pairs(frame, panes[1], *kind, pairs, *focused, edit, error.as_deref());
         }
         Mode::ProfileList { draft, selected } => {
             draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1);
@@ -323,6 +323,7 @@ fn draw_new_request(
     edit: &Edit,
     profiles: &[crate::config::Profile],
     headers: &std::collections::HashMap<String, String>,
+    query: &std::collections::HashMap<String, String>,
     is_edit: bool,
     global: bool,
     error: Option<&str>,
@@ -388,6 +389,31 @@ fn draw_new_request(
     }
     lines.push(Line::raw(""));
 
+    // Query params, on the same terms as headers and drawn right after them
+    // because that is the order a request config lists them in.
+    lines.push(action_row(
+        "query params",
+        Color::DarkGray,
+        "Enter to edit",
+        focused == fields.len() + 2,
+    ));
+    if query.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "    none",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let mut sorted: Vec<(&String, &String)> = query.iter().collect();
+        sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (k, v) in sorted {
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {}: ", k), Style::default().fg(Color::Cyan)),
+                Span::styled(v.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+    lines.push(Line::raw(""));
+
     // Drawn even when empty, unlike before: it is a Tab stop now, and a row
     // that vanishes when there is nothing in it is one focus can land on
     // invisibly.
@@ -395,7 +421,7 @@ fn draw_new_request(
         "profiles",
         Color::DarkGray,
         "Enter to edit",
-        focused == fields.len() + 2,
+        focused == fields.len() + 3,
     ));
     if profiles.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -548,24 +574,29 @@ fn draw_new_profile(
     frame.render_widget(paragraph, area);
 }
 
-/// The draft's headers as name/value field pairs.
+/// The draft's headers or query params as name/value field pairs.
 /// focused: 2i = pairs[i].name, 2i+1 = pairs[i].value
-fn draw_edit_headers(
+///
+/// One renderer for both maps: `kind` supplies the title and the noun, and
+/// nothing else about the pane differs.
+fn draw_edit_pairs(
     frame: &mut Frame,
     area: Rect,
+    kind: PairKind,
     pairs: &[(String, String)],
     focused: usize,
     edit: &Edit,
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let noun = kind.noun();
 
     for (i, (name, value)) in pairs.iter().enumerate() {
         let name_focused = focused == 2 * i;
         let value_focused = focused == 2 * i + 1;
 
         lines.push(Line::from(Span::styled(
-            format!("  header {} name", i + 1),
+            format!("  {} {} name", noun, i + 1),
             Style::default()
                 .fg(if name_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
@@ -573,7 +604,7 @@ fn draw_edit_headers(
         lines.push(input_line(name, caret(name_focused, edit)));
 
         lines.push(Line::from(Span::styled(
-            format!("  header {} value", i + 1),
+            format!("  {} {} value", noun, i + 1),
             Style::default()
                 .fg(if value_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
@@ -584,7 +615,7 @@ fn draw_edit_headers(
 
     if pairs.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  No headers. Ctrl+a adds one.",
+            kind.empty_hint(),
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::raw(""));
@@ -599,7 +630,7 @@ fn draw_edit_headers(
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
-            .title(" Headers ")
+            .title(kind.title())
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
@@ -1023,6 +1054,13 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
+        // 75 columns, and it has to stay under 80 — a terminal that narrow
+        // truncates silently, hiding the tail rather than wrapping it. Adding
+        // `^q query` to the six entries this used to carry came to 87, so `^g
+        // global` gave up its slot: of the six it is the one that loses least,
+        // because the row it names renders its own state as `[ ] global` and
+        // Enter on it toggles, whereas the chords that open a pane are the ones
+        // worth advertising. Anything added here has to be measured first.
         Mode::NewRequest { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("save", Style::default().fg(Color::DarkGray)),
@@ -1030,22 +1068,24 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("fields", Style::default().fg(Color::DarkGray)),
             Span::styled("   ^e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("headers", Style::default().fg(Color::DarkGray)),
+            Span::styled("   ^q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("query", Style::default().fg(Color::DarkGray)),
             Span::styled("   ^p ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("profiles", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^g ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("global", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
-        Mode::EditHeaders { .. } => vec![
+        // The noun follows `kind`, so the pane never says "header" while
+        // editing query params.
+        Mode::EditPairs { kind, .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("apply", Style::default().fg(Color::DarkGray)),
             Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("fields", Style::default().fg(Color::DarkGray)),
             Span::styled("   ^a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("add header", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("add {}", kind.noun()), Style::default().fg(Color::DarkGray)),
             Span::styled("   ^d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("remove header", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("remove {}", kind.noun()), Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],

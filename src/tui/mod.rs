@@ -98,9 +98,16 @@ enum Mode {
         entry_name: String,
         global: bool,
     },
-    // The draft's headers as an editable key/value list.
+    // The draft's headers *or* query params as an editable key/value list.
     // focused: 2i = pairs[i].name, 2i+1 = pairs[i].value
-    EditHeaders {
+    //
+    // One mode for both because they are the same screen: two fields per row,
+    // the same Tab walk, the same add/remove chords, the same
+    // edits-live-in-the-draft-until-saved contract. `kind` names which map the
+    // rows come from and go back to, and is the only thing the handler and the
+    // renderer branch on — see `PairKind`.
+    EditPairs {
+        kind: PairKind,
         draft: RequestDraft,
         pairs: Vec<(String, String)>,
         focused: usize,
@@ -168,10 +175,10 @@ impl Mode {
         Mode::TestInput { entry_name, vars, iterations, focused: 0, edit }
     }
 
-    fn edit_headers(draft: RequestDraft) -> Self {
-        let pairs = header_pairs(&draft);
+    fn edit_pairs(kind: PairKind, draft: RequestDraft) -> Self {
+        let pairs = kind.pairs(&draft);
         let edit = Edit::at_end(pairs.first().map_or("", |(name, _)| name.as_str()));
-        Mode::EditHeaders { draft, pairs, focused: 0, edit, error: None }
+        Mode::EditPairs { kind, draft, pairs, focused: 0, edit, error: None }
     }
 
     fn new_profile(
@@ -185,19 +192,82 @@ impl Mode {
     }
 }
 
+/// Which of the draft's two name/value maps a `Mode::EditPairs` is editing.
+///
+/// The pane itself is one screen serving both. Everything that genuinely
+/// differs hangs off this enum rather than off a duplicated mode, handler, and
+/// renderer — which is the arrangement that would drift, since a fix to the
+/// caret handling or the add/remove chords would have to be made twice.
+///
+/// What differs is only: the words on screen, and the rules in `apply`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairKind {
+    Headers,
+    Query,
+}
+
+impl PairKind {
+    /// The pane title.
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            PairKind::Headers => " Headers ",
+            PairKind::Query => " Query params ",
+        }
+    }
+
+    /// The singular noun for a row, used in labels, hints, and errors.
+    pub(crate) fn noun(self) -> &'static str {
+        match self {
+            PairKind::Headers => "header",
+            PairKind::Query => "param",
+        }
+    }
+
+    /// What the pane says when there is nothing in it.
+    pub(crate) fn empty_hint(self) -> &'static str {
+        match self {
+            PairKind::Headers => "  No headers. Ctrl+a adds one.",
+            PairKind::Query => "  No query params. Ctrl+a adds one.",
+        }
+    }
+
+    /// The draft's current rows for this map, ordered.
+    fn pairs(self, draft: &RequestDraft) -> Vec<(String, String)> {
+        let map = match self {
+            PairKind::Headers => &draft.headers,
+            PairKind::Query => &draft.query,
+        };
+        // Sorted because a `HashMap` has no order of its own — without this the
+        // rows would shuffle every time the editor is opened.
+        let mut pairs: Vec<(String, String)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        pairs
+    }
+
+    /// Folds edited rows back into the draft, or refuses them by name.
+    fn apply(self, draft: &mut RequestDraft, pairs: Vec<(String, String)>) -> Result<(), String> {
+        match self {
+            PairKind::Headers => apply_headers(draft, pairs),
+            PairKind::Query => apply_query(draft, pairs),
+        }
+    }
+}
+
 /// What `RequestDraft::focused` is pointing at.
 ///
-/// Tab walks the four text fields and then three rows that are *actions* — the
-/// global flag, the headers pane, the profiles pane — so that everything the
-/// form can reach is reachable by walking it, with no chord to know in advance.
-/// Text and actions have to stay distinguishable because only the first has a
-/// caret: handing an action row to `edit::apply` would index `fields` out of
-/// range.
+/// Tab walks the four text fields and then four rows that are *actions* — the
+/// global flag, the headers pane, the query pane, the profiles pane — so that
+/// everything the form can reach is reachable by walking it, with no chord to
+/// know in advance. Text and actions have to stay distinguishable because only
+/// the first has a caret: handing an action row to `edit::apply` would index
+/// `fields` out of range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
     Field(usize),
     Global,
     Headers,
+    Query,
     Profiles,
 }
 
@@ -270,18 +340,24 @@ impl RequestDraft {
         &self.headers
     }
 
-    /// The number of Tab stops: the text fields, then the three action rows.
+    pub(crate) fn query(&self) -> &HashMap<String, String> {
+        &self.query
+    }
+
+    /// The number of Tab stops: the text fields, then the four action rows.
     pub(crate) fn rows(&self) -> usize {
-        self.fields.len() + 3
+        self.fields.len() + 4
     }
 
     /// What `focused` is pointing at. Anything past the last field is an action
-    /// row; the order here is the order they are drawn in.
+    /// row; the order here is the order they are drawn in, and headers sit
+    /// beside query because that is the order a request config lists them in.
     pub(crate) fn focus_target(&self) -> Focus {
         match self.focused.checked_sub(self.fields.len()) {
             None => Focus::Field(self.focused),
             Some(0) => Focus::Global,
             Some(1) => Focus::Headers,
+            Some(2) => Focus::Query,
             _ => Focus::Profiles,
         }
     }
@@ -1180,7 +1256,7 @@ impl App {
                     edit::insert_str(value, edit, &single_line());
                 }
             }
-            Mode::EditHeaders { pairs, focused, edit, error, .. } => {
+            Mode::EditPairs { pairs, focused, edit, error, .. } => {
                 *error = None;
                 if let Some(value) = pair_field(pairs, *focused) {
                     edit::insert_str(value, edit, &single_line());
@@ -1220,6 +1296,17 @@ impl App {
             return handlers::handle_key_filter(self, key);
         }
         if matches!(self.mode, Mode::Browse) {
+            // Browse binds bare letters and reads only the `KeyCode`, so a
+            // `Ctrl+<letter>` — which crossterm reports as `Char` plus a
+            // CONTROL modifier — would run the unmodified binding. That made
+            // `Ctrl+q` quit the TUI, which stopped being merely odd once
+            // `Ctrl+q` became "edit query params" one pane away: a chord worth
+            // learning must not end the session where it is not bound. Browse
+            // has no chords of its own, so refusing all of them here is the
+            // same central refusal `edit::apply` performs for form fields.
+            if key.modifiers.contains(event::KeyModifiers::CONTROL) {
+                return false;
+            }
             return handlers::handle_key_browse(self, key.code);
         }
         if matches!(self.mode, Mode::ProfileSelect { .. }) {
@@ -1237,8 +1324,8 @@ impl App {
         if matches!(self.mode, Mode::ImportCurl { .. }) {
             return handlers::handle_key_import_curl(self, key);
         }
-        if matches!(self.mode, Mode::EditHeaders { .. }) {
-            return handlers::handle_key_edit_headers(self, key);
+        if matches!(self.mode, Mode::EditPairs { .. }) {
+            return handlers::handle_key_edit_pairs(self, key);
         }
         if matches!(self.mode, Mode::ProfileList { .. }) {
             return handlers::handle_key_profile_list(self, key);
@@ -1350,21 +1437,42 @@ fn apply_headers(draft: &mut RequestDraft, pairs: Vec<(String, String)>) -> Resu
     Ok(())
 }
 
-/// The draft's headers as an ordered, editable list.
+/// Folds edited query rows back into a draft.
 ///
-/// Sorted because a `HashMap` has no order of its own — without this the rows
-/// would shuffle every time the editor is opened.
-fn header_pairs(draft: &RequestDraft) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = draft
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    pairs
+/// Rows with a blank name are dropped, as in `apply_headers`, so an
+/// added-then-abandoned row is not an error.
+///
+/// Duplicate names are refused **case-sensitively**, which is the one rule that
+/// genuinely differs from headers: HTTP header names are case-insensitive, so
+/// `Accept` and `accept` are one header, but a query string's keys are opaque
+/// bytes to the server and `page` and `Page` are two different params. Refusing
+/// case-insensitively here would reject a request that is perfectly legal to
+/// send. The refusal itself is still needed, because `query` is a `HashMap`:
+/// two rows with the same name cannot both survive, and silently keeping
+/// whichever landed last is the outcome this prevents. It is also why
+/// `from_curl` declines to lift a repeated key out of a URL.
+///
+/// Values are trimmed, as headers are. A query value gets URL-encoded on the
+/// way out, so a leading or trailing space would be sent as `%20` rather than
+/// ignored — which makes an accidental one a real, and invisible, bug.
+fn apply_query(draft: &mut RequestDraft, pairs: Vec<(String, String)>) -> Result<(), String> {
+    let mut kept: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if kept.iter().any(|(k, _): &(String, String)| k == &name) {
+            return Err(format!("Duplicate query param '{name}'"));
+        }
+        kept.push((name, value.trim().to_string()));
+    }
+
+    draft.query = kept.into_iter().collect();
+    Ok(())
 }
 
-/// The header row a `Mode::EditHeaders` focus index points at: `2i` is
+/// The row a `Mode::EditPairs` focus index points at: `2i` is
 /// `pairs[i]`'s name, `2i+1` its value. `None` once focus outruns the list,
 /// which a deleted row can leave it doing for one keystroke.
 fn pair_field(pairs: &mut [(String, String)], focused: usize) -> Option<&mut String> {
@@ -1714,6 +1822,138 @@ mod tests {
         let mut draft = RequestDraft::blank();
         apply_headers(&mut draft, pairs(&[("Content-Type", "text/plain")])).unwrap();
         assert_eq!(draft.headers.get("Content-Type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn query_params_are_replaced_wholesale_so_a_removed_row_is_gone() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        assert!(draft.query.contains_key("page"));
+
+        apply_query(&mut draft, pairs(&[("limit", "50")])).expect("valid");
+
+        assert_eq!(draft.query.len(), 1);
+        assert!(!draft.query.contains_key("page"), "removed row survived");
+        assert_eq!(draft.query.get("limit").unwrap(), "50");
+    }
+
+    #[test]
+    fn a_blank_query_name_is_dropped_rather_than_stored() {
+        let mut draft = RequestDraft::blank();
+        apply_query(&mut draft, pairs(&[("page", "2"), ("  ", "orphan"), ("", "")]))
+            .expect("blank rows are not an error");
+        assert_eq!(draft.query.len(), 1);
+    }
+
+    #[test]
+    fn query_names_and_values_are_trimmed() {
+        let mut draft = RequestDraft::blank();
+        apply_query(&mut draft, pairs(&[("  page  ", "  2  ")])).unwrap();
+        assert_eq!(draft.query.get("page").unwrap(), "2");
+    }
+
+    /// The one rule that differs from headers. A query key is opaque to the
+    /// server, so `page` and `Page` are two params and refusing them as a pair
+    /// would reject a request that is legal to send.
+    #[test]
+    fn query_names_differing_only_in_case_are_two_params() {
+        let mut draft = RequestDraft::blank();
+        apply_query(&mut draft, pairs(&[("page", "1"), ("Page", "2")]))
+            .expect("case makes these distinct");
+        assert_eq!(draft.query.len(), 2);
+        assert_eq!(draft.query.get("page").unwrap(), "1");
+        assert_eq!(draft.query.get("Page").unwrap(), "2");
+    }
+
+    /// An exact repeat still has to be refused: `query` is a `HashMap`, so one
+    /// of the two would vanish silently.
+    #[test]
+    fn an_exactly_duplicated_query_name_is_refused() {
+        let mut draft = RequestDraft::blank();
+        let err = apply_query(&mut draft, pairs(&[("page", "1"), ("page", "2")]))
+            .expect_err("same param twice");
+        assert!(err.contains("page"), "the error names the param: {err}");
+        assert!(draft.query.is_empty(), "nothing applied on refusal");
+    }
+
+    /// `Content-Type` is a header rule and must not leak into query handling —
+    /// a param that happens to be named that is just a param.
+    #[test]
+    fn a_content_type_query_param_is_left_alone() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        let before = draft.body.as_ref().unwrap().content_type.clone();
+
+        apply_query(&mut draft, pairs(&[("Content-Type", "text/plain")])).unwrap();
+
+        assert_eq!(draft.query.get("Content-Type").unwrap(), "text/plain");
+        assert_eq!(draft.body.as_ref().unwrap().content_type, before, "body was touched");
+    }
+
+    /// Editing one map must not disturb the other; they are separate rows on
+    /// the form and separate keys in the config.
+    #[test]
+    fn editing_query_leaves_headers_untouched_and_the_reverse() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+
+        apply_query(&mut draft, pairs(&[("limit", "50")])).unwrap();
+        assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
+
+        apply_headers(&mut draft, pairs(&[("Accept", "text/plain")])).unwrap();
+        assert_eq!(draft.query.get("limit").unwrap(), "50");
+    }
+
+    /// Both kinds read and write their own map through `PairKind`, which is
+    /// what lets one pane serve both.
+    #[test]
+    fn each_kind_reads_and_writes_its_own_map() {
+        let draft = RequestDraft::from_config(full_config(), None, false);
+        assert_eq!(PairKind::Headers.pairs(&draft), pairs(&[("Accept", "application/json")]));
+        assert_eq!(PairKind::Query.pairs(&draft), pairs(&[("page", "2")]));
+
+        let mut draft = draft;
+        PairKind::Query.apply(&mut draft, pairs(&[("q", "x")])).unwrap();
+        assert_eq!(draft.query.get("q").unwrap(), "x");
+        assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
+    }
+
+    /// Rows are sorted, because a `HashMap` has none of its own and unsorted
+    /// rows would shuffle between openings of the pane.
+    #[test]
+    fn rows_come_back_in_a_stable_order() {
+        let mut draft = RequestDraft::blank();
+        apply_query(&mut draft, pairs(&[("zeta", "1"), ("alpha", "2"), ("mid", "3")])).unwrap();
+        let names: Vec<String> =
+            PairKind::Query.pairs(&draft).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    /// Tab has to reach every action row. Query was added between headers and
+    /// profiles, so the walk is four fields then four rows.
+    #[test]
+    fn tab_walks_every_field_and_action_row() {
+        let draft = RequestDraft::blank();
+        assert_eq!(draft.rows(), draft.fields.len() + 4);
+
+        let targets: Vec<Focus> = (0..draft.rows())
+            .map(|i| {
+                let mut d = draft.clone();
+                d.focused = i;
+                d.focus_target()
+            })
+            .collect();
+
+        assert_eq!(
+            targets,
+            vec![
+                Focus::Field(0),
+                Focus::Field(1),
+                Focus::Field(2),
+                Focus::Field(3),
+                Focus::Global,
+                Focus::Headers,
+                Focus::Query,
+                Focus::Profiles,
+            ]
+        );
     }
 
     const BODY: &str = "alpha\nBETA line\ngamma\nbeta again\ndelta";
