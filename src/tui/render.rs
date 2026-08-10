@@ -102,8 +102,18 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([
+            Constraint::Percentage(app.split_pct),
+            Constraint::Percentage(100 - app.split_pct),
+        ])
         .split(outer[0]);
+
+    // Hand the divider's drawn position back to the mouse handler. Recording it
+    // here is what keeps the hit test honest across a resize: the next click is
+    // tested against the frame the user is actually looking at, not against a
+    // percentage re-solved at a width that may have changed since.
+    app.split_x = panes[1].x;
+    app.term_width = full.width;
 
     let filtered = app.filtered_indices();
     let tree_rows_storage: Option<Vec<VisibleRow>> = if app.using_tree() {

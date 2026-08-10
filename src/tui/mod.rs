@@ -9,14 +9,15 @@ use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, bui
 use anyhow::Result;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEvent,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyEvent, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 use std::{collections::{HashMap, HashSet}, fs, io};
-use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig};
+use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig, UserConfig, MAX_SPLIT_PCT, MIN_SPLIT_PCT};
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
 
@@ -323,6 +324,42 @@ struct App {
     // changing under a half-typed field would be worse than not reloading it.
     keys: Keys,
     mode: Mode,
+    // ── The draggable split ──
+    // The list pane's share of the width, seeded from `layout.split_pct` and
+    // then moved by dragging. A drag is not written back to the file: the
+    // config is the width a session *starts* at, and a drag to read one long
+    // response should not silently become the permanent setting.
+    split_pct: u16,
+    // Where the divider was actually drawn on the last frame, and the width it
+    // was drawn against. Recorded by `render::draw` rather than recomputed here,
+    // because a click has to be tested against the geometry the user is looking
+    // at — re-deriving it from `split_pct` would repeat the layout solver's
+    // rounding and land a column off on some widths.
+    split_x: u16,
+    term_width: u16,
+    dragging_split: bool,
+}
+
+/// How far either side of the divider still counts as grabbing it. The divider
+/// is two adjacent border columns (the list's right, the detail's left), so a
+/// pixel-exact hit test would make it a one-column target on a mouse that
+/// reports whole cells.
+const DIVIDER_GRAB: u16 = 1;
+
+/// The `split_pct` that puts the divider under `column` on a terminal `total`
+/// columns wide, clamped to the pane bounds. `None` when there is no width to
+/// divide — before the first frame, `App::term_width` is still 0.
+///
+/// The divider is drawn at the right pane's first column, so the left pane is
+/// exactly `column` columns wide: this is the inverse of the layout solver, and
+/// rounds to nearest so the divider tracks the pointer rather than trailing it.
+fn split_pct_at(column: u16, total: u16) -> Option<u16> {
+    if total == 0 {
+        return None;
+    }
+    let total = u32::from(total);
+    let pct = (u32::from(column) * 100 + total / 2) / total;
+    Some((pct as u16).clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT))
 }
 
 impl App {
@@ -340,9 +377,12 @@ impl App {
         // A broken user config opens the TUI on the message and runs on
         // defaults, rather than either refusing to start over a preference or
         // silently ignoring a keymap someone is waiting to see work.
-        let (keys, mode) = match Keys::load() {
-            Ok(keys) => (keys, Mode::Browse),
-            Err(e) => (Keys::default(), Mode::message(ResponseKind::Error, format!("Config: {e:#}"))),
+        let (config, mode) = match UserConfig::load() {
+            Ok(config) => (config, Mode::Browse),
+            Err(e) => (
+                UserConfig::defaults(),
+                Mode::message(ResponseKind::Error, format!("Config: {e:#}")),
+            ),
         };
         Ok(Self {
             entries,
@@ -355,9 +395,44 @@ impl App {
             filter: String::new(),
             filter_active: false,
             show_help: false,
-            keys,
+            keys: config.keys,
             mode,
+            split_pct: config.split_pct,
+            split_x: 0,
+            term_width: 0,
+            dragging_split: false,
         })
+    }
+
+    // ─── Mouse ────────────────────────────────────────────────────────────────
+
+    /// The mouse does one thing: drag the divider between the two panes.
+    ///
+    /// It is deliberately mode-independent — both panes are drawn in every mode,
+    /// so widening the detail pane to read a response works the same as widening
+    /// it to fill in a form, and a drag never has to be a keystroke some mode
+    /// would rather have as text.
+    fn handle_mouse(&mut self, ev: MouseEvent) {
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.dragging_split = self.split_x.abs_diff(ev.column) <= DIVIDER_GRAB;
+            }
+            // The button state in a drag event is the button that started it, so
+            // this cannot fire from a right-drag that began elsewhere.
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
+                self.set_split_at(ev.column);
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.dragging_split = false,
+            _ => {}
+        }
+    }
+
+    /// Puts the divider under `column`, leaving it where it is if the terminal
+    /// width has not been recorded yet (no frame drawn, so no divider to grab).
+    fn set_split_at(&mut self, column: u16) {
+        if let Some(pct) = split_pct_at(column, self.term_width) {
+            self.split_pct = pct;
+        }
     }
 
     fn using_tree(&self) -> bool {
@@ -1191,14 +1266,25 @@ pub fn run() -> Result<()> {
     // Bracketed paste makes a multi-line paste arrive as one event instead of a
     // stream of keystrokes with Enters in it. It must be turned back off on
     // every exit path, or the terminal keeps emitting paste markers.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    //
+    // Mouse capture is what makes the pane divider draggable, and it costs the
+    // terminal's own click-drag text selection while ichigo is up — most
+    // terminals give that back under Shift (Option on macOS). The response
+    // pane's `V`/`y` copy does not depend on it either way. It has the same
+    // must-be-disabled-on-exit obligation as bracketed paste.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     result
@@ -1217,6 +1303,7 @@ fn event_loop(
                 }
             }
             Event::Paste(text) => app.handle_paste(&text),
+            Event::Mouse(mouse) => app.handle_mouse(mouse),
             _ => {}
         }
     }
@@ -1468,6 +1555,31 @@ mod tests {
         let names = chain_var_names(&[s1, s2]);
         // Only the truly user-supplied variable remains, listed once.
         assert_eq!(names, vec!["USER_ID".to_string()]);
+    }
+
+    /// The percentage has to be the inverse of the layout solver, or the
+    /// divider steps away from the pointer on the first drag event.
+    #[test]
+    fn a_drag_puts_the_divider_under_the_pointer() {
+        assert_eq!(split_pct_at(40, 100), Some(40));
+        assert_eq!(split_pct_at(60, 120), Some(50));
+        // Rounds to nearest rather than truncating: 28/80 is 35%, not 34%.
+        assert_eq!(split_pct_at(28, 80), Some(35));
+    }
+
+    #[test]
+    fn a_drag_past_the_edge_stops_at_the_bounds() {
+        assert_eq!(split_pct_at(0, 100), Some(MIN_SPLIT_PCT));
+        assert_eq!(split_pct_at(100, 100), Some(MAX_SPLIT_PCT));
+        // A drag off the right edge reports a column past the width.
+        assert_eq!(split_pct_at(400, 100), Some(MAX_SPLIT_PCT));
+    }
+
+    /// Before the first frame there is no width recorded, and no divider drawn
+    /// to have been grabbed — dividing by it would panic.
+    #[test]
+    fn a_drag_with_no_frame_drawn_yet_is_ignored() {
+        assert_eq!(split_pct_at(10, 0), None);
     }
 
     fn full_config() -> RequestConfig {
