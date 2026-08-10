@@ -209,6 +209,11 @@ The hint line at the bottom of the screen carries only the handful of keys you
 reach for most; press `?` for the full keymap, grouped by what it does. Any key
 dismisses it.
 
+**Resizing the panes.** Drag the divider between the list and the detail pane
+with the mouse; it works in every mode, so you can widen the detail pane while a
+response or a form is up. The width a session *starts* at is
+[`layout.split_pct`](#layoutsplit_pct) — a drag is not saved back to it.
+
 The TUI is meant to be left open. Every run and load test re-reads the config file from disk first, so edits you make in another terminal — rotating a token in a profile, adding a header, changing a URL — take effect on the next run with no restart. Press `R` when you have created, renamed, or deleted config *files* on disk and want them to show up in the list.
 
 #### Editing text fields
@@ -456,18 +461,21 @@ about how *you* type rather than about a project.
 
 ### All options
 
-Every option ichigo currently understands. There is exactly one so far; the
-table is the reference as the list grows.
+Every option ichigo currently understands.
 
 | Option | Type | Default | What it does |
 | ------ | ---- | ------- | ------------ |
 | `keys.insert_escape` | string, exactly two characters | unset — `Esc` only | A two-key sequence that leaves insert mode in a TUI text field, the equivalent of vim's `inoremap jk <Esc>`. See [Editing text fields](#editing-text-fields). |
+| `layout.split_pct` | integer, 15–85 | `35` | The request list's share of the TUI width, as a percentage. The rest goes to the detail pane. |
 
 A complete file, with every option set:
 
 ```toml
 [keys]
 insert_escape = "jk"
+
+[layout]
+split_pct = 35
 ```
 
 Any option you leave out keeps its default, and an empty file — or no file at
@@ -482,6 +490,33 @@ un-typed when the second completes the sequence within a second — so `j`, a
 pause to think, then `k` leaves you with a literal `jk`, the same as vim's
 `timeoutlen`. Typing `jk` quickly *does* escape, which is why the usual advice
 is to pick a digraph you never type.
+
+### `layout.split_pct`
+
+The TUI is two panes: the request list on the left, everything else on the
+right. `split_pct` is the list's share of the width, so a smaller number gives
+more room to responses and forms:
+
+```toml
+[layout]
+split_pct = 25   # a narrow list, a wide detail pane
+```
+
+It is a percentage rather than a column count, so the same file means the same
+layout on a laptop and on a wide monitor, and the ratio holds when you resize
+the terminal. Values outside 15–85 are refused rather than quietly clamped —
+below that either pane has room for little more than its own borders.
+
+You can also **drag the divider with the mouse** at any time, in any mode. That
+is a per-session adjustment: it starts from `split_pct` and is not written back
+to the file, so widening the detail pane to read one long response does not
+silently become your permanent setting. Set the option for the layout you want
+every session to open with, and drag when a particular response needs the room.
+
+Because the TUI captures the mouse to do this, your terminal's own click-drag
+text selection is unavailable while ichigo is running. Most terminals still give
+it to you with **Shift** held down (**Option** on macOS), and the response
+pane's own `V`/`y` copy works regardless.
 
 ### When the file is wrong
 
