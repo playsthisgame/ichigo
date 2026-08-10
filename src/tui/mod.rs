@@ -184,6 +184,22 @@ impl Mode {
     }
 }
 
+/// What `RequestDraft::focused` is pointing at.
+///
+/// Tab walks the four text fields and then three rows that are *actions* — the
+/// global flag, the headers pane, the profiles pane — so that everything the
+/// form can reach is reachable by walking it, with no chord to know in advance.
+/// Text and actions have to stay distinguishable because only the first has a
+/// caret: handing an action row to `edit::apply` would index `fields` out of
+/// range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Focus {
+    Field(usize),
+    Global,
+    Headers,
+    Profiles,
+}
+
 /// The request being created or edited in `NewRequest`.
 ///
 /// The form edits four fields; a config has more. The rest live here rather
@@ -194,10 +210,13 @@ impl Mode {
 pub(crate) struct RequestDraft {
     // (label, value): name, method, url, description
     pub(crate) fields: Vec<(String, String)>,
+    // Indexes the text fields first, then the three action rows. Read it
+    // through `focus_target` rather than comparing it to `fields.len()`.
     pub(crate) focused: usize,
-    // The caret in `fields[focused]`. Travels with the draft so a trip through
-    // the headers or profiles pane comes back to the same spot in the same
-    // field.
+    // The caret in `fields[focused]`, and stale while an action row has focus —
+    // nothing reads it there, because no field's index can match. Travels with
+    // the draft so a trip through the headers or profiles pane comes back to
+    // the same spot in the same field.
     edit: Edit,
     pub(crate) profiles: Vec<crate::config::Profile>,
     // Some(name) when editing an existing request; None when creating one.
@@ -250,14 +269,34 @@ impl RequestDraft {
         &self.headers
     }
 
+    /// The number of Tab stops: the text fields, then the three action rows.
+    pub(crate) fn rows(&self) -> usize {
+        self.fields.len() + 3
+    }
+
+    /// What `focused` is pointing at. Anything past the last field is an action
+    /// row; the order here is the order they are drawn in.
+    pub(crate) fn focus_target(&self) -> Focus {
+        match self.focused.checked_sub(self.fields.len()) {
+            None => Focus::Field(self.focused),
+            Some(0) => Focus::Global,
+            Some(1) => Focus::Headers,
+            _ => Focus::Profiles,
+        }
+    }
+
     /// Moves focus and puts the caret at the end of the field it lands on.
     ///
     /// The draft keeps one caret for whichever field has focus, so every focus
     /// change has to re-anchor it — otherwise Tab carries an offset from the
-    /// previous field into a shorter one.
+    /// previous field into a shorter one. An action row has no field to anchor
+    /// to, so it leaves the caret alone; nothing reads it there, and Tabbing
+    /// back onto a field re-anchors it anyway.
     fn focus(&mut self, idx: usize) {
         self.focused = idx;
-        self.edit = Edit::at_end(&self.fields[idx].1);
+        if let Some((_, value)) = self.fields.get(idx) {
+            self.edit = Edit::at_end(value);
+        }
     }
 }
 
@@ -876,39 +915,6 @@ impl App {
             Ok(config) => {
                 let draft = RequestDraft::from_config(config, Some(name), global);
                 self.mode = Mode::NewRequest { draft, error: None };
-            }
-            Err(e) => self.show_error(e),
-        }
-    }
-
-    /// Opens the selected request's headers for editing.
-    ///
-    /// Exists alongside the request form's `Ctrl+e` because a plain key in
-    /// Browse is the one binding no terminal or multiplexer can intercept.
-    /// Re-reads from disk like every other action path.
-    fn edit_headers_selected(&mut self) {
-        let Some((name, global)) = self.selected_request() else { return };
-        match RequestConfig::load(&name) {
-            Ok(config) => {
-                let draft = RequestDraft::from_config(config, Some(name), global);
-                self.mode = Mode::edit_headers(draft);
-            }
-            Err(e) => self.show_error(e),
-        }
-    }
-
-    /// Opens the selected request's profiles for editing.
-    ///
-    /// Re-reads from disk like every other action path: the profile params fed
-    /// back into the draft are what gets written on save, so a stale snapshot
-    /// here would quietly revert a token rotated in another terminal.
-    fn edit_profiles_selected(&mut self) {
-        let Some((name, global)) = self.selected_request() else { return };
-        match RequestConfig::load(&name) {
-            Ok(config) => {
-                let draft = RequestDraft::from_config(config, Some(name), global);
-                // 0 is the first profile, or the "new" row when there are none.
-                self.mode = Mode::ProfileList { draft, selected: 0 };
             }
             Err(e) => self.show_error(e),
         }

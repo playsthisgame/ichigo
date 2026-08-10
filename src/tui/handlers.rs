@@ -3,21 +3,23 @@ use std::collections::HashMap;
 use std::fs;
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
 use super::edit::{self, Applied, Edit};
-use super::{App, Mode, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field};
+use super::{App, Focus, Mode, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field};
 use super::tree::{VisibleRow, visible_rows, build_tree, load_entries};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
+        // Tab covers the action rows too, so global/headers/profiles are found
+        // by walking the form rather than by knowing a chord.
         KeyCode::Tab => {
             if let Mode::NewRequest { draft, .. } = &mut app.mode {
-                let next = (draft.focused + 1) % draft.fields.len();
+                let next = (draft.focused + 1) % draft.rows();
                 draft.focus(next);
             }
         }
         KeyCode::BackTab => {
             if let Mode::NewRequest { draft, .. } = &mut app.mode {
-                let len = draft.fields.len();
-                let prev = draft.focused.checked_sub(1).unwrap_or(len - 1);
+                let rows = draft.rows();
+                let prev = draft.focused.checked_sub(1).unwrap_or(rows - 1);
                 draft.focus(prev);
             }
         }
@@ -49,8 +51,34 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                 app.mode = Mode::edit_headers(draft.clone());
             }
         }
+        // Enter saves from a text field and does the row's thing on an action
+        // row. Two meanings for one key, but the row under focus says which,
+        // and a form whose only Enter saved would leave the action rows inert.
         KeyCode::Enter => {
-            app.save_new_request();
+            let target = match &app.mode {
+                Mode::NewRequest { draft, .. } => draft.focus_target(),
+                _ => return false,
+            };
+            match target {
+                Focus::Field(_) => app.save_new_request(),
+                Focus::Global => {
+                    if let Mode::NewRequest { draft, .. } = &mut app.mode {
+                        draft.global = !draft.global;
+                    }
+                }
+                // Cloned out first: the new mode owns the draft, so it cannot
+                // be built while `app.mode` is still borrowed.
+                Focus::Headers | Focus::Profiles => {
+                    let Mode::NewRequest { draft, .. } = &app.mode else { return false };
+                    let draft = draft.clone();
+                    app.mode = if target == Focus::Headers {
+                        Mode::edit_headers(draft)
+                    } else {
+                        // 0 is the first profile, or the "new" row when empty.
+                        Mode::ProfileList { draft, selected: 0 }
+                    };
+                }
+            }
         }
         // Everything else is text editing in the focused field. `edit::apply`
         // owns the Char/Backspace/motion arms, including refusing Ctrl+<letter>
@@ -62,11 +90,18 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
             let keys = app.keys;
             let mut leaving = false;
             if let Mode::NewRequest { draft, error } = &mut app.mode {
-                let focused = draft.focused;
-                match edit::apply(&mut draft.fields[focused].1, &mut draft.edit, key, keys) {
-                    Applied::Yes => *error = None,
-                    Applied::Exit => leaving = true,
-                    Applied::No => {}
+                match draft.focus_target() {
+                    Focus::Field(i) => {
+                        match edit::apply(&mut draft.fields[i].1, &mut draft.edit, key, keys) {
+                            Applied::Yes => *error = None,
+                            Applied::Exit => leaving = true,
+                            Applied::No => {}
+                        }
+                    }
+                    // No text under the caret, so no insert mode to drop out of
+                    // first: one Esc leaves the form here, where a field takes
+                    // two. Every other key is inert rather than typed.
+                    _ => leaving = key.code == KeyCode::Esc,
                 }
             }
             if leaving {
@@ -386,8 +421,10 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('e') => app.edit_selected(),
         KeyCode::Char('c') => app.clone_selected(),
-        KeyCode::Char('p') => app.edit_profiles_selected(),
-        KeyCode::Char('h') => app.edit_headers_selected(),
+        // Headers and profiles are deliberately *not* bound here. They are
+        // parts of a request, not things to do to one, so they are reached by
+        // Tabbing to their row inside the form — one door instead of two, and
+        // no way to edit a request's headers without seeing the request.
         KeyCode::Char('d') => {
             let Some(idx) = app.selected_entry_index() else { return false };
             let entry = &app.entries[idx];

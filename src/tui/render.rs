@@ -57,6 +57,34 @@ fn caret(is_focused: bool, edit: &Edit) -> Option<&Edit> {
     is_focused.then_some(edit)
 }
 
+/// One of the request form's three action rows — global, headers, profiles.
+///
+/// These are Tab stops with no text in them, so focus cannot be a caret. It is
+/// the `▸` marker plus the label going green, matching the way a focused
+/// field's label above already goes green. The hint only appears on the focused
+/// row: three permanent hints read as clutter, one reads as an instruction.
+fn action_row(label: &str, color: Color, hint: &str, is_focused: bool) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(
+            if is_focused { "▸ " } else { "  " },
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(if is_focused { Color::Green } else { color })
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if is_focused {
+        spans.push(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// A `  > value` input row, dimmed unless it is the one holding the caret.
 fn input_line(value: &str, caret: Option<&Edit>) -> Line<'static> {
     let color = if caret.is_some() { Color::White } else { Color::DarkGray };
@@ -310,27 +338,29 @@ fn draw_new_request(
         lines.push(Line::raw(""));
     }
 
+    // The three rows Tab reaches after the last field. Their state is on the
+    // row itself, so focus is the marker and the colour rather than a caret.
     let (global_check, global_color) = if global {
         ("[x] global", Color::Cyan)
     } else {
         ("[ ] global", Color::DarkGray)
     };
-    lines.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(global_check, Style::default().fg(global_color).add_modifier(Modifier::BOLD)),
-        Span::styled("  Ctrl+g to toggle", Style::default().fg(Color::DarkGray)),
-    ]));
+    lines.push(action_row(
+        global_check,
+        global_color,
+        "Enter to toggle",
+        focused == fields.len(),
+    ));
     lines.push(Line::raw(""));
 
     // Headers are edited in their own pane, but shown here so the form is not
     // silent about a part of the request it carries.
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  headers",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  Ctrl+e to edit", Style::default().fg(Color::DarkGray)),
-    ]));
+    lines.push(action_row(
+        "headers",
+        Color::DarkGray,
+        "Enter to edit",
+        focused == fields.len() + 1,
+    ));
     if headers.is_empty() {
         lines.push(Line::from(Span::styled(
             "    none",
@@ -348,11 +378,21 @@ fn draw_new_request(
     }
     lines.push(Line::raw(""));
 
-    if !profiles.is_empty() {
+    // Drawn even when empty, unlike before: it is a Tab stop now, and a row
+    // that vanishes when there is nothing in it is one focus can land on
+    // invisibly.
+    lines.push(action_row(
+        "profiles",
+        Color::DarkGray,
+        "Enter to edit",
+        focused == fields.len() + 2,
+    ));
+    if profiles.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  profiles",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD),
+            "    none",
+            Style::default().fg(Color::DarkGray),
         )));
+    } else {
         for profile in profiles {
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default()),
@@ -365,8 +405,8 @@ fn draw_new_request(
                 ]));
             }
         }
-        lines.push(Line::raw(""));
     }
+    lines.push(Line::raw(""));
 
     if let Some(err) = error {
         lines.push(Line::from(Span::styled(
@@ -922,7 +962,9 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
     let spans: Vec<Span<'static>> = match mode {
         // Deliberately short. The full keymap lives behind `?`; listing all
         // fifteen bindings here ran to 155 columns, which an 80-column terminal
-        // truncates without a mark, hiding the last five outright.
+        // truncates without a mark, hiding the last five outright. These seven
+        // come to 61, so there is room but not much — measure before adding an
+        // eighth, and put it in `HELP_COLUMNS` instead if it does not fit.
         Mode::Browse => vec![
             Span::styled(" r ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("run", Style::default().fg(Color::DarkGray)),
@@ -930,6 +972,8 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("test", Style::default().fg(Color::DarkGray)),
             Span::styled("   n ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("new", Style::default().fg(Color::DarkGray)),
+            Span::styled("   e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("edit", Style::default().fg(Color::DarkGray)),
             Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("filter", Style::default().fg(Color::DarkGray)),
             Span::styled("   ? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
@@ -1081,8 +1125,6 @@ const HELP_COLUMNS: [(&str, &[(&str, &str)]); 3] = [
         &[
             ("n", "new"),
             ("e", "edit"),
-            ("h", "headers"),
-            ("p", "profiles"),
             ("c", "clone"),
             ("d", "delete"),
             ("R", "refresh"),
