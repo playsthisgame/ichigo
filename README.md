@@ -1,5 +1,11 @@
 # 🍓 ichigo 🍓
 
+[![CI](https://github.com/playsthisgame/ichigo/actions/workflows/ci.yml/badge.svg)](https://github.com/playsthisgame/ichigo/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/ichigo.svg)](https://crates.io/crates/ichigo)
+[![downloads](https://img.shields.io/crates/d/ichigo.svg)](https://crates.io/crates/ichigo)
+[![license](https://img.shields.io/crates/l/ichigo.svg)](https://github.com/playsthisgame/ichigo/blob/main/LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.91-blue.svg)](https://github.com/playsthisgame/ichigo/blob/main/Cargo.toml)
+
 A CLI HTTP client. Store named request configs in your project or globally, then run them by name.
 
 ![ichigo TUI](https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.png)
@@ -194,8 +200,6 @@ Keybindings:
 | `y` | Copy selected request as a cURL command |
 | `i` | Import a pasted cURL command as a new request |
 | `n` / `e` / `c` | New / edit / clone a request |
-| `h` | Edit the selected request's headers |
-| `p` | Edit the selected request's profiles |
 | `d` | Delete selected request |
 | `R` | Refresh the config list from disk |
 | `q` | Quit |
@@ -367,9 +371,31 @@ ichigo test create-user --iter 50 --profile staging
 
 Any `{{PLACEHOLDER}}` not covered by the chosen profile is still resolved from `--var` flags or environment variables as normal. In the TUI, a profile picker appears automatically when profiles are present — pick one (or skip) and fill in any remaining variables interactively.
 
+#### The request form
+
+`n` opens a blank request form and `e` opens the selected one. Tab and
+Shift-Tab walk it, and the walk covers more than the four text fields:
+
+| Row | Enter does |
+| --- | ---------- |
+| `name`, `method`, `url`, `description` | Save the request |
+| `[ ] global` | Toggle between `.ichigo/` and `~/.config/ichigo/` |
+| `headers` | Open the headers pane |
+| `profiles` | Open the profiles pane |
+
+So every part of a request is reachable by tabbing through the form — there is
+no chord to know in advance. `Ctrl+g`, `Ctrl+e`, and `Ctrl+p` still jump
+straight to those three from anywhere in the form.
+
+The four text fields are editors (see [Editing text fields](#editing-text-fields)),
+which is why Esc takes two presses there — the first leaves insert mode, the
+second leaves the form. On the three rows below them there is no text to edit,
+so one Esc leaves.
+
 #### Editing headers in the TUI
 
-Press `h` on a request, or `Ctrl+e` while editing one, to edit its headers:
+Tab to `headers` in the request form and press Enter, or press `Ctrl+e` from
+anywhere in the form:
 
 | Key | Action |
 | --- | ------ |
@@ -381,8 +407,8 @@ Press `h` on a request, or `Ctrl+e` while editing one, to edit its headers:
 
 > `Ctrl+h` also works, but only in terminals that send it. Many terminals, tmux
 > configs, and shells bind Ctrl+H to backward-delete-char and send a plain
-> Backspace instead, in which case the key just deletes a character. `h` from
-> the request list is the binding nothing can intercept.
+> Backspace instead, in which case the key just deletes a character. Tab to the
+> `headers` row and press Enter if you want the path nothing can intercept.
 
 Applying only updates the request in memory — Enter on the request form is what
 writes the file, so Esc out of that form drops the header changes too.
@@ -396,7 +422,8 @@ on the wire twice.
 
 #### Editing profiles in the TUI
 
-Press `p` on a request to manage its profiles without leaving the TUI:
+Tab to `profiles` in the request form and press Enter, or press `Ctrl+p` from
+anywhere in the form:
 
 | Key | Action |
 | --- | ------ |

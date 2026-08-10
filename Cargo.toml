@@ -1,13 +1,25 @@
 [package]
 name = "ichigo"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "A CLI HTTP client — store named request configs in your project or globally, then run them by name or through the TUI"
 license = "MIT"
+# Found by bisecting real toolchains, not by reading the edition. Edition 2024
+# floors at 1.85 and the let-chains want 1.88, but `Duration::from_mins` in
+# src/utils.rs was unstable until 1.91 — 1.90 fails to compile. Anything that
+# lowers this has to be re-bisected; anything that raises it is a breaking
+# change for someone on an older toolchain.
+rust-version = "1.91"
 repository = "https://github.com/playsthisgame/ichigo"
 homepage = "https://github.com/playsthisgame/ichigo"
 keywords = ["http", "cli", "rest", "client", "requests"]
 categories = ["command-line-utilities", "web-programming::http-client"]
+# An allowlist, because the default is "everything git does not ignore" — which
+# swept `.claude/`, `.melon/`, `openspec/`, and a 347 KB screenshot into the
+# 0.3.0 tarball and made it 503 KB. Nothing here is needed to build the crate,
+# so anything added to it should be. The README's one image is an absolute
+# raw.githubusercontent URL, so it renders on crates.io without `assets/`.
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [[bin]]
 name = "ichigo"
