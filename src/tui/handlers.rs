@@ -326,6 +326,22 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
                 *edit = Edit::default();
             }
         }
+        // The counterpart to `Ctrl+a`, and the same chord `EditPairs` uses to
+        // drop a row. Inert on the name field, which is not a param and is the
+        // one row a profile cannot do without.
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::NewProfile { name, params, focused, edit, error, .. } = &mut app.mode
+                && let Some(idx) = focused.checked_sub(1).map(|offset| offset / 2)
+                && idx < params.len()
+            {
+                params.remove(idx);
+                // The list just got shorter; keep focus on a field that still
+                // exists (the name row when the last param is gone).
+                *focused = (*focused).min(2 * params.len());
+                *edit = caret_for(profile_field(name, params, *focused));
+                *error = None;
+            }
+        }
         KeyCode::Enter => {
             app.save_new_profile();
         }
