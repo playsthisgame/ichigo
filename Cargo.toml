@@ -17,8 +17,11 @@ categories = ["command-line-utilities", "web-programming::http-client"]
 # An allowlist, because the default is "everything git does not ignore" — which
 # swept `.claude/`, `.melon/`, `openspec/`, and a 347 KB screenshot into the
 # 0.3.0 tarball and made it 503 KB. Nothing here is needed to build the crate,
-# so anything added to it should be. The README's one image is an absolute
-# raw.githubusercontent URL, so it renders on crates.io without `assets/`.
+# so anything added to it should be. That is also what keeps `assets/` — now a
+# demo video as well as the screenshot — off the tarball entirely: the README
+# points at both by absolute raw.githubusercontent URL, so they render from
+# GitHub and weigh nothing here. Adding `assets/**` would put a video in every
+# `cargo install`.
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE"]
 
 [[bin]]
