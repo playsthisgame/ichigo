@@ -8,11 +8,9 @@
 
 A CLI HTTP client. Store named request configs in your project or globally, then run them by name.
 
-<video src="https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.mp4"
-       poster="https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.png"
-       controls muted loop playsinline width="100%">
-  <img src="https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.png" alt="ichigo TUI">
-</video>
+[![ichigo TUI](https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.gif)](https://github.com/playsthisgame/ichigo/blob/main/assets/demo.mp4)
+
+*(click for the full-resolution video)*
 
 ## Installation
 
