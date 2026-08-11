@@ -6,11 +6,9 @@
 [![license](https://img.shields.io/crates/l/ichigo.svg)](https://github.com/playsthisgame/ichigo/blob/main/LICENSE)
 [![MSRV](https://img.shields.io/badge/MSRV-1.91-blue.svg)](https://github.com/playsthisgame/ichigo/blob/main/Cargo.toml)
 
-A CLI HTTP client. Store named request configs in your project or globally, then run them by name.
+A terminal HTTP client. Keep named request configs in your project or globally, then run them by name from the shell or open the TUI to browse, edit, and load-test them.
 
 [![ichigo TUI](https://raw.githubusercontent.com/playsthisgame/ichigo/main/assets/demo.gif)](https://github.com/playsthisgame/ichigo/blob/main/assets/demo.mp4)
-
-*(click for the full-resolution video)*
 
 ## Installation
 
