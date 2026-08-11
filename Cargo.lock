@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "ichigo"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "basic-toml",
