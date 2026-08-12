@@ -17,10 +17,20 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
 use ratatui_image::{
-    picker::{Picker, ProtocolType},
+    picker::{
+        cap_parser::{Parser, QueryStdioOptions, Response},
+        Picker, ProtocolType,
+    },
     protocol::StatefulProtocol,
 };
-use std::{collections::{HashMap, HashSet}, fs, io, io::IsTerminal};
+use std::{
+    collections::{HashMap, HashSet},
+    fs, io,
+    io::{IsTerminal, Read, Write},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig, UserConfig, MAX_SPLIT_PCT, MIN_SPLIT_PCT};
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
@@ -504,12 +514,126 @@ fn split_pct_at(column: u16, total: u16) -> Option<u16> {
 /// fallback and would render *something* in any terminal, but a quarter-scale
 /// mosaic of colour blocks sitting in the response pane reads as what the
 /// server sent, and it isn't.
+///
+/// Halfblocks is *also* what `from_query_stdio` reports when the terminal
+/// answered the graphics query but not the cell-size one, which is a different
+/// thing entirely and is why `recover_protocol` exists — see it for the case
+/// that costs us.
 fn detect_picker() -> Option<Picker> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return None;
     }
     let picker = Picker::from_query_stdio().ok()?;
-    (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
+    if picker.protocol_type() != ProtocolType::Halfblocks {
+        return Some(picker);
+    }
+
+    // Halfblocks here means one of two very different things, and the picker
+    // cannot tell us which — see `recover_protocol`.
+    let protocol = recover_protocol()?;
+    let mut picker = Picker::from_fontsize(ASSUMED_CELL_SIZE);
+    picker.set_protocol_type(protocol);
+    Some(picker)
+}
+
+/// The cell size to draw at when the terminal reports a graphics protocol but
+/// will not say how large a cell is.
+///
+/// It is only ever a guess, so it is a deliberate *under*-estimate. The kitty
+/// images `ratatui-image` emits are virtual placements carrying no `c=`/`r=`,
+/// so the terminal derives their footprint in cells from the transmitted pixel
+/// size divided by its own real cell size. Guess high and that footprint is
+/// larger than the placeholders we wrote, and the image is silently cropped to
+/// its top-left corner; guess low and it is drawn whole, just smaller than the
+/// pane it was given. A response image that is small and complete can be read;
+/// one that is full-size and clipped cannot.
+///
+/// The spread it has to survive is wide — a cell is reported in device pixels,
+/// so the same font is ~8×16 on one display and ~17×39 on a HiDPI one — which
+/// is the other half of why this errs low. A terminal that answers `CSI 16 t`
+/// never reaches here and is drawn exactly.
+const ASSUMED_CELL_SIZE: (u16, u16) = (8, 16);
+
+/// Asks the terminal a second time, purely to tell "no graphics protocol" apart
+/// from "a graphics protocol we could not size".
+///
+/// `from_query_stdio` collapses the two. It falls back to its default picker —
+/// Halfblocks, arbitrary font size — whenever the cell size is unknown, and
+/// that fallback *discards the capabilities it just collected*, so a terminal
+/// that answered the kitty query with `OK` and ignored `CSI 16 t` is
+/// indistinguishable from one that answered nothing at all. Multiplexers land
+/// here: herdr passes the kitty protocol through to its panes but answers
+/// neither `CSI 14/16/18 t` nor `TIOCGWINSZ` with pixel dimensions, so ichigo
+/// told people running it under herdr that their terminal had no image
+/// protocol when it plainly did.
+///
+/// Re-querying is the whole of the recovery, and it deliberately runs *only*
+/// down this path: a terminal that works today never reaches it, so the second
+/// query cannot cost anything a working setup would notice. What comes back is
+/// read for the protocol alone — the cell size is already known to be missing,
+/// or we would not be here.
+///
+/// The timeout, the detached thread and the `\x1b[5n` terminator are the same
+/// bargain `from_query_stdio` makes, for the same reason, and are safe here for
+/// the same one: `detect_picker` has already refused anything that is not a
+/// terminal on both ends.
+fn recover_protocol() -> Option<ProtocolType> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(query_protocol());
+    });
+    rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
+}
+
+/// Writes the capability query and reads the reply, in raw mode so the terminal
+/// hands us the response bytes instead of the line discipline eating them.
+///
+/// Raw mode is turned off again on every exit, including the failures — this
+/// runs before the TUI has set up its own, and leaving the terminal in it would
+/// strand the shell if anything below returned early.
+fn query_protocol() -> Option<ProtocolType> {
+    enable_raw_mode().ok()?;
+    let protocol = read_protocol();
+    let _ = disable_raw_mode();
+    protocol
+}
+
+fn read_protocol() -> Option<ProtocolType> {
+    // `is_tmux` false: if we were under tmux, `from_query_stdio` would have
+    // detected it and reported its outer protocol rather than Halfblocks.
+    let query = Parser::query(false, QueryStdioOptions { text_sizing_protocol: false });
+    let mut stdout = io::stdout();
+    stdout.write_all(query.as_bytes()).ok()?;
+    stdout.flush().ok()?;
+
+    let mut parser = Parser::new();
+    let mut protocol = None;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    let mut buf = [0u8; 64];
+    loop {
+        let read = handle.read(&mut buf).ok()?;
+        // EOF. The `is_terminal` guard should have made this unreachable; it is
+        // handled rather than looped on so a stdin that closes under us ends
+        // the thread instead of spinning on `Ok(0)` forever.
+        if read == 0 {
+            return protocol;
+        }
+        for byte in &buf[..read] {
+            for response in parser.push(char::from(*byte)) {
+                match response {
+                    Response::Kitty => protocol = Some(ProtocolType::Kitty),
+                    // Only if kitty is not supported, matching the crate's own
+                    // precedence.
+                    Response::Sixel => protocol = protocol.or(Some(ProtocolType::Sixel)),
+                    // Answered by everything, and last in the query, so it is
+                    // the end of the reply and not just of a response.
+                    Response::Status => return protocol,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl App {
