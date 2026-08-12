@@ -16,7 +16,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
-use std::{collections::{HashMap, HashSet}, fs, io};
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+};
+use std::{collections::{HashMap, HashSet}, fs, io, io::IsTerminal};
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig, UserConfig, MAX_SPLIT_PCT, MIN_SPLIT_PCT};
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
@@ -80,6 +84,15 @@ enum Mode {
         // Transient feedback ("copied 2 lines"), shown beside the status badge
         // and cleared by the next keypress.
         status: Option<String>,
+        // A decoded image body, already handed to the terminal's graphics
+        // protocol. `None` for every text response, and also for an image the
+        // terminal cannot draw — in that case `body` (the summary line) is the
+        // whole of what the pane shows.
+        //
+        // It lives here rather than on `App` so it dies with the pane, the way
+        // every other mode's state does. Note this makes `Mode` un-`Clone`able:
+        // `StatefulProtocol` owns the encoded image and is not `Clone`.
+        image: Option<Box<StatefulProtocol>>,
     },
     TestResponse {
         results: crate::tester::TestResults,
@@ -150,6 +163,19 @@ impl Mode {
     /// A response pane showing `body`. Reach it through `App::show_message` /
     /// `show_error` unless there is no `App` yet, as at startup.
     fn message(kind: ResponseKind, body: String) -> Self {
+        Mode::message_with_image(kind, body, None)
+    }
+
+    /// The same pane with a decoded image drawn under the body text.
+    ///
+    /// `image` is `None` whenever the response was text, the terminal has no
+    /// graphics protocol, or the decode failed — in each case `body` already
+    /// says what happened, so this is the one constructor and not two.
+    fn message_with_image(
+        kind: ResponseKind,
+        body: String,
+        image: Option<Box<StatefulProtocol>>,
+    ) -> Self {
         Mode::Response {
             kind,
             body,
@@ -159,6 +185,7 @@ impl Mode {
             cursor: 0,
             anchor: None,
             status: None,
+            image,
         }
     }
 
@@ -414,6 +441,13 @@ struct App {
     split_x: u16,
     term_width: u16,
     dragging_split: bool,
+    // How this terminal draws pixels, probed once at launch. `None` means it
+    // cannot, and every image response falls back to its summary line.
+    //
+    // Not reloadable for the same reason `keys` isn't, and a stronger one: the
+    // probe writes control sequences to stdout and reads the reply off stdin,
+    // which is only safe before the alternate screen is up.
+    picker: Option<Picker>,
 }
 
 /// How far either side of the divider still counts as grabbing it. The divider
@@ -436,6 +470,46 @@ fn split_pct_at(column: u16, total: u16) -> Option<u16> {
     let total = u32::from(total);
     let pct = (u32::from(column) * 100 + total / 2) / total;
     Some((pct as u16).clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT))
+}
+
+/// Probes the terminal for a graphics protocol, once, at launch.
+///
+/// Two-stage by way of `ratatui-image`, the same shape yazi uses: guess from
+/// `$TERM` / `$TERM_PROGRAM`, and where that says nothing, write control
+/// sequences and read the reply. The reply arrives on **stdin**, which is why
+/// this has to run before the alternate screen and raw mode are set up — it is
+/// called from `App::new`, and `run` builds the `App` first for that reason.
+///
+/// A failed probe is not an error: there is then nothing to draw an image on,
+/// and the summary line is the honest answer.
+///
+/// The `is_terminal` guard is load-bearing, and not just an optimization.
+/// `ratatui-image` runs the query on a detached thread and gives up on it after
+/// one second, but the thread itself has no timeout — it blocks in
+/// `stdin().read()` until something parses as a Device Status Report. Where
+/// nothing ever answers, that abandoned thread goes on consuming stdin, so the
+/// keys meant for the event loop are swallowed one by one, and it finally calls
+/// `disable_raw_mode` on the way out — under a TUI that is by then running in
+/// it. The two ways to get there are exactly the two this refuses:
+///
+/// * `ichigo | cat` — the query goes down the pipe, so the terminal never sees
+///   it and never replies.
+/// * `ichigo < /dev/null` — `read` returns `Ok(0)` forever and its loop spins.
+///
+/// With a terminal on both ends the trailing `\x1b[5n` is answered by
+/// essentially everything, which is why it is in the query at all, so the
+/// thread ends promptly and the one-second bound is the worst case.
+///
+/// `Halfblocks` is refused deliberately. It is `ratatui-image`'s universal
+/// fallback and would render *something* in any terminal, but a quarter-scale
+/// mosaic of colour blocks sitting in the response pane reads as what the
+/// server sent, and it isn't.
+fn detect_picker() -> Option<Picker> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    let picker = Picker::from_query_stdio().ok()?;
+    (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
 }
 
 impl App {
@@ -477,6 +551,7 @@ impl App {
             split_x: 0,
             term_width: 0,
             dragging_split: false,
+            picker: detect_picker(),
         })
     }
 
@@ -957,22 +1032,81 @@ impl App {
         let result = RequestConfig::load(entry_name)
             .and_then(|config| crate::utils::send_request(&config, vars, false));
 
-        let (status, body) = match result {
+        let (status, body, image) = match result {
             Ok(response) => {
                 let status = response.status().as_u16();
-                let text = response.text().unwrap_or_else(|e| e.to_string());
-                // Pretty-print JSON if the body parses as such.
-                let body = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                    .unwrap_or(text);
-                (status, body)
+                // Read the type before the body: `text()` and `bytes()` both
+                // consume the response, so the branch has to be decided first.
+                // An image read as text is lossy UTF-8 over binary — the
+                // mojibake this whole path exists to stop showing.
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                if crate::media::is_renderable_image(&content_type) {
+                    let (body, image) = self.render_image_body(&content_type, response);
+                    (status, body, image)
+                } else {
+                    let text = response.text().unwrap_or_else(|e| e.to_string());
+                    // Pretty-print JSON if the body parses as such.
+                    let body = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or(text);
+                    (status, body, None)
+                }
             }
-            Err(e) => (0, format!("Error: {e}")),
+            Err(e) => (0, format!("Error: {e}"), None),
         };
 
         let kind = if status == 0 { ResponseKind::Error } else { ResponseKind::Http(status) };
-        self.show_message(kind, body);
+        self.mode = Mode::message_with_image(kind, body, image);
+    }
+
+    /// Turns an image response into the pane's two halves: the summary line
+    /// that is always shown, and the protocol handle that is shown when the
+    /// terminal can draw one.
+    ///
+    /// Every failure below degrades to summary-plus-note rather than to an
+    /// error pane. The request itself succeeded — a `200` that we could not
+    /// decode is still a `200`, and showing it as an error would misreport the
+    /// server.
+    fn render_image_body(
+        &self,
+        content_type: &str,
+        response: reqwest::blocking::Response,
+    ) -> (String, Option<Box<StatefulProtocol>>) {
+        let bytes = match response.bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => return (format!("{content_type}\n\nCould not read body: {e}"), None),
+        };
+
+        let decoded = match crate::media::decode(&bytes) {
+            Ok(image) => image,
+            Err(e) => {
+                let summary = crate::media::summarize(content_type, bytes.len(), None);
+                return (format!("{summary}\n\nCould not decode: {e:#}"), None);
+            }
+        };
+
+        let dims = (decoded.width(), decoded.height());
+        let summary = crate::media::summarize(content_type, bytes.len(), Some(dims));
+
+        match &self.picker {
+            Some(picker) => {
+                (summary, Some(Box::new(picker.new_resize_protocol(decoded))))
+            }
+            // No graphics protocol: the summary is the whole of the pane, and
+            // it says so rather than leaving a blank space where an image was
+            // expected.
+            None => (
+                format!("{summary}\n\nThis terminal has no image protocol ichigo can use."),
+                None,
+            ),
+        }
     }
 
     fn execute_chain(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
@@ -990,18 +1124,31 @@ impl App {
                 let status = response.status().as_u16();
                 last_status = status;
 
-                let is_json = response
+                let content_type = response
                     .headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v.contains("application/json"))
-                    .unwrap_or(false);
+                    .unwrap_or("")
+                    .to_string();
+                let is_json = content_type.contains("application/json");
 
-                let text = response.text().unwrap_or_default();
-                let pretty = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                    .unwrap_or_else(|| text.clone());
+                // A chain renders as one combined text block, so an image step
+                // contributes its summary line rather than an inline image —
+                // but it must not contribute its *bytes*, which is what reading
+                // it as text used to do. `text` stays empty so a step that also
+                // declares `extract` fails with the honest "response is not
+                // JSON" below instead of on mojibake.
+                let (text, pretty) = if crate::media::is_renderable_image(&content_type) {
+                    let len = response.bytes().map(|b| b.len()).unwrap_or(0);
+                    (String::new(), crate::media::summarize(&content_type, len, None))
+                } else {
+                    let text = response.text().unwrap_or_default();
+                    let pretty = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or_else(|| text.clone());
+                    (text, pretty)
+                };
 
                 out.push_str(&format!("▸ {}  [{}]\n", step.name, status));
                 if pretty.is_empty() {

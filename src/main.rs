@@ -7,6 +7,7 @@ use std::io::{self, Read};
 
 mod config;
 mod curl;
+mod media;
 mod runner;
 mod tester;
 mod tui;
