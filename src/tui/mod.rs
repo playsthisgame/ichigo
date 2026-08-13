@@ -25,8 +25,9 @@ use ratatui_image::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    env, fs, io,
     io::{IsTerminal, Read, Write},
+    process::{Command, Stdio},
     sync::mpsc,
     thread,
     time::Duration,
@@ -519,22 +520,118 @@ fn split_pct_at(column: u16, total: u16) -> Option<u16> {
 /// answered the graphics query but not the cell-size one, which is a different
 /// thing entirely and is why `recover_protocol` exists — see it for the case
 /// that costs us.
+///
+/// Under a multiplexer both halves of the crate's answer need checking, and for
+/// unrelated reasons — see `prepare_tmux` for the protocol and
+/// `TMUX_DEFAULT_CELL_SIZE` for the size.
 fn detect_picker() -> Option<Picker> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return None;
     }
+    let tmux = prepare_tmux();
     let picker = Picker::from_query_stdio().ok()?;
-    if picker.protocol_type() != ProtocolType::Halfblocks {
+
+    let protocol = match picker.protocol_type() {
+        // Halfblocks means one of two very different things, and the picker
+        // cannot tell us which — see `recover_protocol`.
+        ProtocolType::Halfblocks => recover_protocol(tmux)?,
+        // A protocol the crate is sure of. Outside tmux its cell size is sound
+        // too, so there is nothing left to second-guess.
+        _ if !tmux => return Some(picker),
+        known => known,
+    };
+
+    let cell_size = cell_size(picker.font_size(), tmux);
+    if protocol == picker.protocol_type() && cell_size == picker.font_size() {
         return Some(picker);
     }
-
-    // Halfblocks here means one of two very different things, and the picker
-    // cannot tell us which — see `recover_protocol`.
-    let protocol = recover_protocol()?;
-    let mut picker = Picker::from_fontsize(ASSUMED_CELL_SIZE);
+    let mut picker = Picker::from_fontsize(cell_size);
     picker.set_protocol_type(protocol);
     Some(picker)
 }
+
+/// The size to draw a cell at, given the one `from_query_stdio` reported.
+///
+/// Only called where that number is already in doubt: either the crate fell back
+/// to its default picker, or we are under tmux, where its two sources say
+/// different things about how much they can be trusted. A `CSI 16 t` answer is
+/// the terminal's own measurement and survives the passthrough, so it is kept;
+/// `TIOCGWINSZ` under tmux may be `TMUX_DEFAULT_CELL_SIZE`, which is not a
+/// measurement at all.
+fn cell_size(reported: (u16, u16), tmux: bool) -> (u16, u16) {
+    match tmux {
+        // Outside tmux this is only reached from the recovery path, which the
+        // crate takes *because* the cell size was unknown — there is no
+        // measurement here to keep.
+        false => ASSUMED_CELL_SIZE,
+        true if reported == TMUX_DEFAULT_CELL_SIZE => ASSUMED_CELL_SIZE,
+        true => reported,
+    }
+}
+
+/// Makes tmux ready to be drawn through, and reports whether we are under it.
+///
+/// tmux does not implement any graphics protocol itself. What it has is
+/// *passthrough*: a `\x1bPtmux;…\x1b\\` wrapper whose contents it forwards to
+/// the terminal it is attached to, byte for byte. Both halves of drawing an
+/// image go through it — the capability query at launch and every transmitted
+/// image after — and both are refused unless the pane says they are allowed,
+/// which is what `allow-passthrough` does. It is a *pane* option, set here for
+/// our own pane and gone when the pane is, so this needs nothing in the user's
+/// `tmux.conf` and changes nothing outside the session it runs in.
+///
+/// `ratatui-image` writes that wrapper for us, but only where it believes it is
+/// under tmux, and it decides that from `TERM` alone — `TERM` starting with
+/// `tmux`, or `TERM_PROGRAM` being exactly `tmux`. Neither holds for the very
+/// common `set -g default-terminal "screen-256color"` on tmux before 3.5, which
+/// is the release that started setting `TERM_PROGRAM` at all. `$TMUX` is set by
+/// every tmux for every pane, so it is what we test, and where the two disagree
+/// we set `TERM_PROGRAM` to what the crate is looking for. Without it the query
+/// and the images are written unwrapped: tmux swallows them as sequences of its
+/// own that it does not recognise, and the terminal never sees a byte.
+///
+/// The mutation is why this runs from `detect_picker` and no later: it is the
+/// first thing `App::new` does, before the crate's query has spawned its reader
+/// thread and long before the event loop, so the process is still single
+/// threaded and nothing can be reading the environment as it is written.
+fn prepare_tmux() -> bool {
+    if env::var_os("TMUX").is_none_or(|v| v.is_empty()) {
+        return false;
+    }
+
+    let detected_by_crate = env::var("TERM").is_ok_and(|term| term.starts_with("tmux"))
+        || env::var("TERM_PROGRAM").is_ok_and(|program| program == "tmux");
+    if !detected_by_crate {
+        // SAFETY: single-threaded, see above.
+        unsafe { env::set_var("TERM_PROGRAM", "tmux") };
+    }
+
+    let _ = Command::new("tmux")
+        .args(["set", "-p", "allow-passthrough", "on"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    true
+}
+
+/// The cell size tmux invents when it has never been told a real one.
+///
+/// Inside tmux the kernel always has an answer: tmux sets its panes' pixel
+/// dimensions from the attached client's, and where the client reported none it
+/// uses `DEFAULT_XPIXEL` / `DEFAULT_YPIXEL` — 16×32 — rather than leaving them
+/// zero. `ratatui-image` falls back to `TIOCGWINSZ` for the cell size and has no
+/// way to tell that apart from a measurement, so an image drawn under tmux is
+/// scaled against a number the terminal never gave and the pane is filled with a
+/// cropped corner of it.
+///
+/// So under tmux exactly this size is read as "no answer" and replaced with
+/// `ASSUMED_CELL_SIZE`. A terminal whose cells really are 16×32 pays for that by
+/// being drawn at half scale — complete, and readable, which is the trade
+/// `ASSUMED_CELL_SIZE` already makes everywhere else. A terminal that answers
+/// `CSI 16 t` through the passthrough never reaches here: that answer is the
+/// crate's first choice and the kernel only its fallback.
+const TMUX_DEFAULT_CELL_SIZE: (u16, u16) = (16, 32);
 
 /// The cell size to draw at when the terminal reports a graphics protocol but
 /// will not say how large a cell is.
@@ -577,10 +674,17 @@ const ASSUMED_CELL_SIZE: (u16, u16) = (8, 16);
 /// bargain `from_query_stdio` makes, for the same reason, and are safe here for
 /// the same one: `detect_picker` has already refused anything that is not a
 /// terminal on both ends.
-fn recover_protocol() -> Option<ProtocolType> {
+///
+/// `tmux` is the same flag `prepare_tmux` returns, and it has to be threaded all
+/// the way down to the query: a second question asked *unwrapped* under a
+/// multiplexer is not a second opinion on the terminal, it is a first opinion on
+/// tmux — which answers `CSI 5 n` and `CSI c` itself, out of its own
+/// capabilities, and never forwards either. Reading that as the terminal's reply
+/// is how a kitty-capable setup ends up drawing sixels, or nothing.
+fn recover_protocol(tmux: bool) -> Option<ProtocolType> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send(query_protocol());
+        let _ = tx.send(query_protocol(tmux));
     });
     rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
 }
@@ -591,17 +695,15 @@ fn recover_protocol() -> Option<ProtocolType> {
 /// Raw mode is turned off again on every exit, including the failures — this
 /// runs before the TUI has set up its own, and leaving the terminal in it would
 /// strand the shell if anything below returned early.
-fn query_protocol() -> Option<ProtocolType> {
+fn query_protocol(tmux: bool) -> Option<ProtocolType> {
     enable_raw_mode().ok()?;
-    let protocol = read_protocol();
+    let protocol = read_protocol(tmux);
     let _ = disable_raw_mode();
     protocol
 }
 
-fn read_protocol() -> Option<ProtocolType> {
-    // `is_tmux` false: if we were under tmux, `from_query_stdio` would have
-    // detected it and reported its outer protocol rather than Halfblocks.
-    let query = Parser::query(false, QueryStdioOptions { text_sizing_protocol: false });
+fn read_protocol(tmux: bool) -> Option<ProtocolType> {
+    let query = Parser::query(tmux, QueryStdioOptions { text_sizing_protocol: false });
     let mut stdout = io::stdout();
     stdout.write_all(query.as_bytes()).ok()?;
     stdout.flush().ok()?;
@@ -1934,6 +2036,18 @@ mod tests {
         let names = chain_var_names(&[s1, s2]);
         // Only the truly user-supplied variable remains, listed once.
         assert_eq!(names, vec!["USER_ID".to_string()]);
+    }
+
+    /// Under tmux the cell size the crate reports may be tmux's invention, and
+    /// scaling an image against it crops the image to a corner.
+    #[test]
+    fn tmuxs_invented_cell_size_is_not_taken_for_a_measurement() {
+        assert_eq!(cell_size(TMUX_DEFAULT_CELL_SIZE, true), ASSUMED_CELL_SIZE);
+        // Anything else under tmux came from the terminal itself, through the
+        // passthrough or through a pane size tmux was actually told.
+        assert_eq!(cell_size((9, 20), true), (9, 20));
+        // Outside tmux this is only reached when the size is already unknown.
+        assert_eq!(cell_size((10, 20), false), ASSUMED_CELL_SIZE);
     }
 
     /// The percentage has to be the inverse of the layout solver, or the
