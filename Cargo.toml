@@ -40,6 +40,18 @@ ratatui = "0.29"
 crossterm = "0.28"
 serde_yaml_ng = "0.10.0"
 basic-toml = "0.1.10"
+# 8.x is the last line that targets ratatui 0.29; 10.x and 11.x require 0.30, so
+# bumping this is a ratatui migration and not a version bump. `default-features`
+# is off because the default set includes `image-defaults` (= `image/default`),
+# which pulls the AVIF encoder — ravif, rayon, and a few dozen crates — to
+# decode formats no HTTP response is going to hand us. The formats we do want
+# are named on our own `image` dependency below, and feature unification merges
+# the two. Keep `crossterm` on: it is what selects ratatui's backend.
+ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+# Must stay on the same major as ratatui-image's own `image` (^0.25.6) — a
+# mismatch makes the two `DynamicImage` types distinct and `new_resize_protocol`
+# stops accepting ours.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

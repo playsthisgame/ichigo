@@ -7,6 +7,7 @@ use edit::Edit;
 use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
 
 use anyhow::Result;
+use image::{imageops::FilterType, DynamicImage};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -16,7 +17,22 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, widgets::ListState, Terminal};
-use std::{collections::{HashMap, HashSet}, fs, io};
+use ratatui_image::{
+    picker::{
+        cap_parser::{Parser, QueryStdioOptions, Response},
+        Picker, ProtocolType,
+    },
+    protocol::StatefulProtocol,
+};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs, io,
+    io::{IsTerminal, Read, Write},
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig, UserConfig, MAX_SPLIT_PCT, MIN_SPLIT_PCT};
 
 // ─── Modes ────────────────────────────────────────────────────────────────────
@@ -80,6 +96,15 @@ enum Mode {
         // Transient feedback ("copied 2 lines"), shown beside the status badge
         // and cleared by the next keypress.
         status: Option<String>,
+        // A decoded image body, already handed to the terminal's graphics
+        // protocol. `None` for every text response, and also for an image the
+        // terminal cannot draw — in that case `body` (the summary line) is the
+        // whole of what the pane shows.
+        //
+        // It lives here rather than on `App` so it dies with the pane, the way
+        // every other mode's state does. Note this makes `Mode` un-`Clone`able:
+        // `StatefulProtocol` owns the encoded image and is not `Clone`.
+        image: Option<Box<StatefulProtocol>>,
     },
     TestResponse {
         results: crate::tester::TestResults,
@@ -150,6 +175,19 @@ impl Mode {
     /// A response pane showing `body`. Reach it through `App::show_message` /
     /// `show_error` unless there is no `App` yet, as at startup.
     fn message(kind: ResponseKind, body: String) -> Self {
+        Mode::message_with_image(kind, body, None)
+    }
+
+    /// The same pane with a decoded image drawn under the body text.
+    ///
+    /// `image` is `None` whenever the response was text, the terminal has no
+    /// graphics protocol, or the decode failed — in each case `body` already
+    /// says what happened, so this is the one constructor and not two.
+    fn message_with_image(
+        kind: ResponseKind,
+        body: String,
+        image: Option<Box<StatefulProtocol>>,
+    ) -> Self {
         Mode::Response {
             kind,
             body,
@@ -159,6 +197,7 @@ impl Mode {
             cursor: 0,
             anchor: None,
             status: None,
+            image,
         }
     }
 
@@ -414,6 +453,16 @@ struct App {
     split_x: u16,
     term_width: u16,
     dragging_split: bool,
+    // Whether images have to be drawn through tmux's passthrough, which caps
+    // how large one may be — see `TMUX_PIXEL_BUDGET`.
+    tmux: bool,
+    // How this terminal draws pixels, probed once at launch. `None` means it
+    // cannot, and every image response falls back to its summary line.
+    //
+    // Not reloadable for the same reason `keys` isn't, and a stronger one: the
+    // probe writes control sequences to stdout and reads the reply off stdin,
+    // which is only safe before the alternate screen is up.
+    picker: Option<Picker>,
 }
 
 /// How far either side of the divider still counts as grabbing it. The divider
@@ -436,6 +485,335 @@ fn split_pct_at(column: u16, total: u16) -> Option<u16> {
     let total = u32::from(total);
     let pct = (u32::from(column) * 100 + total / 2) / total;
     Some((pct as u16).clamp(MIN_SPLIT_PCT, MAX_SPLIT_PCT))
+}
+
+/// Probes the terminal for a graphics protocol, once, at launch.
+///
+/// Two-stage by way of `ratatui-image`, the same shape yazi uses: guess from
+/// `$TERM` / `$TERM_PROGRAM`, and where that says nothing, write control
+/// sequences and read the reply. The reply arrives on **stdin**, which is why
+/// this has to run before the alternate screen and raw mode are set up — it is
+/// called from `App::new`, and `run` builds the `App` first for that reason.
+///
+/// A failed probe is not an error: there is then nothing to draw an image on,
+/// and the summary line is the honest answer.
+///
+/// The `is_terminal` guard is load-bearing, and not just an optimization.
+/// `ratatui-image` runs the query on a detached thread and gives up on it after
+/// one second, but the thread itself has no timeout — it blocks in
+/// `stdin().read()` until something parses as a Device Status Report. Where
+/// nothing ever answers, that abandoned thread goes on consuming stdin, so the
+/// keys meant for the event loop are swallowed one by one, and it finally calls
+/// `disable_raw_mode` on the way out — under a TUI that is by then running in
+/// it. The two ways to get there are exactly the two this refuses:
+///
+/// * `ichigo | cat` — the query goes down the pipe, so the terminal never sees
+///   it and never replies.
+/// * `ichigo < /dev/null` — `read` returns `Ok(0)` forever and its loop spins.
+///
+/// With a terminal on both ends the trailing `\x1b[5n` is answered by
+/// essentially everything, which is why it is in the query at all, so the
+/// thread ends promptly and the one-second bound is the worst case.
+///
+/// `Halfblocks` is refused deliberately. It is `ratatui-image`'s universal
+/// fallback and would render *something* in any terminal, but a quarter-scale
+/// mosaic of colour blocks sitting in the response pane reads as what the
+/// server sent, and it isn't.
+///
+/// Halfblocks is *also* what `from_query_stdio` reports when the terminal
+/// answered the graphics query but not the cell-size one, which is a different
+/// thing entirely and is why `recover_protocol` exists — see it for the case
+/// that costs us.
+///
+/// Under a multiplexer both halves of the crate's answer need checking, and for
+/// unrelated reasons — see `prepare_tmux` for the protocol and
+/// `TMUX_DEFAULT_CELL_SIZE` for the size.
+fn detect_picker() -> Option<Picker> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return None;
+    }
+    let tmux = prepare_tmux();
+    let picker = Picker::from_query_stdio().ok()?;
+
+    let protocol = match picker.protocol_type() {
+        // Halfblocks means one of two very different things, and the picker
+        // cannot tell us which — see `recover_protocol`.
+        ProtocolType::Halfblocks => recover_protocol(tmux)?,
+        // A protocol the crate is sure of. Outside tmux its cell size is sound
+        // too, so there is nothing left to second-guess.
+        _ if !tmux => return Some(picker),
+        known => known,
+    };
+
+    let cell_size = cell_size(picker.font_size(), tmux);
+    if protocol == picker.protocol_type() && cell_size == picker.font_size() {
+        return Some(picker);
+    }
+    let mut picker = Picker::from_fontsize(cell_size);
+    picker.set_protocol_type(protocol);
+    Some(picker)
+}
+
+/// The size to draw a cell at, given the one `from_query_stdio` reported.
+///
+/// Only called where that number is already in doubt: either the crate fell back
+/// to its default picker, or we are under tmux, where its two sources say
+/// different things about how much they can be trusted. A `CSI 16 t` answer is
+/// the terminal's own measurement and survives the passthrough, so it is kept;
+/// `TIOCGWINSZ` under tmux may be `TMUX_DEFAULT_CELL_SIZE`, which is not a
+/// measurement at all.
+fn cell_size(reported: (u16, u16), tmux: bool) -> (u16, u16) {
+    match tmux {
+        // Outside tmux this is only reached from the recovery path, which the
+        // crate takes *because* the cell size was unknown — there is no
+        // measurement here to keep.
+        false => ASSUMED_CELL_SIZE,
+        true if reported == TMUX_DEFAULT_CELL_SIZE => ASSUMED_CELL_SIZE,
+        true => reported,
+    }
+}
+
+/// `$TMUX` is set by every tmux for every pane, and is the one signal that does
+/// not depend on how `default-terminal` was configured — see `prepare_tmux`.
+fn in_tmux() -> bool {
+    env::var_os("TMUX").is_some_and(|v| !v.is_empty())
+}
+
+/// Makes tmux ready to be drawn through, and reports whether we are under it.
+///
+/// tmux does not implement any graphics protocol itself. What it has is
+/// *passthrough*: a `\x1bPtmux;…\x1b\\` wrapper whose contents it forwards to
+/// the terminal it is attached to, byte for byte. Both halves of drawing an
+/// image go through it — the capability query at launch and every transmitted
+/// image after — and both are refused unless the pane says they are allowed,
+/// which is what `allow-passthrough` does. It is a *pane* option, set here for
+/// our own pane and gone when the pane is, so this needs nothing in the user's
+/// `tmux.conf` and changes nothing outside the session it runs in.
+///
+/// `ratatui-image` writes that wrapper for us, but only where it believes it is
+/// under tmux, and it decides that from `TERM` alone — `TERM` starting with
+/// `tmux`, or `TERM_PROGRAM` being exactly `tmux`. Neither holds for the very
+/// common `set -g default-terminal "screen-256color"` on tmux before 3.5, which
+/// is the release that started setting `TERM_PROGRAM` at all. `$TMUX` is set by
+/// every tmux for every pane, so it is what we test, and where the two disagree
+/// we set `TERM_PROGRAM` to what the crate is looking for. Without it the query
+/// and the images are written unwrapped: tmux swallows them as sequences of its
+/// own that it does not recognise, and the terminal never sees a byte.
+///
+/// The mutation is why this runs from `detect_picker` and no later: it is the
+/// first thing `App::new` does, before the crate's query has spawned its reader
+/// thread and long before the event loop, so the process is still single
+/// threaded and nothing can be reading the environment as it is written.
+fn prepare_tmux() -> bool {
+    if !in_tmux() {
+        return false;
+    }
+
+    let detected_by_crate = env::var("TERM").is_ok_and(|term| term.starts_with("tmux"))
+        || env::var("TERM_PROGRAM").is_ok_and(|program| program == "tmux");
+    if !detected_by_crate {
+        // SAFETY: single-threaded, see above.
+        unsafe { env::set_var("TERM_PROGRAM", "tmux") };
+    }
+
+    let _ = Command::new("tmux")
+        .args(["set", "-p", "allow-passthrough", "on"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    true
+}
+
+/// The most pixels an image may carry when it is drawn through tmux.
+///
+/// tmux collects a passthrough sequence into one buffer before forwarding it,
+/// and that buffer is bounded — `INPUT_BUF_LIMIT`, 1 MiB. Past it the sequence
+/// is **discarded whole**, not truncated: nothing reaches the terminal, no error
+/// is reported, and the pane fills with placeholder cells addressing an image
+/// that was never transmitted. Measured against tmux 3.5a, a payload of
+/// 1,048,000 bytes goes through and 1,048,570 does not.
+///
+/// `ratatui-image` wraps the entire chunked kitty transmit in a *single*
+/// passthrough sequence, so the only lever on this side is how many pixels go
+/// into it. A pixel costs 4 bytes as RGBA and 4/3 of that again in base64, plus
+/// about 0.3% of per-chunk framing — call it 5.4 bytes of sequence per pixel, so
+/// 180,000 pixels is ~970 KiB and leaves room for the header and the framing.
+///
+/// This bounds the image *as transmitted*, which is not the one handed to the
+/// widget: the resize target is rounded up to whole cells, so a transmit runs up
+/// to a cell wider and a cell taller than its source. Budgeting the source
+/// instead is what let a 2121×1414 photograph through at 522×380 — 1,061,847
+/// bytes, 13 KiB over, and dropped exactly like the uncapped one.
+/// `budget_dimensions` therefore solves for the padded size, and `Resize::Fit`
+/// never scales up, so nothing can grow past it afterwards.
+///
+/// A large response is then drawn at lower resolution than its pane could show —
+/// the same trade `ASSUMED_CELL_SIZE` makes, and for the same reason: an image
+/// smaller than it could be can still be read, and one that never arrives
+/// cannot. It binds only under tmux, and only on images past roughly 500×350.
+const TMUX_PIXEL_BUDGET: u32 = 180_000;
+
+/// Shrinks an image to what one tmux passthrough sequence can carry, leaving
+/// anything already inside the budget untouched.
+///
+/// `Triangle` rather than the `Nearest` the widget resizes with: this runs once
+/// per response, on the decode rather than on every frame, and it is the step
+/// that decides how much of a photograph survives.
+fn fit_for_tmux(image: DynamicImage, cell: (u16, u16)) -> DynamicImage {
+    match budget_dimensions(image.width(), image.height(), cell, TMUX_PIXEL_BUDGET) {
+        Some((w, h)) => image.resize(w, h, FilterType::Triangle),
+        None => image,
+    }
+}
+
+/// The dimensions `w`×`h` has to shrink to so that it still fits `budget` pixels
+/// *after* the widget has rounded its resize target up to whole `cell`s, or
+/// `None` when it already does.
+///
+/// The rounding can add a cell to each side, so what has to fit the budget is
+/// `(sw + cell.0) × (sh + cell.1)`. Substituting `sw = s·w`, `sh = s·h` makes
+/// that a quadratic in the scale `s`, and its positive root is the answer —
+/// solved rather than stepped towards so the result is exact and testable.
+fn budget_dimensions(w: u32, h: u32, cell: (u16, u16), budget: u32) -> Option<(u32, u32)> {
+    let (cw, ch) = (u32::from(cell.0).max(1), u32::from(cell.1).max(1));
+    // Widened before adding: an image is never this large, but a dimension near
+    // `u32::MAX` would wrap the padding into a value that looks like it fits.
+    if (u64::from(w) + u64::from(cw)) * (u64::from(h) + u64::from(ch)) <= u64::from(budget) {
+        return None;
+    }
+
+    let (w_f, h_f) = (f64::from(w), f64::from(h));
+    let a = w_f * h_f;
+    let b = w_f * f64::from(ch) + h_f * f64::from(cw);
+    let c = f64::from(cw) * f64::from(ch) - f64::from(budget);
+    // `a` is positive and `c` negative for any budget worth a cell, so the
+    // discriminant is positive and this root is the one in (0, 1).
+    let scale = (-b + (b * b - 4.0 * a * c).sqrt()) / (2.0 * a);
+    Some((((w_f * scale) as u32).max(1), ((h_f * scale) as u32).max(1)))
+}
+
+/// The cell size tmux invents when it has never been told a real one.
+///
+/// Inside tmux the kernel always has an answer: tmux sets its panes' pixel
+/// dimensions from the attached client's, and where the client reported none it
+/// uses `DEFAULT_XPIXEL` / `DEFAULT_YPIXEL` — 16×32 — rather than leaving them
+/// zero. `ratatui-image` falls back to `TIOCGWINSZ` for the cell size and has no
+/// way to tell that apart from a measurement, so an image drawn under tmux is
+/// scaled against a number the terminal never gave and the pane is filled with a
+/// cropped corner of it.
+///
+/// So under tmux exactly this size is read as "no answer" and replaced with
+/// `ASSUMED_CELL_SIZE`. A terminal whose cells really are 16×32 pays for that by
+/// being drawn at half scale — complete, and readable, which is the trade
+/// `ASSUMED_CELL_SIZE` already makes everywhere else. A terminal that answers
+/// `CSI 16 t` through the passthrough never reaches here: that answer is the
+/// crate's first choice and the kernel only its fallback.
+const TMUX_DEFAULT_CELL_SIZE: (u16, u16) = (16, 32);
+
+/// The cell size to draw at when the terminal reports a graphics protocol but
+/// will not say how large a cell is.
+///
+/// It is only ever a guess, so it is a deliberate *under*-estimate. The kitty
+/// images `ratatui-image` emits are virtual placements carrying no `c=`/`r=`,
+/// so the terminal derives their footprint in cells from the transmitted pixel
+/// size divided by its own real cell size. Guess high and that footprint is
+/// larger than the placeholders we wrote, and the image is silently cropped to
+/// its top-left corner; guess low and it is drawn whole, just smaller than the
+/// pane it was given. A response image that is small and complete can be read;
+/// one that is full-size and clipped cannot.
+///
+/// The spread it has to survive is wide — a cell is reported in device pixels,
+/// so the same font is ~8×16 on one display and ~17×39 on a HiDPI one — which
+/// is the other half of why this errs low. A terminal that answers `CSI 16 t`
+/// never reaches here and is drawn exactly.
+const ASSUMED_CELL_SIZE: (u16, u16) = (8, 16);
+
+/// Asks the terminal a second time, purely to tell "no graphics protocol" apart
+/// from "a graphics protocol we could not size".
+///
+/// `from_query_stdio` collapses the two. It falls back to its default picker —
+/// Halfblocks, arbitrary font size — whenever the cell size is unknown, and
+/// that fallback *discards the capabilities it just collected*, so a terminal
+/// that answered the kitty query with `OK` and ignored `CSI 16 t` is
+/// indistinguishable from one that answered nothing at all. Multiplexers land
+/// here: herdr passes the kitty protocol through to its panes but answers
+/// neither `CSI 14/16/18 t` nor `TIOCGWINSZ` with pixel dimensions, so ichigo
+/// told people running it under herdr that their terminal had no image
+/// protocol when it plainly did.
+///
+/// Re-querying is the whole of the recovery, and it deliberately runs *only*
+/// down this path: a terminal that works today never reaches it, so the second
+/// query cannot cost anything a working setup would notice. What comes back is
+/// read for the protocol alone — the cell size is already known to be missing,
+/// or we would not be here.
+///
+/// The timeout, the detached thread and the `\x1b[5n` terminator are the same
+/// bargain `from_query_stdio` makes, for the same reason, and are safe here for
+/// the same one: `detect_picker` has already refused anything that is not a
+/// terminal on both ends.
+///
+/// `tmux` is the same flag `prepare_tmux` returns, and it has to be threaded all
+/// the way down to the query: a second question asked *unwrapped* under a
+/// multiplexer is not a second opinion on the terminal, it is a first opinion on
+/// tmux — which answers `CSI 5 n` and `CSI c` itself, out of its own
+/// capabilities, and never forwards either. Reading that as the terminal's reply
+/// is how a kitty-capable setup ends up drawing sixels, or nothing.
+fn recover_protocol(tmux: bool) -> Option<ProtocolType> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(query_protocol(tmux));
+    });
+    rx.recv_timeout(Duration::from_secs(1)).ok().flatten()
+}
+
+/// Writes the capability query and reads the reply, in raw mode so the terminal
+/// hands us the response bytes instead of the line discipline eating them.
+///
+/// Raw mode is turned off again on every exit, including the failures — this
+/// runs before the TUI has set up its own, and leaving the terminal in it would
+/// strand the shell if anything below returned early.
+fn query_protocol(tmux: bool) -> Option<ProtocolType> {
+    enable_raw_mode().ok()?;
+    let protocol = read_protocol(tmux);
+    let _ = disable_raw_mode();
+    protocol
+}
+
+fn read_protocol(tmux: bool) -> Option<ProtocolType> {
+    let query = Parser::query(tmux, QueryStdioOptions { text_sizing_protocol: false });
+    let mut stdout = io::stdout();
+    stdout.write_all(query.as_bytes()).ok()?;
+    stdout.flush().ok()?;
+
+    let mut parser = Parser::new();
+    let mut protocol = None;
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    let mut buf = [0u8; 64];
+    loop {
+        let read = handle.read(&mut buf).ok()?;
+        // EOF. The `is_terminal` guard should have made this unreachable; it is
+        // handled rather than looped on so a stdin that closes under us ends
+        // the thread instead of spinning on `Ok(0)` forever.
+        if read == 0 {
+            return protocol;
+        }
+        for byte in &buf[..read] {
+            for response in parser.push(char::from(*byte)) {
+                match response {
+                    Response::Kitty => protocol = Some(ProtocolType::Kitty),
+                    // Only if kitty is not supported, matching the crate's own
+                    // precedence.
+                    Response::Sixel => protocol = protocol.or(Some(ProtocolType::Sixel)),
+                    // Answered by everything, and last in the query, so it is
+                    // the end of the reply and not just of a response.
+                    Response::Status => return protocol,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 impl App {
@@ -477,6 +855,8 @@ impl App {
             split_x: 0,
             term_width: 0,
             dragging_split: false,
+            tmux: in_tmux(),
+            picker: detect_picker(),
         })
     }
 
@@ -957,22 +1337,83 @@ impl App {
         let result = RequestConfig::load(entry_name)
             .and_then(|config| crate::utils::send_request(&config, vars, false));
 
-        let (status, body) = match result {
+        let (status, body, image) = match result {
             Ok(response) => {
                 let status = response.status().as_u16();
-                let text = response.text().unwrap_or_else(|e| e.to_string());
-                // Pretty-print JSON if the body parses as such.
-                let body = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                    .unwrap_or(text);
-                (status, body)
+                // Read the type before the body: `text()` and `bytes()` both
+                // consume the response, so the branch has to be decided first.
+                // An image read as text is lossy UTF-8 over binary — the
+                // mojibake this whole path exists to stop showing.
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                if crate::media::is_renderable_image(&content_type) {
+                    let (body, image) = self.render_image_body(&content_type, response);
+                    (status, body, image)
+                } else {
+                    let text = response.text().unwrap_or_else(|e| e.to_string());
+                    // Pretty-print JSON if the body parses as such.
+                    let body = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or(text);
+                    (status, body, None)
+                }
             }
-            Err(e) => (0, format!("Error: {e}")),
+            Err(e) => (0, format!("Error: {e}"), None),
         };
 
         let kind = if status == 0 { ResponseKind::Error } else { ResponseKind::Http(status) };
-        self.show_message(kind, body);
+        self.mode = Mode::message_with_image(kind, body, image);
+    }
+
+    /// Turns an image response into the pane's two halves: the summary line
+    /// that is always shown, and the protocol handle that is shown when the
+    /// terminal can draw one.
+    ///
+    /// Every failure below degrades to summary-plus-note rather than to an
+    /// error pane. The request itself succeeded — a `200` that we could not
+    /// decode is still a `200`, and showing it as an error would misreport the
+    /// server.
+    fn render_image_body(
+        &self,
+        content_type: &str,
+        response: reqwest::blocking::Response,
+    ) -> (String, Option<Box<StatefulProtocol>>) {
+        let bytes = match response.bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => return (format!("{content_type}\n\nCould not read body: {e}"), None),
+        };
+
+        let decoded = match crate::media::decode(&bytes) {
+            Ok(image) => image,
+            Err(e) => {
+                let summary = crate::media::summarize(content_type, bytes.len(), None);
+                return (format!("{summary}\n\nCould not decode: {e:#}"), None);
+            }
+        };
+
+        let dims = (decoded.width(), decoded.height());
+        let summary = crate::media::summarize(content_type, bytes.len(), Some(dims));
+
+        match &self.picker {
+            Some(picker) => {
+                let decoded =
+                    if self.tmux { fit_for_tmux(decoded, picker.font_size()) } else { decoded };
+                (summary, Some(Box::new(picker.new_resize_protocol(decoded))))
+            }
+            // No graphics protocol: the summary is the whole of the pane, and
+            // it says so rather than leaving a blank space where an image was
+            // expected.
+            None => (
+                format!("{summary}\n\nThis terminal has no image protocol ichigo can use."),
+                None,
+            ),
+        }
     }
 
     fn execute_chain(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
@@ -990,18 +1431,31 @@ impl App {
                 let status = response.status().as_u16();
                 last_status = status;
 
-                let is_json = response
+                let content_type = response
                     .headers()
                     .get("content-type")
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v.contains("application/json"))
-                    .unwrap_or(false);
+                    .unwrap_or("")
+                    .to_string();
+                let is_json = content_type.contains("application/json");
 
-                let text = response.text().unwrap_or_default();
-                let pretty = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                    .unwrap_or_else(|| text.clone());
+                // A chain renders as one combined text block, so an image step
+                // contributes its summary line rather than an inline image —
+                // but it must not contribute its *bytes*, which is what reading
+                // it as text used to do. `text` stays empty so a step that also
+                // declares `extract` fails with the honest "response is not
+                // JSON" below instead of on mojibake.
+                let (text, pretty) = if crate::media::is_renderable_image(&content_type) {
+                    let len = response.bytes().map(|b| b.len()).unwrap_or(0);
+                    (String::new(), crate::media::summarize(&content_type, len, None))
+                } else {
+                    let text = response.text().unwrap_or_default();
+                    let pretty = serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or_else(|| text.clone());
+                    (text, pretty)
+                };
 
                 out.push_str(&format!("▸ {}  [{}]\n", step.name, status));
                 if pretty.is_empty() {
@@ -1663,6 +2117,55 @@ mod tests {
         let names = chain_var_names(&[s1, s2]);
         // Only the truly user-supplied variable remains, listed once.
         assert_eq!(names, vec!["USER_ID".to_string()]);
+    }
+
+    /// tmux discards a passthrough sequence past 1 MiB whole, so an image that
+    /// would exceed it has to be shrunk before it is handed to the encoder.
+    #[test]
+    fn a_large_image_is_shrunk_to_what_tmux_will_carry() {
+        // The photograph that started this, on the cell size it was drawn at.
+        let cell = (18, 38);
+        let (w, h) = budget_dimensions(2121, 1414, cell, TMUX_PIXEL_BUDGET).expect("over budget");
+        // What has to fit is the size *after* the widget rounds up to cells.
+        let padded = (u64::from(w) + 18) * (u64::from(h) + 38);
+        assert!(padded <= u64::from(TMUX_PIXEL_BUDGET), "padded {padded}");
+        // At ~5.4 bytes of passthrough per pixel, inside tmux's 1 MiB.
+        assert!(padded * 54 / 10 < 1024 * 1024, "{} bytes", padded * 54 / 10);
+        // Aspect ratio survives: 2121/1414 is 1.5.
+        let ratio = f64::from(w) / f64::from(h);
+        assert!((ratio - 1.5).abs() < 0.01, "ratio {ratio}");
+    }
+
+    #[test]
+    fn an_image_inside_the_budget_is_left_alone() {
+        assert_eq!(budget_dimensions(64, 64, (18, 38), TMUX_PIXEL_BUDGET), None);
+        assert_eq!(budget_dimensions(400, 400, (9, 20), TMUX_PIXEL_BUDGET), None);
+        // Degenerate shapes keep at least one pixel on the short side.
+        let (w, h) = budget_dimensions(1_000_000, 2, (9, 20), TMUX_PIXEL_BUDGET)
+            .expect("over budget");
+        assert!(w >= 1 && h >= 1);
+    }
+
+    /// A huge cell size must not make the padding allowance eat the whole
+    /// budget and hand back a zero-sized image.
+    #[test]
+    fn the_budget_survives_an_unusually_large_cell() {
+        let (w, h) = budget_dimensions(4000, 3000, (32, 64), TMUX_PIXEL_BUDGET)
+            .expect("over budget");
+        assert!((u64::from(w) + 32) * (u64::from(h) + 64) <= u64::from(TMUX_PIXEL_BUDGET));
+        assert!(w > 1 && h > 1);
+    }
+
+    /// Under tmux the cell size the crate reports may be tmux's invention, and
+    /// scaling an image against it crops the image to a corner.
+    #[test]
+    fn tmuxs_invented_cell_size_is_not_taken_for_a_measurement() {
+        assert_eq!(cell_size(TMUX_DEFAULT_CELL_SIZE, true), ASSUMED_CELL_SIZE);
+        // Anything else under tmux came from the terminal itself, through the
+        // passthrough or through a pane size tmux was actually told.
+        assert_eq!(cell_size((9, 20), true), (9, 20));
+        // Outside tmux this is only reached when the size is already unknown.
+        assert_eq!(cell_size((10, 20), false), ASSUMED_CELL_SIZE);
     }
 
     /// The percentage has to be the inverse of the layout solver, or the

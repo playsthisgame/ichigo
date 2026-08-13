@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use ratatui_image::StatefulImage;
 use super::edit::Edit;
 use super::{App, Mode, PairKind, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
@@ -125,6 +126,12 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     draw_list(frame, panes[0], &app.entries, tree_rows, &filtered, &mut app.list_state, &app.filter, app.filter_active, app.use_nerd_fonts);
 
     let mut response_view_height = None;
+    // Where `draw_response` left room for an image. Filled in below and drawn
+    // after the match, because the widget needs `&mut app.mode` and the match
+    // holds it immutably — the Browse arm reads `app.entries` through `&self`
+    // methods in the same scope, so the whole match cannot become mutable.
+    let mut image_area = None;
+    let has_image = matches!(&app.mode, Mode::Response { image: Some(_), .. });
     match &app.mode {
         Mode::Browse => {
             // Accessing app.list_state and app.entries here is fine: they are
@@ -141,11 +148,13 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestInput { vars, focused, iterations, edit, entry_name } => {
             draw_test_input(frame, panes[1], vars, iterations, *focused, edit, entry_name);
         }
-        Mode::Response { kind, body, scroll, response_filter, response_filter_active, cursor, anchor, status } => {
-            response_view_height = Some(draw_response(
+        Mode::Response { kind, body, scroll, response_filter, response_filter_active, cursor, anchor, status, .. } => {
+            let (height, area) = draw_response(
                 frame, panes[1], kind, body, *scroll, response_filter,
-                *response_filter_active, *cursor, *anchor, status.as_deref(),
-            ));
+                *response_filter_active, *cursor, *anchor, status.as_deref(), has_image,
+            );
+            response_view_height = Some(height);
+            image_area = area;
         }
         Mode::TestResponse { results } => {
             draw_test_results(frame, panes[1], results);
@@ -171,6 +180,13 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(h) = response_view_height {
         app.response_view_height = h;
+    }
+
+    // `StatefulImage` re-fits at render time, so a terminal resize and a drag
+    // of the split divider both just work — the area is recomputed each frame
+    // and the protocol re-encodes when it changes.
+    if let (Some(area), Mode::Response { image: Some(protocol), .. }) = (image_area, &mut app.mode) {
+        frame.render_stateful_widget(StatefulImage::new(), area, protocol.as_mut());
     }
 
     draw_help(frame, outer[1], &app.mode);
@@ -898,7 +914,8 @@ fn draw_response(
     cursor: usize,
     anchor: Option<usize>,
     status: Option<&str>,
-) -> u16 {
+    has_image: bool,
+) -> (u16, Option<Rect>) {
     // A generated command is neither a response nor an error, so it gets its
     // own heading rather than borrowing a status code it doesn't have.
     let (heading, badge_color, badge) = match kind {
@@ -985,17 +1002,40 @@ fn draw_response(
         })
         .collect();
 
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(badge_color)),
-        )
-        .scroll((scroll, 0));
+    let line_count = lines.len() as u16;
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(badge_color));
+    // Taken before the block moves into the paragraph, so the image lands
+    // inside the border rather than over it.
+    let inner = block.inner(chunks[1]);
+    let paragraph = Paragraph::new(lines).block(block).scroll((scroll, 0));
 
     frame.render_widget(paragraph, chunks[1]);
-    chunks[1].height.saturating_sub(2)
+
+    let image_area = has_image.then(|| image_area(inner, line_count)).flatten();
+
+    (chunks[1].height.saturating_sub(2), image_area)
+}
+
+/// The part of the response block an image gets: everything below the body
+/// text, with one blank row between them.
+///
+/// Its own function so the arithmetic is unit-tested, the same reason
+/// `split_pct_at` is one. The cases that matter are the degenerate ones — a
+/// pane too short for both, or dragged narrow enough to have no interior at
+/// all — where the answer has to be `None` rather than a zero-sized or
+/// wrapped-around `Rect`.
+fn image_area(inner: Rect, text_rows: u16) -> Option<Rect> {
+    let offset = text_rows.saturating_add(1).min(inner.height);
+    let height = inner.height.saturating_sub(offset);
+    (height > 0 && inner.width > 0).then(|| Rect {
+        x: inner.x,
+        y: inner.y + offset,
+        width: inner.width,
+        height,
+    })
 }
 
 
@@ -1709,5 +1749,53 @@ mod tests {
     #[test]
     fn empty_value_yields_no_spans() {
         assert!(split("").is_empty());
+    }
+
+    // ─── image_area ───────────────────────────────────────────────────────
+
+    fn inner(width: u16, height: u16) -> Rect {
+        Rect { x: 3, y: 5, width, height }
+    }
+
+    /// One summary line leaves everything below the blank separator.
+    #[test]
+    fn image_gets_the_rows_below_the_text() {
+        let area = image_area(inner(40, 20), 1).expect("room for an image");
+        assert_eq!(area.x, 3, "must stay inside the block's left border");
+        assert_eq!(area.y, 5 + 2, "one text row plus one blank separator");
+        assert_eq!(area.width, 40);
+        assert_eq!(area.height, 18);
+    }
+
+    /// The decode-failure summary runs to three lines; the image is gone by
+    /// then, but the arithmetic still has to hold for a longer body.
+    #[test]
+    fn more_text_leaves_less_image() {
+        let area = image_area(inner(40, 20), 3).expect("room for an image");
+        assert_eq!(area.y, 5 + 4);
+        assert_eq!(area.height, 16);
+    }
+
+    /// A pane too short for both is text-only rather than a zero-height Rect.
+    #[test]
+    fn no_room_below_the_text_yields_none() {
+        assert_eq!(image_area(inner(40, 2), 1), None);
+        assert_eq!(image_area(inner(40, 1), 1), None);
+        assert_eq!(image_area(inner(40, 0), 1), None);
+    }
+
+    /// The divider can be dragged until the detail pane has no interior at
+    /// all. `y` must not run past the block either.
+    #[test]
+    fn no_width_yields_none() {
+        assert_eq!(image_area(inner(0, 20), 1), None);
+    }
+
+    /// A body longer than the pane must clamp rather than wrap the offset
+    /// past the bottom of the block.
+    #[test]
+    fn text_taller_than_the_pane_clamps() {
+        assert_eq!(image_area(inner(40, 10), 40), None);
+        assert_eq!(image_area(inner(40, 10), u16::MAX), None);
     }
 }
