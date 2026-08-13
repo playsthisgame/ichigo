@@ -7,6 +7,7 @@ use edit::Edit;
 use tree::{EntryKind, Entry, TreeNode, VisibleRow, load_entries, load_entry, build_tree, collect_folder_paths, visible_rows, detect_nerd_fonts};
 
 use anyhow::Result;
+use image::{imageops::FilterType, DynamicImage};
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -452,6 +453,9 @@ struct App {
     split_x: u16,
     term_width: u16,
     dragging_split: bool,
+    // Whether images have to be drawn through tmux's passthrough, which caps
+    // how large one may be — see `TMUX_PIXEL_BUDGET`.
+    tmux: bool,
     // How this terminal draws pixels, probed once at launch. `None` means it
     // cannot, and every image response falls back to its summary line.
     //
@@ -569,6 +573,12 @@ fn cell_size(reported: (u16, u16), tmux: bool) -> (u16, u16) {
     }
 }
 
+/// `$TMUX` is set by every tmux for every pane, and is the one signal that does
+/// not depend on how `default-terminal` was configured — see `prepare_tmux`.
+fn in_tmux() -> bool {
+    env::var_os("TMUX").is_some_and(|v| !v.is_empty())
+}
+
 /// Makes tmux ready to be drawn through, and reports whether we are under it.
 ///
 /// tmux does not implement any graphics protocol itself. What it has is
@@ -595,7 +605,7 @@ fn cell_size(reported: (u16, u16), tmux: bool) -> (u16, u16) {
 /// thread and long before the event loop, so the process is still single
 /// threaded and nothing can be reading the environment as it is written.
 fn prepare_tmux() -> bool {
-    if env::var_os("TMUX").is_none_or(|v| v.is_empty()) {
+    if !in_tmux() {
         return false;
     }
 
@@ -613,6 +623,74 @@ fn prepare_tmux() -> bool {
         .stderr(Stdio::null())
         .status();
     true
+}
+
+/// The most pixels an image may carry when it is drawn through tmux.
+///
+/// tmux collects a passthrough sequence into one buffer before forwarding it,
+/// and that buffer is bounded — `INPUT_BUF_LIMIT`, 1 MiB. Past it the sequence
+/// is **discarded whole**, not truncated: nothing reaches the terminal, no error
+/// is reported, and the pane fills with placeholder cells addressing an image
+/// that was never transmitted. Measured against tmux 3.5a, a payload of
+/// 1,048,000 bytes goes through and 1,048,570 does not.
+///
+/// `ratatui-image` wraps the entire chunked kitty transmit in a *single*
+/// passthrough sequence, so the only lever on this side is how many pixels go
+/// into it. A pixel costs 4 bytes as RGBA and 4/3 of that again in base64, plus
+/// about 0.3% of per-chunk framing — call it 5.4 bytes of sequence per pixel, so
+/// 180,000 pixels is ~970 KiB and leaves room for the header and the framing.
+///
+/// This bounds the image *as transmitted*, which is not the one handed to the
+/// widget: the resize target is rounded up to whole cells, so a transmit runs up
+/// to a cell wider and a cell taller than its source. Budgeting the source
+/// instead is what let a 2121×1414 photograph through at 522×380 — 1,061,847
+/// bytes, 13 KiB over, and dropped exactly like the uncapped one.
+/// `budget_dimensions` therefore solves for the padded size, and `Resize::Fit`
+/// never scales up, so nothing can grow past it afterwards.
+///
+/// A large response is then drawn at lower resolution than its pane could show —
+/// the same trade `ASSUMED_CELL_SIZE` makes, and for the same reason: an image
+/// smaller than it could be can still be read, and one that never arrives
+/// cannot. It binds only under tmux, and only on images past roughly 500×350.
+const TMUX_PIXEL_BUDGET: u32 = 180_000;
+
+/// Shrinks an image to what one tmux passthrough sequence can carry, leaving
+/// anything already inside the budget untouched.
+///
+/// `Triangle` rather than the `Nearest` the widget resizes with: this runs once
+/// per response, on the decode rather than on every frame, and it is the step
+/// that decides how much of a photograph survives.
+fn fit_for_tmux(image: DynamicImage, cell: (u16, u16)) -> DynamicImage {
+    match budget_dimensions(image.width(), image.height(), cell, TMUX_PIXEL_BUDGET) {
+        Some((w, h)) => image.resize(w, h, FilterType::Triangle),
+        None => image,
+    }
+}
+
+/// The dimensions `w`×`h` has to shrink to so that it still fits `budget` pixels
+/// *after* the widget has rounded its resize target up to whole `cell`s, or
+/// `None` when it already does.
+///
+/// The rounding can add a cell to each side, so what has to fit the budget is
+/// `(sw + cell.0) × (sh + cell.1)`. Substituting `sw = s·w`, `sh = s·h` makes
+/// that a quadratic in the scale `s`, and its positive root is the answer —
+/// solved rather than stepped towards so the result is exact and testable.
+fn budget_dimensions(w: u32, h: u32, cell: (u16, u16), budget: u32) -> Option<(u32, u32)> {
+    let (cw, ch) = (u32::from(cell.0).max(1), u32::from(cell.1).max(1));
+    // Widened before adding: an image is never this large, but a dimension near
+    // `u32::MAX` would wrap the padding into a value that looks like it fits.
+    if (u64::from(w) + u64::from(cw)) * (u64::from(h) + u64::from(ch)) <= u64::from(budget) {
+        return None;
+    }
+
+    let (w_f, h_f) = (f64::from(w), f64::from(h));
+    let a = w_f * h_f;
+    let b = w_f * f64::from(ch) + h_f * f64::from(cw);
+    let c = f64::from(cw) * f64::from(ch) - f64::from(budget);
+    // `a` is positive and `c` negative for any budget worth a cell, so the
+    // discriminant is positive and this root is the one in (0, 1).
+    let scale = (-b + (b * b - 4.0 * a * c).sqrt()) / (2.0 * a);
+    Some((((w_f * scale) as u32).max(1), ((h_f * scale) as u32).max(1)))
 }
 
 /// The cell size tmux invents when it has never been told a real one.
@@ -777,6 +855,7 @@ impl App {
             split_x: 0,
             term_width: 0,
             dragging_split: false,
+            tmux: in_tmux(),
             picker: detect_picker(),
         })
     }
@@ -1323,6 +1402,8 @@ impl App {
 
         match &self.picker {
             Some(picker) => {
+                let decoded =
+                    if self.tmux { fit_for_tmux(decoded, picker.font_size()) } else { decoded };
                 (summary, Some(Box::new(picker.new_resize_protocol(decoded))))
             }
             // No graphics protocol: the summary is the whole of the pane, and
@@ -2036,6 +2117,43 @@ mod tests {
         let names = chain_var_names(&[s1, s2]);
         // Only the truly user-supplied variable remains, listed once.
         assert_eq!(names, vec!["USER_ID".to_string()]);
+    }
+
+    /// tmux discards a passthrough sequence past 1 MiB whole, so an image that
+    /// would exceed it has to be shrunk before it is handed to the encoder.
+    #[test]
+    fn a_large_image_is_shrunk_to_what_tmux_will_carry() {
+        // The photograph that started this, on the cell size it was drawn at.
+        let cell = (18, 38);
+        let (w, h) = budget_dimensions(2121, 1414, cell, TMUX_PIXEL_BUDGET).expect("over budget");
+        // What has to fit is the size *after* the widget rounds up to cells.
+        let padded = (u64::from(w) + 18) * (u64::from(h) + 38);
+        assert!(padded <= u64::from(TMUX_PIXEL_BUDGET), "padded {padded}");
+        // At ~5.4 bytes of passthrough per pixel, inside tmux's 1 MiB.
+        assert!(padded * 54 / 10 < 1024 * 1024, "{} bytes", padded * 54 / 10);
+        // Aspect ratio survives: 2121/1414 is 1.5.
+        let ratio = f64::from(w) / f64::from(h);
+        assert!((ratio - 1.5).abs() < 0.01, "ratio {ratio}");
+    }
+
+    #[test]
+    fn an_image_inside_the_budget_is_left_alone() {
+        assert_eq!(budget_dimensions(64, 64, (18, 38), TMUX_PIXEL_BUDGET), None);
+        assert_eq!(budget_dimensions(400, 400, (9, 20), TMUX_PIXEL_BUDGET), None);
+        // Degenerate shapes keep at least one pixel on the short side.
+        let (w, h) = budget_dimensions(1_000_000, 2, (9, 20), TMUX_PIXEL_BUDGET)
+            .expect("over budget");
+        assert!(w >= 1 && h >= 1);
+    }
+
+    /// A huge cell size must not make the padding allowance eat the whole
+    /// budget and hand back a zero-sized image.
+    #[test]
+    fn the_budget_survives_an_unusually_large_cell() {
+        let (w, h) = budget_dimensions(4000, 3000, (32, 64), TMUX_PIXEL_BUDGET)
+            .expect("over budget");
+        assert!((u64::from(w) + 32) * (u64::from(h) + 64) <= u64::from(TMUX_PIXEL_BUDGET));
+        assert!(w > 1 && h > 1);
     }
 
     /// Under tmux the cell size the crate reports may be tmux's invention, and

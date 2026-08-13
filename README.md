@@ -288,6 +288,47 @@ which flags are mapped, ignored, and refused.
 
 If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
 
+#### Image responses
+
+A response whose content type is `image/*` is drawn in the response pane,
+underneath a summary line:
+
+```
+image/jpeg · 2121×1414 · 1.2 MB
+```
+
+The summary is always there, and it is real text — `f`, `y`, `V` and `c` work on
+it exactly as they do on a JSON body. The picture is drawn below it, and if it
+cannot be drawn you get the summary and a note saying why, never an error pane:
+a `200` that could not be decoded is still a `200`. SVG is shown as source
+rather than rendered, since its markup is more use in the text pane than a
+failed decode.
+
+Drawing needs a terminal that speaks a graphics protocol — kitty (Ghostty,
+Kitty), sixel, or iTerm2's (iTerm2, WezTerm). ichigo probes for one at launch;
+where there is none, the pane says so instead of leaving a blank space.
+
+**Inside tmux** it works with no configuration on your side. tmux draws no
+images itself, it only forwards them to the terminal it is attached to, and
+ichigo turns that forwarding on (`allow-passthrough`) for its own pane at
+launch — nothing is written to your `tmux.conf`, and nothing changes for any
+other pane. One thing does change: tmux refuses to forward more than 1 MiB at a
+time, so a large image is drawn at lower resolution than the pane could show. It
+is complete and readable, just softer than the same response outside tmux.
+
+**Inside [herdr](https://herdr.dev)**, add this to `~/.config/herdr/config.toml`
+and restart herdr:
+
+```toml
+[experimental]
+# Local Kitty graphics rendering for attached clients (needed for image
+# responses in ichigo, and any other TUI that draws images).
+kitty_graphics = true
+```
+
+Without it herdr does not render kitty graphics for its attached clients, so an
+image response shows only its summary line.
+
 ## Config format
 
 ```yaml
