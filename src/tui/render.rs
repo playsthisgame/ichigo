@@ -120,11 +120,94 @@ fn action_row(label: &str, color: Color, hint: &str, is_focused: bool) -> Line<'
     Line::from(spans)
 }
 
+/// The columns `input_line` spends before the value itself: two of indent, the
+/// `> ` marker.
+const INPUT_PREFIX: u16 = 4;
+
+/// The columns inside a bordered pane — the width a row actually has.
+fn interior(area: Rect) -> u16 {
+    area.width.saturating_sub(2)
+}
+
+/// Which slice of a value a field shows, in characters, and whether text is
+/// hidden either side of it.
+///
+/// The form panes are `Paragraph`s with no wrapping, so a value wider than the
+/// pane is simply cut off at the border — and with it the caret, which is the
+/// one thing on the row that has to stay on screen. This slides a window along
+/// the value instead, keeping the caret inside it.
+///
+/// It is computed fresh each frame from the caret rather than stored and
+/// nudged, so there is no scroll offset to keep in step with a value the form
+/// can replace underneath it. The cost of being stateless is that the window
+/// centres on the caret rather than following it lazily: text slides under a
+/// caret moving through the middle of a long value, which is what vim's own
+/// `scrolloff=999` does and is far better than the alternative of losing the
+/// caret off the edge.
+#[derive(Debug, PartialEq, Eq)]
+struct Window {
+    start: usize,
+    end: usize,
+    left: bool,
+    right: bool,
+}
+
+/// The window for a value of `len` characters with the caret `caret` characters
+/// into it, drawn in `width` columns.
+///
+/// Both markers are paid for whenever windowing happens at all, even when only
+/// one is drawn. Charging for them only when they appear would change the
+/// window's width as the caret reached either end of the value, sliding the
+/// text by a column for a reason that has nothing to do with the caret moving.
+fn window(len: usize, caret: usize, width: usize) -> Window {
+    // The insert caret is drawn *between* characters as its own glyph, so a
+    // value needs one column more than it has characters to show a caret at its
+    // end. A width too small to hold anything is left unwindowed: there is
+    // nothing useful to show, and the arithmetic below would have no budget.
+    if width < 4 || len < width {
+        return Window { start: 0, end: len, left: false, right: false };
+    }
+    let budget = width - 3;
+    let start = caret.saturating_sub(budget / 2).min(len - budget);
+    let end = (start + budget).min(len);
+    Window { start, end, left: start > 0, right: end < len }
+}
+
 /// A `  > value` input row, dimmed unless it is the one holding the caret.
-fn input_line(value: &str, caret: Option<&Edit>) -> Line<'static> {
+///
+/// `width` is the whole row's width — the pane's interior. A row too narrow to
+/// window is drawn whole and clipped by the pane, which is what every row did
+/// before there was a window at all.
+fn input_line(value: &str, caret: Option<&Edit>, width: u16) -> Line<'static> {
     let color = if caret.is_some() { Color::White } else { Color::DarkGray };
     let mut spans = vec![Span::styled("  > ", Style::default().fg(Color::DarkGray))];
-    spans.extend(field_spans(value, caret, color));
+
+    // Only the focused row has a caret to keep on screen. The rest are cut off
+    // at the border as before: without a caret there is no one place in the
+    // value that has to be visible, and a window would just hide the start.
+    let Some(edit) = caret else {
+        spans.extend(field_spans(value, None, color));
+        return Line::from(spans);
+    };
+
+    let chars: Vec<(usize, char)> = value.char_indices().collect();
+    let caret_col = chars.iter().take_while(|(i, _)| *i < edit.caret).count();
+    let win = window(chars.len(), caret_col, usize::from(width.saturating_sub(INPUT_PREFIX)));
+
+    let from = chars.get(win.start).map_or(value.len(), |(i, _)| *i);
+    let to = chars.get(win.end).map_or(value.len(), |(i, _)| *i);
+    let marker = Style::default().fg(Color::DarkGray);
+    if win.left {
+        spans.push(Span::styled("‹", marker));
+    }
+    spans.extend(spans_with_caret(
+        &value[from..to],
+        Some((edit.caret.saturating_sub(from), edit.insert)),
+        color,
+    ));
+    if win.right {
+        spans.push(Span::styled("›", marker));
+    }
     Line::from(spans)
 }
 
@@ -399,7 +482,7 @@ fn draw_new_request(
         }
         lines.push(Line::from(label_spans));
 
-        lines.push(input_line(value, caret(is_focused, edit)));
+        lines.push(input_line(value, caret(is_focused, edit), interior(area)));
         lines.push(Line::raw(""));
     }
 
@@ -591,7 +674,7 @@ fn draw_edit_body(
                 .fg(if focused == 0 { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )),
-        input_line(content_type, caret(focused == 0, edit)),
+        input_line(content_type, caret(focused == 0, edit), interior(area)),
         Line::raw(""),
         Line::from(Span::styled(
             "  body",
@@ -690,7 +773,7 @@ fn draw_new_profile(
         ),
         Span::styled(" *", Style::default().fg(Color::Red)),
     ]));
-    lines.push(input_line(name, caret(name_focused, edit)));
+    lines.push(input_line(name, caret(name_focused, edit), interior(area)));
     lines.push(Line::raw(""));
 
     // Param pairs: focused index 1+2i = key, 2+2i = value
@@ -704,7 +787,7 @@ fn draw_new_profile(
                 .fg(if key_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(input_line(key, caret(key_focused, edit)));
+        lines.push(input_line(key, caret(key_focused, edit), interior(area)));
 
         lines.push(Line::from(Span::styled(
             format!("  param {} value", i + 1),
@@ -712,7 +795,7 @@ fn draw_new_profile(
                 .fg(if val_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(input_line(value, caret(val_focused, edit)));
+        lines.push(input_line(value, caret(val_focused, edit), interior(area)));
         lines.push(Line::raw(""));
     }
 
@@ -759,7 +842,7 @@ fn draw_edit_pairs(
                 .fg(if name_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(input_line(name, caret(name_focused, edit)));
+        lines.push(input_line(name, caret(name_focused, edit), interior(area)));
 
         lines.push(Line::from(Span::styled(
             format!("  {} {} value", noun, i + 1),
@@ -767,7 +850,7 @@ fn draw_edit_pairs(
                 .fg(if value_focused { Color::Green } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(input_line(value, caret(value_focused, edit)));
+        lines.push(input_line(value, caret(value_focused, edit), interior(area)));
         lines.push(Line::raw(""));
     }
 
@@ -893,7 +976,7 @@ fn draw_var_input(
                 .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(input_line(value, caret(is_focused, edit)));
+        lines.push(input_line(value, caret(is_focused, edit), interior(area)));
         lines.push(Line::raw(""));
     }
 
@@ -926,7 +1009,7 @@ fn draw_test_input(
                 .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
                 .add_modifier(Modifier::BOLD),
         )));
-        lines.push(input_line(value, caret(is_focused, edit)));
+        lines.push(input_line(value, caret(is_focused, edit), interior(area)));
         lines.push(Line::raw(""));
     }
 
@@ -937,7 +1020,7 @@ fn draw_test_input(
             .fg(if iter_focused { Color::Yellow } else { Color::DarkGray })
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(input_line(iterations, caret(iter_focused, edit)));
+    lines.push(input_line(iterations, caret(iter_focused, edit), interior(area)));
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2005,5 +2088,92 @@ mod tests {
     #[test]
     fn a_trailing_newline_keeps_its_empty_line() {
         assert_eq!(text_area_lines("a\n", None, "").len(), 2);
+    }
+
+    #[test]
+    fn a_value_that_fits_is_not_windowed() {
+        // Nine characters and a caret glyph in ten columns is exactly the
+        // widest a value can be and still be shown whole.
+        assert_eq!(window(9, 9, 10), Window { start: 0, end: 9, left: false, right: false });
+    }
+
+    #[test]
+    fn a_caret_at_the_end_of_a_long_value_stays_visible() {
+        let win = window(100, 100, 20);
+        assert!(win.start <= 100 && 100 <= win.end, "caret outside {win:?}");
+        assert_eq!(win.end, 100);
+        assert!(win.left && !win.right);
+    }
+
+    #[test]
+    fn a_caret_at_the_start_of_a_long_value_stays_visible() {
+        let win = window(100, 0, 20);
+        assert_eq!(win.start, 0);
+        assert!(!win.left && win.right);
+    }
+
+    /// The property the whole thing exists for: wherever the caret is, the
+    /// window holds it.
+    #[test]
+    fn the_caret_is_inside_the_window_at_every_position() {
+        for width in [4, 5, 12, 40, 80] {
+            for len in [0, 1, 7, 40, 200] {
+                for caret in 0..=len {
+                    let win = window(len, caret, width);
+                    assert!(
+                        win.start <= caret && caret <= win.end,
+                        "len {len} caret {caret} width {width} gave {win:?}",
+                    );
+                    assert!(win.end <= len);
+                }
+            }
+        }
+    }
+
+    /// Both markers are always paid for, so the window is the same size
+    /// wherever it sits — text must not shift sideways just because a marker
+    /// stopped being drawn.
+    #[test]
+    fn the_window_is_the_same_width_wherever_it_sits() {
+        let widths: Vec<usize> = (0..=200).map(|c| window(200, c, 30)).map(|w| w.end - w.start).collect();
+        assert!(widths.iter().all(|w| *w == widths[0]), "{widths:?}");
+    }
+
+    /// A pane dragged down to a sliver has no room to window in; the row is
+    /// drawn whole and clipped, exactly as it was before windows existed.
+    #[test]
+    fn a_pane_too_narrow_to_window_is_left_alone() {
+        assert_eq!(window(50, 30, 3), Window { start: 0, end: 50, left: false, right: false });
+    }
+
+    #[test]
+    fn a_windowed_row_marks_the_text_it_hides() {
+        let edit = Edit::at_end(&"x".repeat(60));
+        let line = input_line(&"x".repeat(60), Some(&edit), 24);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.starts_with("  > ‹"), "{rendered}");
+        // The caret is at the end, so there is nothing hidden to its right.
+        assert!(!rendered.contains('›'), "{rendered}");
+        assert!(rendered.chars().count() <= 24, "{rendered}");
+    }
+
+    /// An unfocused row has no caret, and so no one place that has to be on
+    /// screen — it is drawn whole and clipped by the pane.
+    #[test]
+    fn an_unfocused_row_is_never_windowed() {
+        let line = input_line(&"x".repeat(60), None, 24);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rendered, format!("  > {}", "x".repeat(60)));
+    }
+
+    /// The window is measured in characters, so a multi-byte value must not
+    /// slice one in half.
+    #[test]
+    fn a_multibyte_value_is_sliced_on_char_boundaries() {
+        let value = "é".repeat(60);
+        let edit = Edit::at_end(&value);
+        let line = input_line(&value, Some(&edit), 24);
+        let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(rendered.contains('é'));
     }
 }

@@ -107,11 +107,21 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
             // Copied out before `app.mode` is borrowed: the two are separate
             // fields, so Rust can split-borrow them, but not through one `&mut`.
             let keys = app.keys;
+            // A second field borrow, disjoint from `app.mode`: the register has
+            // to outlive the field it is put into, so it cannot live on the
+            // `Edit` the way the undo history does.
+            let register = &mut app.register;
             let mut leaving = false;
             if let Mode::NewRequest { draft, error } = &mut app.mode {
                 match draft.focus_target() {
                     Focus::Field(i) => {
-                        match edit::apply(&mut draft.fields[i].1, &mut draft.edit, key, keys) {
+                        match edit::apply(
+                            &mut draft.fields[i].1,
+                            &mut draft.edit,
+                            key,
+                            keys,
+                            register,
+                        ) {
                             Applied::Yes => *error = None,
                             Applied::Exit => leaving = true,
                             // The normal-mode walk between rows. Not an error
@@ -235,13 +245,14 @@ pub(super) fn handle_key_edit_pairs(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => {
             let keys = app.keys;
+            let register = &mut app.register;
             let mut leaving = None;
             if let Mode::EditPairs { draft, pairs, focused, edit, error, .. } = &mut app.mode {
                 // `focused` stays a `&mut` so the walk arms below can move it;
                 // `idx` is the copy the field lookup needs.
                 let idx = *focused;
                 if let Some(value) = pair_field(pairs, idx) {
-                    match edit::apply(value, edit, key, keys) {
+                    match edit::apply(value, edit, key, keys, register) {
                         Applied::Yes => *error = None,
                         // Back to the form without saving: these edits live
                         // in the draft until the request itself is written.
@@ -305,6 +316,7 @@ pub(super) fn handle_key_edit_body(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => {
             let keys = app.keys;
+            let register = &mut app.register;
             let mut leaving = None;
             if let Mode::EditBody { draft, content_type, data, focused, edit, error } = &mut app.mode {
                 let value = body_field(content_type, data, *focused);
@@ -313,9 +325,9 @@ pub(super) fn handle_key_edit_body(app: &mut App, key: KeyEvent) -> bool {
                 // — where Enter types one and `j`/`k` move by line before they
                 // become a row walk.
                 let applied = if *focused == 0 {
-                    edit::apply(value, edit, key, keys)
+                    edit::apply(value, edit, key, keys, register)
                 } else {
-                    edit::apply_multiline(value, edit, key, keys)
+                    edit::apply_multiline(value, edit, key, keys, register)
                 };
                 match applied {
                     Applied::Yes => *error = None,
@@ -451,13 +463,14 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => {
             let keys = app.keys;
+            let register = &mut app.register;
             let mut leaving = None;
             if let Mode::NewProfile { draft, editing, name, params, focused, edit, error } =
                 &mut app.mode
             {
                 let idx = *focused;
                 if let Some(value) = profile_field(name, params, idx) {
-                    match edit::apply(value, edit, key, keys) {
+                    match edit::apply(value, edit, key, keys, register) {
                         Applied::Yes => *error = None,
                         // Back to the list without saving: `selected` returns to
                         // the profile being edited, or to the "new" row when
@@ -754,10 +767,11 @@ pub(super) fn handle_key_var_input(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => {
             let keys = app.keys;
+            let register = &mut app.register;
             let mut leaving = false;
             if let Mode::VarInput { vars, focused, edit, .. } = &mut app.mode {
                 let idx = *focused;
-                match edit::apply(&mut vars[idx].1, edit, key, keys) {
+                match edit::apply(&mut vars[idx].1, edit, key, keys, register) {
                     Applied::Exit => leaving = true,
                     Applied::FocusNext => step_vars(vars, focused, edit, true),
                     Applied::FocusPrev => step_vars(vars, focused, edit, false),
@@ -797,6 +811,7 @@ pub(super) fn handle_key_test_input(app: &mut App, key: KeyEvent) -> bool {
         }
         _ => {
             let keys = app.keys;
+            let register = &mut app.register;
             let mut leaving = false;
             if let Mode::TestInput { vars, focused, iterations, edit, .. } = &mut app.mode {
                 let idx = *focused;
@@ -812,7 +827,7 @@ pub(super) fn handle_key_test_input(app: &mut App, key: KeyEvent) -> bool {
                     Some(&mut *iterations)
                 };
                 if let Some(value) = value {
-                    match edit::apply(value, edit, key, keys) {
+                    match edit::apply(value, edit, key, keys, register) {
                         Applied::Exit => leaving = true,
                         Applied::FocusNext => {
                             step_test(vars, iterations, focused, edit, true)
