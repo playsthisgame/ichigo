@@ -19,6 +19,14 @@
 //!
 //! Undo (`u`) lives here too, and its history therefore lives and dies with the
 //! focused field's [`Edit`]: undo is per-field, and moving focus starts over.
+//!
+//! One field is not single-line: the request body. [`apply_multiline`] is the
+//! door for it — Enter becomes a newline, and `j`/`k` move by line before they
+//! fall off the field and become a row walk. Everything else it hands straight
+//! to [`apply`], which is why the motions that are *about* a line (`0`, `^`,
+//! `$`, `D`, `C`, `S`) are measured against the line the caret is on rather
+//! than against the whole value. On a value with no newline in it the two are
+//! the same string, so every single-line field behaves exactly as before.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
@@ -244,6 +252,68 @@ pub(super) fn apply(value: &mut String, edit: &mut Edit, key: KeyEvent, keys: Ke
     Applied::Yes
 }
 
+/// Applies one key to a field that may hold newlines — the request body, and
+/// nothing else.
+///
+/// It is a wrapper rather than a flag on [`apply`] because only two keys
+/// actually differ, and both of them differ in the direction of *more* text
+/// editing rather than less:
+///
+/// * `Enter` inserts a newline instead of falling through to the pane. It has
+///   to: a terminal without bracketed paste delivers a pasted JSON body as
+///   characters with Enters between the lines, so a pane whose Enter meant
+///   "apply" would keep the first line and throw the rest at its own bindings.
+///   That is the same contract the cURL import buffer has, and the reason both
+///   are applied with `Ctrl+s`.
+/// * `j` and `k` move by line while there is a line to move to, and only report
+///   [`Applied::FocusNext`] / [`Applied::FocusPrev`] off the top and bottom. In
+///   a one-line field there never is one, so the row walk is unchanged; in a
+///   twenty-line body, `j` walking to the next *row* would be unusable.
+///
+/// Everything else — insert, motions, undo, the insert-escape sequence — is
+/// [`apply`]'s, so the body field cannot drift away from the fields around it.
+pub(super) fn apply_multiline(
+    value: &mut String,
+    edit: &mut Edit,
+    key: KeyEvent,
+    keys: Keys,
+) -> Applied {
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return Applied::No;
+    }
+    edit.caret = clamp(value, edit.caret);
+
+    match key.code {
+        KeyCode::Enter if edit.insert => insert_str(value, edit, "\n"),
+        // Normal mode: vim's Enter is a line down, to the first non-blank.
+        KeyCode::Enter => {
+            let Some(caret) = line_down(value, edit.caret) else { return Applied::Yes };
+            edit.caret = first_non_blank(value, caret);
+            rest_on_char(value, edit);
+        }
+        KeyCode::Down => return vertical(value, edit, true),
+        KeyCode::Up => return vertical(value, edit, false),
+        KeyCode::Char('j') if !edit.insert => return vertical(value, edit, true),
+        KeyCode::Char('k') if !edit.insert => return vertical(value, edit, false),
+        _ => return apply(value, edit, key, keys),
+    }
+    Applied::Yes
+}
+
+/// One line down or up, or the row walk when there is no such line.
+fn vertical(value: &str, edit: &mut Edit, down: bool) -> Applied {
+    let moved = if down { line_down(value, edit.caret) } else { line_up(value, edit.caret) };
+    match moved {
+        Some(caret) => {
+            edit.caret = caret;
+            rest_on_char(value, edit);
+            Applied::Yes
+        }
+        None if down => Applied::FocusNext,
+        None => Applied::FocusPrev,
+    }
+}
+
 /// Inserts `text` at the caret and leaves the caret after it — the paste path.
 pub(super) fn insert_str(value: &mut String, edit: &mut Edit, text: &str) {
     edit.caret = clamp(value, edit.caret);
@@ -317,10 +387,13 @@ fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
         'B' => edit.caret = word_back(value, edit.caret, Words::Big),
         'e' => edit.caret = word_end(value, edit.caret, Words::Small),
         'E' => edit.caret = word_end(value, edit.caret, Words::Big),
-        '0' => edit.caret = 0,
-        '^' => edit.caret = first_non_blank(value),
+        // Measured against the line the caret is on, not the whole value. A
+        // field with no newline in it is one line, so this is the old
+        // behaviour everywhere except the body.
+        '0' => edit.caret = line_start(value, edit.caret),
+        '^' => edit.caret = first_non_blank(value, edit.caret),
         '$' => {
-            edit.caret = value.len();
+            edit.caret = line_end(value, edit.caret);
             rest_on_char(value, edit);
         }
         // Off the field entirely, to the pane's next/previous row. Reported
@@ -336,11 +409,11 @@ fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
             edit.insert = true;
         }
         'I' => {
-            edit.caret = first_non_blank(value);
+            edit.caret = first_non_blank(value, edit.caret);
             edit.insert = true;
         }
         'A' => {
-            edit.caret = value.len();
+            edit.caret = line_end(value, edit.caret);
             edit.insert = true;
         }
         'x' => {
@@ -361,28 +434,24 @@ fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
             edit.session_saved = true;
         }
         'D' => {
-            if edit.caret < value.len() {
-                edit.record(value);
-                value.truncate(edit.caret);
-            }
+            delete_to_line_end(value, edit);
             rest_on_char(value, edit);
         }
         'C' => {
-            if edit.caret < value.len() {
-                edit.record(value);
-                value.truncate(edit.caret);
-            }
+            delete_to_line_end(value, edit);
             edit.insert = true;
             edit.session_saved = true;
         }
         // `cc`/`dd` would need a pending-operator state; `S` is the one-key
         // spelling of the same thing and is what a full-line rewrite wants.
         'S' => {
-            if !value.is_empty() {
+            let start = line_start(value, edit.caret);
+            let end = line_end(value, edit.caret);
+            if end > start {
                 edit.record(value);
-                value.clear();
+                value.replace_range(start..end, "");
             }
-            edit.caret = 0;
+            edit.caret = start;
             edit.insert = true;
             edit.session_saved = true;
         }
@@ -414,18 +483,93 @@ fn next(value: &str, caret: usize) -> usize {
 }
 
 /// Pulls a normal-mode caret back off the end of the line, where vim never
-/// leaves it. A no-op in insert mode and on an empty value.
+/// leaves it. A no-op in insert mode and on an empty line.
+///
+/// The newline itself counts as the end: normal mode rests *on* a character,
+/// and `\n` is not one you can sit on — a caret there would draw the block
+/// cursor in the column past the last character, which is the position insert
+/// mode owns.
 fn rest_on_char(value: &str, edit: &mut Edit) {
-    if !edit.insert && edit.caret == value.len() {
+    if edit.insert {
+        return;
+    }
+    let at_line_end = edit.caret == value.len() || value[edit.caret..].starts_with('\n');
+    if at_line_end && edit.caret > line_start(value, edit.caret) {
         edit.caret = prev(value, edit.caret);
     }
 }
 
-fn first_non_blank(value: &str) -> usize {
-    value
+/// The first non-blank of the caret's line, or its start when the line is all
+/// blanks. Blanks here are spaces and tabs, never the newline that ends the
+/// line — `^` on a blank line must not walk onto the next one.
+fn first_non_blank(value: &str, caret: usize) -> usize {
+    let start = line_start(value, caret);
+    let end = line_end(value, caret);
+    value[start..end]
         .char_indices()
         .find(|(_, c)| !c.is_whitespace())
-        .map_or(0, |(i, _)| i)
+        .map_or(start, |(i, _)| start + i)
+}
+
+// ─── Line arithmetic ──────────────────────────────────────────────────────────
+//
+// Only the body field ever holds a newline. These are written so that a value
+// without one is a single line running from 0 to `len()`, which is what keeps
+// every other field's behaviour identical to what it was before.
+
+/// The offset just after the newline preceding `caret`, or 0.
+fn line_start(value: &str, caret: usize) -> usize {
+    value[..caret].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// The offset of the newline ending the caret's line, or `value.len()`.
+fn line_end(value: &str, caret: usize) -> usize {
+    value[caret..].find('\n').map_or(value.len(), |i| caret + i)
+}
+
+/// `D` and `C`: everything from the caret to the end of its line. Recorded only
+/// when there is something to delete, like every other mutation here.
+fn delete_to_line_end(value: &mut String, edit: &mut Edit) {
+    let end = line_end(value, edit.caret);
+    if end > edit.caret {
+        edit.record(value);
+        value.replace_range(edit.caret..end, "");
+    }
+}
+
+/// The same column one line down, clamped to that line's end. `None` on the
+/// last line — the caller turns that into a row walk.
+fn line_down(value: &str, caret: usize) -> Option<usize> {
+    let end = line_end(value, caret);
+    if end == value.len() {
+        return None;
+    }
+    Some(at_column(value, end + 1, column(value, caret)))
+}
+
+/// The same column one line up. `None` on the first line.
+fn line_up(value: &str, caret: usize) -> Option<usize> {
+    let start = line_start(value, caret);
+    if start == 0 {
+        return None;
+    }
+    Some(at_column(value, line_start(value, start - 1), column(value, caret)))
+}
+
+/// How many characters into its line the caret is. Characters and not bytes,
+/// so a line with a `é` in it does not shift the column under it.
+fn column(value: &str, caret: usize) -> usize {
+    value[line_start(value, caret)..caret].chars().count()
+}
+
+/// `column` characters into the line starting at `start`, or that line's end
+/// when it is shorter — vim's own rule for a short line under the cursor.
+fn at_column(value: &str, start: usize, column: usize) -> usize {
+    let end = line_end(value, start);
+    value[start..end]
+        .char_indices()
+        .nth(column)
+        .map_or(end, |(i, _)| start + i)
 }
 
 // ─── Word motions ─────────────────────────────────────────────────────────────
@@ -945,5 +1089,122 @@ mod tests {
 
         // Nothing to rest on, and no caret to pull back off the end.
         assert_eq!(Edit::landing("", false).caret, 0);
+    }
+
+    // ─── Multi-line fields (the request body) ─────────────────────────────────
+
+    fn run_multiline(value: &str, edit: Edit, presses: &[KeyEvent]) -> (String, Edit) {
+        let mut value = value.to_string();
+        let mut edit = edit;
+        for k in presses {
+            apply_multiline(&mut value, &mut edit, *k, Keys::default());
+        }
+        (value, edit)
+    }
+
+    /// The pane's whole reason for `apply_multiline`: Enter is a character, not
+    /// a command, so a body pasted as keystrokes keeps its lines.
+    #[test]
+    fn enter_types_a_newline_in_a_multiline_field() {
+        let (value, edit) = run_multiline(
+            "",
+            Edit::default(),
+            &[key('{'), code(KeyCode::Enter), key('}')],
+        );
+        assert_eq!(value, "{\n}");
+        assert_eq!(edit.caret, 3);
+    }
+
+    /// `j` and `k` are a line motion while there is a line to reach, and the
+    /// form's row walk only at the edges — otherwise `j` in a twenty-line body
+    /// would leave the field on the first press.
+    #[test]
+    fn j_and_k_move_by_line_before_they_walk_rows() {
+        let body = "one\ntwo\nthree";
+        let mut value = body.to_string();
+        let mut edit = normal_at(1);
+
+        assert_eq!(apply_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::Yes);
+        assert_eq!(edit.caret, 5);
+        assert_eq!(apply_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::Yes);
+        assert_eq!(edit.caret, 9);
+        // Off the bottom: now it is the pane's business.
+        assert_eq!(apply_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::FocusNext);
+
+        let mut edit = normal_at(1);
+        assert_eq!(apply_multiline(&mut value, &mut edit, key('k'), Keys::default()), Applied::FocusPrev);
+        assert_eq!(value, body);
+    }
+
+    /// A shorter line under the cursor takes its end, as vim does.
+    #[test]
+    fn a_vertical_move_clamps_to_a_shorter_line() {
+        let (_, edit) = run_multiline("longer\nab\nlonger", normal_at(4), &[key('j')]);
+        // "ab" is two characters; normal mode rests on the last of them.
+        assert_eq!(edit.caret, 8);
+    }
+
+    /// `0`, `^` and `$` are about a line, so in a body they are about *the*
+    /// line — and in every single-line field they are unchanged.
+    #[test]
+    fn line_motions_stay_on_their_line() {
+        let body = "  first\nsecond";
+        let (_, edit) = run_multiline(body, normal_at(10), &[key('0')]);
+        assert_eq!(edit.caret, 8);
+        let (_, edit) = run_multiline(body, normal_at(4), &[key('$')]);
+        assert_eq!(edit.caret, 6);
+        let (_, edit) = run_multiline(body, normal_at(4), &[key('^')]);
+        assert_eq!(edit.caret, 2);
+
+        // The single-line case: one line running the whole value.
+        let (_, edit) = run("  abc", normal_at(4), &[key('^')]);
+        assert_eq!(edit.caret, 2);
+        let (_, edit) = run("  abc", normal_at(0), &[key('$')]);
+        assert_eq!(edit.caret, 4);
+    }
+
+    /// `D` and `S` clear a line, not the rest of the body. Getting this wrong
+    /// is not cosmetic: `D` on line one of a JSON body would delete the body.
+    #[test]
+    fn d_and_s_stop_at_the_end_of_the_line() {
+        let (value, _) = run_multiline("one\ntwo\nthree", normal_at(5), &[key('D')]);
+        assert_eq!(value, "one\nt\nthree");
+
+        let (value, edit) = run_multiline("one\ntwo\nthree", normal_at(5), &[key('S')]);
+        assert_eq!(value, "one\n\nthree");
+        assert_eq!(edit.caret, 4);
+        assert!(edit.insert);
+    }
+
+    /// Normal mode rests *on* a character, and a newline is not one to sit on.
+    #[test]
+    fn the_caret_never_rests_on_a_newline() {
+        let (_, edit) = run_multiline("ab\ncd", normal_at(0), &[key('l'), key('l')]);
+        assert_eq!(edit.caret, 1);
+
+        // Leaving insert mode at the end of a line steps back the same way.
+        let (_, edit) = run_multiline("ab\ncd", Edit { caret: 2, insert: true, ..Edit::default() }, &[code(KeyCode::Esc)]);
+        assert_eq!(edit.caret, 1);
+    }
+
+    /// An empty line is a place the caret can be, so `Enter` at the end of a
+    /// body has somewhere to land.
+    #[test]
+    fn the_caret_can_sit_on_an_empty_line() {
+        let (value, edit) = run_multiline("a", Edit::at_end("a"), &[code(KeyCode::Enter)]);
+        assert_eq!(value, "a\n");
+        assert_eq!(edit.caret, 2);
+    }
+
+    /// Undo treats a whole typed body as one change, exactly as it does a URL.
+    #[test]
+    fn undo_walks_back_a_multiline_insert_session() {
+        let (value, edit) = run_multiline(
+            "",
+            Edit::default(),
+            &[key('a'), code(KeyCode::Enter), key('b'), code(KeyCode::Esc), key('u')],
+        );
+        assert_eq!(value, "");
+        assert_eq!(edit.caret, 0);
     }
 }

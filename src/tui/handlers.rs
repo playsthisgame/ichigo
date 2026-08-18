@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
 use super::edit::{self, Applied, Edit};
-use super::{App, Focus, Mode, PairKind, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field, step_row};
+use super::{App, Focus, Mode, PairKind, PendingAction, RequestDraft, ResponseKind, apply_body, body_field, pair_field, profile_field, step_row};
 use super::tree::{VisibleRow, visible_rows, build_tree, load_entries};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
@@ -58,6 +58,17 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                 app.mode = Mode::edit_pairs(PairKind::Query, draft.clone());
             }
         }
+        // The body. `Ctrl+b` is the mnemonic and, under tmux, the prefix key —
+        // which is a reason to be sure the row exists, not a reason to pick a
+        // worse letter: a chord tmux swallows costs a tmux user nothing, since
+        // Tab to the `body` row is the path nothing intercepts. It is `Ctrl+h`
+        // that could not be the only binding, because that one *arrives* as a
+        // different key rather than not arriving at all.
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::NewRequest { draft, .. } = &app.mode {
+                app.mode = Mode::edit_body(draft.clone());
+            }
+        }
         // Enter saves from a text field and does the row's thing on an action
         // row. Two meanings for one key, but the row under focus says which,
         // and a form whose only Enter saved would leave the action rows inert.
@@ -75,12 +86,13 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                 }
                 // Cloned out first: the new mode owns the draft, so it cannot
                 // be built while `app.mode` is still borrowed.
-                Focus::Headers | Focus::Query | Focus::Profiles => {
+                Focus::Headers | Focus::Query | Focus::Body | Focus::Profiles => {
                     let Mode::NewRequest { draft, .. } = &app.mode else { return false };
                     let draft = draft.clone();
                     app.mode = match target {
                         Focus::Headers => Mode::edit_pairs(PairKind::Headers, draft),
                         Focus::Query => Mode::edit_pairs(PairKind::Query, draft),
+                        Focus::Body => Mode::edit_body(draft),
                         // 0 is the first profile, or the "new" row when empty.
                         _ => Mode::ProfileList { draft, selected: 0 },
                     };
@@ -250,6 +262,97 @@ pub(super) fn handle_key_edit_pairs(app: &mut App, key: KeyEvent) -> bool {
         }
     }
     false
+}
+
+/// The draft's body: the content type on row 0, the data on row 1.
+///
+/// `Ctrl+s` applies and Enter types a newline — the cURL import buffer's
+/// contract rather than `EditPairs`'s, and for its reason: a terminal without
+/// bracketed paste delivers a pasted body as characters with Enters between the
+/// lines, so an Enter that applied would keep the first line and scatter the
+/// rest. On the content-type row, where a newline means nothing, Enter steps
+/// down to the body instead, so typing straight through the pane works.
+///
+/// Edits land in the draft only when `Ctrl+s` succeeds; Esc drops them, and the
+/// request itself is still unwritten until saved from the form.
+pub(super) fn handle_key_edit_body(app: &mut App, key: KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Tab => step_body(app, true),
+        KeyCode::BackTab => step_body(app, false),
+        KeyCode::Char('s') if ctrl => {
+            let taken = match &app.mode {
+                Mode::EditBody { draft, content_type, data, .. } => {
+                    Some((draft.clone(), content_type.clone(), data.clone()))
+                }
+                _ => None,
+            };
+            let Some((mut draft, content_type, data)) = taken else { return false };
+            match apply_body(&mut draft, &content_type, &data) {
+                Ok(()) => app.mode = Mode::NewRequest { draft, error: None },
+                Err(message) => {
+                    if let Mode::EditBody { error, .. } = &mut app.mode {
+                        *error = Some(message);
+                    }
+                }
+            }
+        }
+        // Enter on the content type is a step down, not an apply: the row below
+        // is where Enter types a newline, and one key meaning "save" on one row
+        // and "newline" on the next is the trap this pane exists inside of.
+        KeyCode::Enter if matches!(&app.mode, Mode::EditBody { focused: 0, .. }) => {
+            step_body(app, true);
+        }
+        _ => {
+            let keys = app.keys;
+            let mut leaving = None;
+            if let Mode::EditBody { draft, content_type, data, focused, edit, error } = &mut app.mode {
+                let value = body_field(content_type, data, *focused);
+                // The data row is the one field in the TUI that may hold
+                // newlines, so it is the one that goes through `apply_multiline`
+                // — where Enter types one and `j`/`k` move by line before they
+                // become a row walk.
+                let applied = if *focused == 0 {
+                    edit::apply(value, edit, key, keys)
+                } else {
+                    edit::apply_multiline(value, edit, key, keys)
+                };
+                match applied {
+                    Applied::Yes => *error = None,
+                    // Back to the form without applying: these edits live in
+                    // the draft until the request itself is written.
+                    Applied::Exit => leaving = Some(draft.clone()),
+                    Applied::FocusNext => step_body_at(content_type, data, focused, edit, true),
+                    Applied::FocusPrev => step_body_at(content_type, data, focused, edit, false),
+                    Applied::No => {}
+                }
+            }
+            if let Some(draft) = leaving {
+                app.mode = Mode::NewRequest { draft, error: None };
+            }
+        }
+    }
+    false
+}
+
+fn step_body(app: &mut App, forward: bool) {
+    if let Mode::EditBody { content_type, data, focused, edit, .. } = &mut app.mode {
+        step_body_at(content_type, data, focused, edit, forward);
+    }
+}
+
+/// One of the pane's two rows to the other, re-anchoring the caret and keeping
+/// the mode — the same obligation every focus move in the TUI carries.
+fn step_body_at(
+    content_type: &mut String,
+    data: &mut String,
+    focused: &mut usize,
+    edit: &mut Edit,
+    forward: bool,
+) {
+    *focused = step_row(*focused, 2, forward);
+    let insert = edit.insert;
+    *edit = Edit::landing(body_field(content_type, data, *focused), insert);
 }
 
 /// The draft's profiles. Rows are `0..profiles.len()` plus a trailing "new"

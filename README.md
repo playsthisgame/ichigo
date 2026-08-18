@@ -244,6 +244,11 @@ the whole URL you just typed rather than its last character. The history belongs
 to the field, and moving focus starts a new one — Tab away and back and there is
 nothing left to undo. There is no redo.
 
+Every field here is a single line, with one exception: the request body, where
+Enter types a newline, `j`/`k` move by line, and the line commands act on the
+line under the cursor. See
+[Editing the request body](#editing-the-request-body-in-the-tui).
+
 If you map `jk` (or similar) to `Esc` in vim, see [Configuring ichigo](#configuring-ichigo).
 
 #### Copying part of a response
@@ -428,15 +433,16 @@ Shift-Tab walk it, and the walk covers more than the four text fields:
 | `[ ] global` | Toggle between `.ichigo/` and `~/.config/ichigo/` |
 | `headers` | Open the headers pane |
 | `query params` | Open the query params pane |
+| `body` | Open the body pane |
 | `profiles` | Open the profiles pane |
 
 So every part of a request is reachable by tabbing through the form — there is
-no chord to know in advance. `Ctrl+g`, `Ctrl+e`, `Ctrl+q`, and `Ctrl+p` still
-jump straight to those four from anywhere in the form.
+no chord to know in advance. `Ctrl+g`, `Ctrl+e`, `Ctrl+q`, `Ctrl+b`, and
+`Ctrl+p` still jump straight to those five from anywhere in the form.
 
 The four text fields are editors (see [Editing text fields](#editing-text-fields)),
 which is why Esc takes two presses there — the first leaves insert mode, the
-second leaves the form. On the four rows below them there is no text to edit,
+second leaves the form. On the five rows below them there is no text to edit,
 so one Esc leaves.
 
 #### Editing headers and query params in the TUI
@@ -479,6 +485,46 @@ If the request has a body, a `Content-Type` **header** is stored as the body's
 when it sends, and holding both would put it on the wire twice. That rule is
 headers-only: a query param that happens to be named `Content-Type` is just a
 param.
+
+#### Editing the request body in the TUI
+
+Tab to `body` in the request form and press Enter, or press `Ctrl+b`:
+
+| Key | Action |
+| --- | ------ |
+| Tab / Shift-Tab | Move between the content type and the body |
+| Enter | A newline in the body; a step down from the content type |
+| `Ctrl+s` | Apply to the request |
+| Esc | Discard the edits |
+
+The body is the one field in ichigo that holds more than one line, so Enter
+types a newline there and `Ctrl+s` is what applies the pane — the same pair of
+keys the cURL import buffer uses, and for the same reason: a terminal without
+bracketed paste delivers a pasted body as characters with Enters between the
+lines, so an Enter that applied would keep the first line and throw the rest
+away. Inside the body, `j` and `k` move by line and only move between the
+pane's two rows at the top and bottom; `0`, `$`, `D` and `S` act on the line
+under the cursor rather than on the whole body.
+
+> `Ctrl+b` is tmux's default prefix key, so under tmux it never reaches ichigo.
+> Tab to the `body` row and press Enter instead — as with every other pane,
+> that is the path nothing can intercept.
+
+**Emptying the body removes it**, along with its content type: a request with
+an empty body is a request that sends none, and this is the way to take a body
+back off a request that has one. Going the other way, giving a body to a
+request that had none takes over its `Content-Type` header — ichigo derives that
+header from the body when it sends, so holding both would put it on the wire
+twice. The content type field opens on that header's value when there is one,
+on the existing body's when there is one, and on `application/json` otherwise.
+A body with the content type cleared is refused rather than guessed at.
+
+The body itself is stored exactly as typed. Unlike header and param values it is
+not trimmed: leading whitespace and a trailing newline are bytes the server may
+well be counting.
+
+Applying only updates the request in memory, as the other panes do — Enter on
+the request form is what writes the file.
 
 #### Editing profiles in the TUI
 
