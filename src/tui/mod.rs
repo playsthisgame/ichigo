@@ -500,6 +500,12 @@ struct App {
     // Read once at launch from `config.toml`. Not reloaded mid-session: a keymap
     // changing under a half-typed field would be worse than not reloading it.
     keys: Keys,
+    // What `y`, `d`, `x` and friends last took, and what `p` puts. It lives on
+    // `App` rather than on the focused field's `Edit` — where the undo history
+    // lives — because the point of a register is to carry text *between*
+    // fields: a token yanked out of one header and put into another. It is
+    // charwise only; `edit::cut` says why.
+    register: String,
     mode: Mode,
     // ── The draggable split ──
     // The list pane's share of the width, seeded from `layout.split_pct` and
@@ -922,6 +928,7 @@ impl App {
             filter_active: false,
             show_help: false,
             keys: config.keys,
+            register: String::new(),
             mode,
             split_pct: config.split_pct,
             split_x: 0,
