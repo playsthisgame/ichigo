@@ -139,6 +139,21 @@ enum Mode {
         edit: Edit,
         error: Option<String>,
     },
+    // The draft's body: its content type and its data, on two rows.
+    //
+    // A separate mode from `EditPairs` because a body is not a list of pairs —
+    // it is one long, multi-line string, so the pane has a fixed two rows, an
+    // Enter that types a newline, and `Ctrl+s` to apply. Its edits live in the
+    // draft until the request itself is saved, exactly as every other sub-pane's
+    // do. focused: 0 = content type, 1 = data.
+    EditBody {
+        draft: RequestDraft,
+        content_type: String,
+        data: String,
+        focused: usize,
+        edit: Edit,
+        error: Option<String>,
+    },
     // The draft's profiles, for picking one to edit or delete. The single way
     // into `NewProfile`, so every profile action starts from the same screen.
     // selected: 0..profiles.len() = a profile, profiles.len() = the "new" row —
@@ -220,6 +235,29 @@ impl Mode {
         Mode::EditPairs { kind, draft, pairs, focused: 0, edit, error: None }
     }
 
+    /// Opens on the draft's body, or on an empty one ready to be typed.
+    ///
+    /// The content type is seeded the way `RequestDraft::blank` seeds `method`
+    /// with `GET`: a visible default in an editable field, not a silent one. A
+    /// draft with no body but a `Content-Type` *header* seeds from that header
+    /// instead, since `apply_body` is about to take the header over — losing
+    /// the value the user already typed would be the worse surprise.
+    fn edit_body(draft: RequestDraft) -> Self {
+        let (content_type, data) = match draft.body() {
+            Some(body) => (body.content_type.clone(), body.data.clone()),
+            None => (
+                draft
+                    .headers()
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    .map_or_else(|| DEFAULT_CONTENT_TYPE.to_string(), |(_, v)| v.clone()),
+                String::new(),
+            ),
+        };
+        let edit = Edit::at_end(&content_type);
+        Mode::EditBody { draft, content_type, data, focused: 0, edit, error: None }
+    }
+
     fn new_profile(
         draft: RequestDraft,
         editing: Option<usize>,
@@ -295,18 +333,19 @@ impl PairKind {
 
 /// What `RequestDraft::focused` is pointing at.
 ///
-/// Tab walks the four text fields and then four rows that are *actions* — the
-/// global flag, the headers pane, the query pane, the profiles pane — so that
-/// everything the form can reach is reachable by walking it, with no chord to
-/// know in advance. Text and actions have to stay distinguishable because only
-/// the first has a caret: handing an action row to `edit::apply` would index
-/// `fields` out of range.
+/// Tab walks the four text fields and then five rows that are *actions* — the
+/// global flag, the headers pane, the query pane, the body pane, the profiles
+/// pane — so that everything the form can reach is reachable by walking it,
+/// with no chord to know in advance. Text and actions have to stay
+/// distinguishable because only the first has a caret: handing an action row to
+/// `edit::apply` would index `fields` out of range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
     Field(usize),
     Global,
     Headers,
     Query,
+    Body,
     Profiles,
 }
 
@@ -332,7 +371,8 @@ pub(crate) struct RequestDraft {
     // Some(name) when editing an existing request; None when creating one.
     pub(crate) original_name: Option<String>,
     pub(crate) global: bool,
-    // Carried through the form untouched.
+    // Edited in their own panes and carried here in between; `extract` is the
+    // one the form still only carries.
     headers: HashMap<String, String>,
     query: HashMap<String, String>,
     body: Option<crate::config::Body>,
@@ -383,9 +423,13 @@ impl RequestDraft {
         &self.query
     }
 
-    /// The number of Tab stops: the text fields, then the four action rows.
+    pub(crate) fn body(&self) -> Option<&crate::config::Body> {
+        self.body.as_ref()
+    }
+
+    /// The number of Tab stops: the text fields, then the five action rows.
     pub(crate) fn rows(&self) -> usize {
-        self.fields.len() + 4
+        self.fields.len() + 5
     }
 
     /// What `focused` is pointing at. Anything past the last field is an action
@@ -397,6 +441,7 @@ impl RequestDraft {
             Some(0) => Focus::Global,
             Some(1) => Focus::Headers,
             Some(2) => Focus::Query,
+            Some(3) => Focus::Body,
             _ => Focus::Profiles,
         }
     }
@@ -481,6 +526,16 @@ struct App {
     // which is only safe before the alternate screen is up.
     picker: Option<Picker>,
 }
+
+/// What a body opened on a request that has none starts its content type at.
+///
+/// `from_curl` uses curl's own default (`application/x-www-form-urlencoded`)
+/// because it is transcribing a command someone else wrote, and guessing
+/// differently would misreport what that command sends. This is the opposite
+/// situation — nothing has been sent yet, and a body typed into a TUI in 2025
+/// is overwhelmingly JSON. It is a starting value in an editable field, not a
+/// rule: the field is right there, one Tab stop before the body itself.
+const DEFAULT_CONTENT_TYPE: &str = "application/json";
 
 /// How far either side of the divider still counts as grabbing it. The divider
 /// is two adjacent border columns (the list's right, the detail's left), so a
@@ -1733,6 +1788,22 @@ impl App {
                     edit::insert_str(value, edit, &single_line());
                 }
             }
+            // The body's data field is the second place newlines survive a
+            // paste — pasting a JSON document into it is the whole point of the
+            // pane. Its content type is a single line like every other field.
+            //
+            // `\r` is a line break here rather than data: `single_line` already
+            // treats it as one, a terminal sends it for Enter, and a body that
+            // arrives with CRLF endings would otherwise carry a stray CR into
+            // every line of the file — invisible in the pane and on the wire.
+            Mode::EditBody { content_type, data, focused, edit, error, .. } => {
+                *error = None;
+                if *focused == 0 {
+                    edit::insert_str(content_type, edit, &single_line());
+                } else {
+                    edit::insert_str(data, edit, &text.replace("\r\n", "\n").replace('\r', "\n"));
+                }
+            }
             Mode::VarInput { vars, focused, edit, .. } => {
                 if let Some((_, value)) = vars.get_mut(*focused) {
                     edit::insert_str(value, edit, &single_line());
@@ -1797,6 +1868,9 @@ impl App {
         }
         if matches!(self.mode, Mode::EditPairs { .. }) {
             return handlers::handle_key_edit_pairs(self, key);
+        }
+        if matches!(self.mode, Mode::EditBody { .. }) {
+            return handlers::handle_key_edit_body(self, key);
         }
         if matches!(self.mode, Mode::ProfileList { .. }) {
             return handlers::handle_key_profile_list(self, key);
@@ -1941,6 +2015,60 @@ fn apply_query(draft: &mut RequestDraft, pairs: Vec<(String, String)>) -> Result
 
     draft.query = kept.into_iter().collect();
     Ok(())
+}
+
+/// Folds an edited body back into a draft.
+///
+/// The body is one value with two parts, so unlike the pair panes there is
+/// nothing to drop or de-duplicate; what this owns instead is the three-way
+/// decision about whether the request still *has* a body:
+///
+/// * **Blank data removes it.** The data is the body — an empty one is not a
+///   body with nothing in it, it is a request that sends none, and that is the
+///   only way to take a body off a request that has one. Its content type goes
+///   with it rather than being left behind as a header, since a `Content-Type`
+///   on a bodyless request describes nothing.
+/// * **Data with a blank content type is refused**, by name, rather than
+///   defaulted. The pane opens with one filled in, so a blank field is someone
+///   having cleared it, and quietly putting a guess on the wire is exactly what
+///   the rest of this config refuses to do.
+/// * **Any body takes the `Content-Type` header over.** That is the same
+///   normalization `apply_headers` and `from_curl` apply, for the same reason:
+///   `to_curl` re-derives the header from the body, so a config holding both
+///   emits it twice. Here it has to run in the create direction too — a
+///   bodyless request may legitimately carry the header, and adding a body to
+///   it is the moment the header stops being the place that value lives.
+///
+/// The data is stored exactly as typed, with no trimming: leading whitespace in
+/// a body is the sender's business, and a trailing newline is a byte the server
+/// may well be counting.
+fn apply_body(draft: &mut RequestDraft, content_type: &str, data: &str) -> Result<(), String> {
+    if data.is_empty() {
+        draft.body = None;
+        return Ok(());
+    }
+    let content_type = content_type.trim();
+    if content_type.is_empty() {
+        return Err("Content type is required for a body".to_string());
+    }
+
+    draft.headers.retain(|k, _| !k.eq_ignore_ascii_case("content-type"));
+    draft.body = Some(crate::config::Body {
+        content_type: content_type.to_string(),
+        data: data.to_string(),
+    });
+    Ok(())
+}
+
+/// The body field a `Mode::EditBody` focus index points at: `0` is the content
+/// type, `1` the data. There is no third row, so this cannot fail the way
+/// `pair_field` can.
+fn body_field<'a>(
+    content_type: &'a mut String,
+    data: &'a mut String,
+    focused: usize,
+) -> &'a mut String {
+    if focused == 0 { content_type } else { data }
 }
 
 /// The row a `Mode::EditPairs` focus index points at: `2i` is
@@ -2422,6 +2550,121 @@ mod tests {
         assert_eq!(draft.body.as_ref().unwrap().content_type, before, "body was touched");
     }
 
+    // ─── The body pane ────────────────────────────────────────────────────────
+
+    /// The issue this pane was built for: a POST's body was carried through the
+    /// form untouched, so the one thing you could not edit about a POST was
+    /// what it posts.
+    #[test]
+    fn applying_a_body_replaces_the_one_the_draft_carried() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        apply_body(&mut draft, "text/plain", "hello").unwrap();
+
+        let body = draft.body.as_ref().expect("body");
+        assert_eq!(body.content_type, "text/plain");
+        assert_eq!(body.data, "hello");
+    }
+
+    /// A body is what makes a request a POST worth sending; blanking it is the
+    /// only way to take one back off.
+    #[test]
+    fn blank_data_removes_the_body_entirely() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        apply_body(&mut draft, "application/json", "").unwrap();
+        assert!(draft.body.is_none());
+    }
+
+    /// Refused by name rather than defaulted: the field opens filled in, so a
+    /// blank one is someone having cleared it.
+    #[test]
+    fn data_without_a_content_type_is_refused() {
+        let mut draft = RequestDraft::blank();
+        let err = apply_body(&mut draft, "   ", "{}").expect_err("no content type");
+        assert!(err.contains("Content type"), "the error names the field: {err}");
+        assert!(draft.body.is_none(), "nothing applied on refusal");
+    }
+
+    /// The same normalization `apply_headers` and `from_curl` make, in the
+    /// create direction: a bodyless request may carry the header, and adding a
+    /// body is the moment that stops being where the value lives. Holding both
+    /// would put it on the wire twice.
+    #[test]
+    fn a_new_body_takes_over_the_content_type_header() {
+        let mut draft = RequestDraft::blank();
+        draft.headers.insert("content-type".to_string(), "text/csv".to_string());
+
+        apply_body(&mut draft, "text/csv", "a,b").unwrap();
+
+        assert!(draft.headers.is_empty(), "the header moved onto the body");
+        assert_eq!(draft.body.as_ref().unwrap().content_type, "text/csv");
+    }
+
+    /// And it is that header the pane opens on, rather than the default —
+    /// seeding from the default would quietly discard a value already typed.
+    #[test]
+    fn the_pane_opens_on_the_content_type_the_request_already_has() {
+        let mut draft = RequestDraft::blank();
+        draft.headers.insert("Content-Type".to_string(), "text/csv".to_string());
+        let Mode::EditBody { content_type, data, .. } = Mode::edit_body(draft) else {
+            panic!("edit_body builds an EditBody");
+        };
+        assert_eq!(content_type, "text/csv");
+        assert!(data.is_empty());
+
+        let Mode::EditBody { content_type, .. } = Mode::edit_body(RequestDraft::blank()) else {
+            panic!("edit_body builds an EditBody");
+        };
+        assert_eq!(content_type, DEFAULT_CONTENT_TYPE);
+
+        // An existing body wins over both.
+        let draft = RequestDraft::from_config(full_config(), None, false);
+        let Mode::EditBody { content_type, data, edit, .. } = Mode::edit_body(draft) else {
+            panic!("edit_body builds an EditBody");
+        };
+        assert_eq!(content_type, "application/json");
+        assert_eq!(data, r#"{"a":1}"#);
+        // Opened on the content type, caret at its end and ready to type.
+        assert_eq!(edit.caret, content_type.len());
+    }
+
+    /// Whitespace in a body is the sender's business — a trailing newline is a
+    /// byte the server may be counting — so unlike every pair pane, nothing here
+    /// is trimmed. The content type, which is a header value, still is.
+    #[test]
+    fn body_data_is_stored_exactly_as_typed() {
+        let mut draft = RequestDraft::blank();
+        apply_body(&mut draft, "  application/json  ", "  {\n  \"a\": 1\n}\n").unwrap();
+
+        let body = draft.body.as_ref().expect("body");
+        assert_eq!(body.content_type, "application/json");
+        assert_eq!(body.data, "  {\n  \"a\": 1\n}\n");
+    }
+
+    /// Editing the body must leave the rest of the request where it was; it is
+    /// one row of the form among several.
+    #[test]
+    fn editing_the_body_leaves_the_rest_of_the_draft_alone() {
+        let mut draft = RequestDraft::from_config(full_config(), None, false);
+        apply_body(&mut draft, "text/plain", "hello").unwrap();
+
+        assert_eq!(draft.headers.get("Accept").unwrap(), "application/json");
+        assert_eq!(draft.query.get("page").unwrap(), "2");
+        assert_eq!(draft.profiles.len(), 1);
+        assert!(draft.extract.is_some());
+    }
+
+    /// The two rows the pane walks, in order.
+    #[test]
+    fn the_body_pane_walks_its_two_rows() {
+        let mut content_type = "application/json".to_string();
+        let mut data = "{}".to_string();
+        assert_eq!(body_field(&mut content_type, &mut data, 0), "application/json");
+        assert_eq!(body_field(&mut content_type, &mut data, 1), "{}");
+        assert_eq!(step_row(0, 2, true), 1);
+        assert_eq!(step_row(1, 2, true), 0);
+        assert_eq!(step_row(0, 2, false), 1);
+    }
+
     /// Editing one map must not disturb the other; they are separate rows on
     /// the form and separate keys in the config.
     #[test]
@@ -2460,12 +2703,12 @@ mod tests {
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
     }
 
-    /// Tab has to reach every action row. Query was added between headers and
-    /// profiles, so the walk is four fields then four rows.
+    /// Tab has to reach every action row. Query and then body were added
+    /// between headers and profiles, so the walk is four fields then five rows.
     #[test]
     fn tab_walks_every_field_and_action_row() {
         let draft = RequestDraft::blank();
-        assert_eq!(draft.rows(), draft.fields.len() + 4);
+        assert_eq!(draft.rows(), draft.fields.len() + 5);
 
         let targets: Vec<Focus> = (0..draft.rows())
             .map(|i| {
@@ -2485,6 +2728,7 @@ mod tests {
                 Focus::Global,
                 Focus::Headers,
                 Focus::Query,
+                Focus::Body,
                 Focus::Profiles,
             ]
         );
