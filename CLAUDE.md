@@ -130,3 +130,19 @@ This costs the terminal's own click-drag text selection while ichigo is up — `
 **Pending actions.** `ProfileSelect` and `VarInput` are shared by every action that needs a profile or variables, so each carries a `PendingAction` (`Run` / `Test` / `Curl`) naming its destination. Both `confirm_profile_select` and `handle_key_var_input`'s Enter dispatch on it. A new action must set it at *every* construction site of both modes — miss the `VarInput` one and the action silently falls through to running the request, because that is where the pipeline used to be hardcoded. `Mode::Response` likewise carries a `ResponseKind` (`Http(u16)` / `Error` / `Curl`) instead of encoding "not a response" as status `0`; build it through `App::show_message` / `show_error` rather than spelling out the variant.
 
 **Config freshness.** The TUI is meant to stay open for long sessions, so no action may rely on the entry snapshot taken at startup. `App::entries` is a display cache only. Every action path (`try_run_selected`, `try_test_selected`, `confirm_profile_select`, `start_chain`) re-reads the config through `tree::load_entry` before deriving profiles or `{{VAR}}` names — those feed the vars map, and `interpolate` prefers that map over everything else, so a stale value there silently wins over a correct one in the file. On a load failure the action aborts via `App::show_error`; it must never fall back to the cached entry. `R` in Browse mode calls `reload_entries` for a full resync (picks up files added/renamed/deleted on disk); `r` is run. Environment-sourced `{{VAR}}` values cannot be refreshed — the process env is fixed at launch.
+
+## GitHub project board
+
+Project: Ichigo, user project #4 (private), owner: playsthisgame
+
+Status field: PVTSSF_lAHOBXAZx84Bgp_fzhfouZA
+
+Option IDs:
+- Backlog:     f75ad846
+- Ready:       61e4505c
+- In progress: 47fc9ee4
+- In review:   df73e18b
+- Done:        98236657
+
+Use these IDs directly — do not re-query the field list each run.
+Note the casing: "In progress" and "In review" are not title case.
