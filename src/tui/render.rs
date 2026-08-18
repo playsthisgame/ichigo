@@ -18,8 +18,15 @@ use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
 /// the only signal of which mode a field is in. Nothing else says so, and
 /// nothing else needs to.
 fn field_spans(value: &str, edit: Option<&Edit>, color: Color) -> Vec<Span<'static>> {
+    spans_with_caret(value, edit.map(|e| (e.caret, e.insert)), color)
+}
+
+/// `field_spans` with the caret passed as a position rather than an `Edit`, for
+/// the body pane: there the caret is one offset into a multi-line value, and the
+/// line holding it needs it re-measured from that line's start.
+fn spans_with_caret(value: &str, caret: Option<(usize, bool)>, color: Color) -> Vec<Span<'static>> {
     let text = Style::default().fg(color);
-    let Some(edit) = edit else {
+    let Some((caret_at, insert)) = caret else {
         return vec![Span::styled(value.to_string(), text)];
     };
 
@@ -30,14 +37,14 @@ fn field_spans(value: &str, edit: Option<&Edit>, color: Color) -> Vec<Span<'stat
         .char_indices()
         .map(|(i, _)| i)
         .chain(std::iter::once(value.len()))
-        .take_while(|i| *i <= edit.caret)
+        .take_while(|i| *i <= caret_at)
         .last()
         .unwrap_or(0);
     let (before, after) = value.split_at(caret);
     let cursor = Style::default().fg(Color::Black).bg(Color::White);
 
     let mut spans = vec![Span::styled(before.to_string(), text)];
-    match (edit.insert, after.chars().next()) {
+    match (insert, after.chars().next()) {
         (true, _) => {
             spans.push(Span::styled("│", Style::default().fg(Color::White)));
             spans.push(Span::styled(after.to_string(), text));
@@ -51,6 +58,33 @@ fn field_spans(value: &str, edit: Option<&Edit>, color: Color) -> Vec<Span<'stat
         }
     }
     spans
+}
+
+/// A multi-line value as one drawn line per line of text, with the caret on
+/// whichever line holds it.
+///
+/// Splitting on `\n` rather than wrapping the whole thing in a `Paragraph`:
+/// the caret is a byte offset into the value, and only the line containing it
+/// can place it. `split('\n')` keeps a trailing empty segment for a value
+/// ending in a newline, which is exactly the empty last line the caret sits on
+/// after pressing Enter.
+fn text_area_lines(value: &str, edit: Option<&Edit>, indent: &str) -> Vec<Line<'static>> {
+    let color = if edit.is_some() { Color::White } else { Color::DarkGray };
+    let mut start = 0;
+    let mut lines = Vec::new();
+    for segment in value.split('\n') {
+        let end = start + segment.len();
+        // A caret at `end` belongs to this line's end; the next line starts at
+        // `end + 1`, past the newline, so no offset is claimed twice.
+        let caret = edit
+            .filter(|e| e.caret >= start && e.caret <= end)
+            .map(|e| (e.caret - start, e.insert));
+        let mut spans = vec![Span::raw(indent.to_string())];
+        spans.extend(spans_with_caret(segment, caret, color));
+        lines.push(Line::from(spans));
+        start = end + 1;
+    }
+    lines
 }
 
 /// The caret to draw in a field: `Some` only for the focused one.
@@ -160,13 +194,16 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             draw_test_results(frame, panes[1], results);
         }
         Mode::NewRequest { draft, error } => {
-            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.original_name.is_some(), draft.global, error.as_deref());
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.body(), draft.original_name.is_some(), draft.global, error.as_deref());
         }
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
         }
         Mode::EditPairs { kind, pairs, focused, edit, error, .. } => {
             draw_edit_pairs(frame, panes[1], *kind, pairs, *focused, edit, error.as_deref());
+        }
+        Mode::EditBody { content_type, data, focused, edit, error, .. } => {
+            draw_edit_body(frame, panes[1], content_type, data, *focused, edit, error.as_deref());
         }
         Mode::ProfileList { draft, selected } => {
             draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1);
@@ -340,6 +377,7 @@ fn draw_new_request(
     profiles: &[crate::config::Profile],
     headers: &std::collections::HashMap<String, String>,
     query: &std::collections::HashMap<String, String>,
+    body: Option<&crate::config::Body>,
     is_edit: bool,
     global: bool,
     error: Option<&str>,
@@ -365,8 +403,8 @@ fn draw_new_request(
         lines.push(Line::raw(""));
     }
 
-    // The three rows Tab reaches after the last field. Their state is on the
-    // row itself, so focus is the marker and the colour rather than a caret.
+    // The rows Tab reaches after the last field. Their state is on the row
+    // itself, so focus is the marker and the colour rather than a caret.
     let (global_check, global_color) = if global {
         ("[x] global", Color::Cyan)
     } else {
@@ -430,6 +468,33 @@ fn draw_new_request(
     }
     lines.push(Line::raw(""));
 
+    // The body, in the config's own order: after query, before profiles.
+    lines.push(action_row(
+        "body",
+        Color::DarkGray,
+        "Enter to edit",
+        focused == fields.len() + 3,
+    ));
+    match body {
+        None => lines.push(Line::from(Span::styled(
+            "    none",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Some(body) => {
+            lines.push(Line::from(vec![
+                Span::styled("    content type: ", Style::default().fg(Color::Cyan)),
+                Span::styled(body.content_type.clone(), Style::default().fg(Color::White)),
+            ]));
+            for line in body_preview(&body.data) {
+                lines.push(Line::from(Span::styled(
+                    format!("    {line}"),
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+    }
+    lines.push(Line::raw(""));
+
     // Drawn even when empty, unlike before: it is a Tab stop now, and a row
     // that vanishes when there is nothing in it is one focus can land on
     // invisibly.
@@ -437,7 +502,7 @@ fn draw_new_request(
         "profiles",
         Color::DarkGray,
         "Enter to edit",
-        focused == fields.len() + 3,
+        focused == fields.len() + 4,
     ));
     if profiles.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -471,6 +536,83 @@ fn draw_new_request(
     let paragraph = Paragraph::new(lines).block(
         Block::default()
             .title(title)
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+/// The body as the request form shows it: at most `BODY_PREVIEW_LINES` lines,
+/// then a count of what is left.
+///
+/// The form is one `Paragraph` with no scrolling, so an eighty-line JSON body
+/// would push `profiles` off the bottom of the pane — a Tab stop that focus can
+/// land on invisibly, which is the thing the action rows were introduced to
+/// stop. Headers and query params can do the same in principle, but a request
+/// with sixty headers is a request someone built by hand; a sixty-line body is
+/// an ordinary POST.
+fn body_preview(data: &str) -> Vec<String> {
+    let lines: Vec<&str> = data.lines().collect();
+    let mut preview: Vec<String> = lines
+        .iter()
+        .take(BODY_PREVIEW_LINES)
+        .map(|line| (*line).to_string())
+        .collect();
+    if let Some(hidden) = lines.len().checked_sub(BODY_PREVIEW_LINES).filter(|n| *n > 0) {
+        preview.push(format!("… {hidden} more line{}", if hidden == 1 { "" } else { "s" }));
+    }
+    preview
+}
+
+/// Enough to recognize a body by, short enough that the row below it stays on
+/// screen in a pane of ordinary height.
+const BODY_PREVIEW_LINES: usize = 6;
+
+/// The body pane: the content type on one row, the body itself below it.
+///
+/// The body is the one field in the TUI drawn as a text *area* — every other
+/// one is a single `  > value` row. Hence `Wrap`: a long single-line JSON body
+/// is the common case, and clipping it at the pane edge would hide the caret
+/// along with the text.
+fn draw_edit_body(
+    frame: &mut Frame,
+    area: Rect,
+    content_type: &str,
+    data: &str,
+    focused: usize,
+    edit: &Edit,
+    error: Option<&str>,
+) {
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  content type",
+            Style::default()
+                .fg(if focused == 0 { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )),
+        input_line(content_type, caret(focused == 0, edit)),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  body",
+            Style::default()
+                .fg(if focused == 1 { Color::Green } else { Color::DarkGray })
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    lines.extend(text_area_lines(data, caret(focused == 1, edit), "  "));
+
+    if let Some(err) = error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("  error: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .title(" Body ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
@@ -1100,7 +1242,10 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         // global` gave up its slot: of the six it is the one that loses least,
         // because the row it names renders its own state as `[ ] global` and
         // Enter on it toggles, whereas the chords that open a pane are the ones
-        // worth advertising. Anything added here has to be measured first.
+        // worth advertising. Anything added here has to be measured first —
+        // `^b body` would make it 85, which is why the body pane's accelerator
+        // is documented rather than hinted: `Tab` is already listed, and the
+        // `body` row it reaches carries its own `Enter to edit`.
         Mode::NewRequest { .. } => vec![
             Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("save", Style::default().fg(Color::DarkGray)),
@@ -1126,6 +1271,19 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled(format!("add {}", kind.noun()), Style::default().fg(Color::DarkGray)),
             Span::styled("   ^d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!("remove {}", kind.noun()), Style::default().fg(Color::DarkGray)),
+            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+        ],
+        // `^s apply` first, because it is the one key here that is not where a
+        // form usually puts it — Enter types a newline in a body, so it cannot
+        // also be the key that leaves.
+        Mode::EditBody { .. } => vec![
+            Span::styled(" ^s ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("apply", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("newline", Style::default().fg(Color::DarkGray)),
+            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(Color::DarkGray)),
             Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(Color::DarkGray)),
         ],
@@ -1797,5 +1955,55 @@ mod tests {
     fn text_taller_than_the_pane_clamps() {
         assert_eq!(image_area(inner(40, 10), 40), None);
         assert_eq!(image_area(inner(40, 10), u16::MAX), None);
+    }
+
+    // ─── The body ─────────────────────────────────────────────────────────────
+
+    /// The form has no scrolling, so a long body must not push the rows below
+    /// it — `profiles` among them — off the bottom of the pane.
+    #[test]
+    fn a_long_body_is_previewed_rather_than_printed() {
+        let data = (1..=10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let preview = body_preview(&data);
+
+        assert_eq!(preview.len(), BODY_PREVIEW_LINES + 1);
+        assert_eq!(preview[0], "1");
+        assert_eq!(preview[BODY_PREVIEW_LINES], "… 4 more lines");
+    }
+
+    /// A body that fits gets no note, and the singular reads as English.
+    #[test]
+    fn a_short_body_is_shown_whole() {
+        assert_eq!(body_preview("{\"a\":1}"), vec!["{\"a\":1}".to_string()]);
+        assert!(body_preview("").is_empty());
+
+        let data = (0..=BODY_PREVIEW_LINES).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        assert_eq!(body_preview(&data).last().unwrap(), "… 1 more line");
+    }
+
+    /// The caret goes on the line that holds it, and an offset at a line's end
+    /// is not claimed by the line after it.
+    #[test]
+    fn a_text_area_puts_the_caret_on_one_line_only() {
+        // Caret at the end of "ab\n" is offset 3 — the start of the second line.
+        let edit = Edit::at_end("ab\n");
+        let lines = text_area_lines("ab\ncd", Some(&edit), "  ");
+        assert_eq!(lines.len(), 2);
+
+        // Caret 3 is the first byte of the second line, so the bar is drawn
+        // there and the first line is plain text.
+        let drawn: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(drawn[0], "  ab");
+        assert_eq!(drawn[1], "  │cd");
+    }
+
+    /// A body ending in a newline has an empty last line, which is where the
+    /// caret sits after pressing Enter.
+    #[test]
+    fn a_trailing_newline_keeps_its_empty_line() {
+        assert_eq!(text_area_lines("a\n", None, "").len(), 2);
     }
 }
