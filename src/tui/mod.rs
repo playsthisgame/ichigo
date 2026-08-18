@@ -401,18 +401,35 @@ impl RequestDraft {
         }
     }
 
-    /// Moves focus and puts the caret at the end of the field it lands on.
+    /// Moves focus and puts the caret at the end of the field it lands on,
+    /// keeping the mode the walk started in.
     ///
     /// The draft keeps one caret for whichever field has focus, so every focus
     /// change has to re-anchor it — otherwise Tab carries an offset from the
     /// previous field into a shorter one. An action row has no field to anchor
     /// to, so it leaves the caret alone; nothing reads it there, and Tabbing
     /// back onto a field re-anchors it anyway.
+    ///
+    /// The *mode* survives the move — `Edit::landing` is handed the mode the
+    /// previous field was in — because a walk is not a decision about typing.
+    /// The `j`/`k` walk needs it (landing in insert would turn the second `j`
+    /// into a character), and Tab gets it for free rather than as a second rule:
+    /// a form has one mode at a time, and which key moved the focus is no reason
+    /// to change it. Fields still *open* in insert mode; that is the `Mode`
+    /// constructors' `Edit::at_end`, not this.
     fn focus(&mut self, idx: usize) {
         self.focused = idx;
         if let Some((_, value)) = self.fields.get(idx) {
-            self.edit = Edit::at_end(value);
+            self.edit = Edit::landing(value, self.edit.insert);
         }
+    }
+
+    /// One `rows()` stop forward or back, wrapping.
+    ///
+    /// Tab, BackTab, and the normal-mode `j`/`k` walk all come through here, so
+    /// the order they walk and where they wrap cannot drift apart.
+    pub(crate) fn step_focus(&mut self, forward: bool) {
+        self.focus(step_row(self.focused, self.rows(), forward));
     }
 }
 
@@ -1934,6 +1951,20 @@ fn pair_field(pairs: &mut [(String, String)], focused: usize) -> Option<&mut Str
     Some(if focused % 2 == 1 { value } else { name })
 }
 
+/// One focus stop forward or back through `total` rows, wrapping at both ends.
+///
+/// Every form pane walks its rows through this — Tab, BackTab, and the
+/// normal-mode `j`/`k` alike — so no two of them can end up wrapping
+/// differently. `total` must be non-zero; the panes whose row count can be zero
+/// check before calling.
+pub(super) fn step_row(focused: usize, total: usize, forward: bool) -> usize {
+    if forward {
+        (focused + 1) % total
+    } else {
+        focused.checked_sub(1).unwrap_or(total - 1)
+    }
+}
+
 /// The profile field a `Mode::NewProfile` focus index points at: `0` is the
 /// name, then `1+2i` / `2+2i` are `params[i]`'s key and value.
 fn profile_field<'a>(
@@ -2457,6 +2488,33 @@ mod tests {
                 Focus::Profiles,
             ]
         );
+    }
+
+    /// The `j`/`k` walk and Tab are the same walk, and it wraps at both ends.
+    #[test]
+    fn the_row_walk_wraps_both_ways() {
+        let mut draft = RequestDraft::blank();
+        let last = draft.rows() - 1;
+
+        draft.step_focus(false);
+        assert_eq!(draft.focused, last);
+        draft.step_focus(true);
+        assert_eq!(draft.focused, 0);
+    }
+
+    /// A walk begun in normal mode lands in normal mode. Landing in insert
+    /// instead would make the second `j` of a two-row hop a literal `j` typed
+    /// into the field it just reached.
+    #[test]
+    fn the_row_walk_keeps_the_mode_it_started_in() {
+        let mut draft = RequestDraft::blank();
+        draft.fields[1].1 = "POST".to_string();
+        draft.edit = Edit::landing("", false);
+
+        draft.step_focus(true);
+        assert!(!draft.edit.insert);
+        // Normal mode rests on the last character, not past it.
+        assert_eq!(draft.edit.caret, 3);
     }
 
     const BODY: &str = "alpha\nBETA line\ngamma\nbeta again\ndelta";

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
 use super::edit::{self, Applied, Edit};
-use super::{App, Focus, Mode, PairKind, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field};
+use super::{App, Focus, Mode, PairKind, PendingAction, RequestDraft, ResponseKind, pair_field, profile_field, step_row};
 use super::tree::{VisibleRow, visible_rows, build_tree, load_entries};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
@@ -12,15 +12,12 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
         // found by walking the form rather than by knowing a chord.
         KeyCode::Tab => {
             if let Mode::NewRequest { draft, .. } = &mut app.mode {
-                let next = (draft.focused + 1) % draft.rows();
-                draft.focus(next);
+                draft.step_focus(true);
             }
         }
         KeyCode::BackTab => {
             if let Mode::NewRequest { draft, .. } = &mut app.mode {
-                let rows = draft.rows();
-                let prev = draft.focused.checked_sub(1).unwrap_or(rows - 1);
-                draft.focus(prev);
+                draft.step_focus(false);
             }
         }
         KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -105,13 +102,23 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                         match edit::apply(&mut draft.fields[i].1, &mut draft.edit, key, keys) {
                             Applied::Yes => *error = None,
                             Applied::Exit => leaving = true,
+                            // The normal-mode walk between rows. Not an error
+                            // clear: moving the focus does not answer whatever
+                            // the last save complained about.
+                            Applied::FocusNext => draft.step_focus(true),
+                            Applied::FocusPrev => draft.step_focus(false),
                             Applied::No => {}
                         }
                     }
                     // No text under the caret, so no insert mode to drop out of
                     // first: one Esc leaves the form here, where a field takes
-                    // two. Every other key is inert rather than typed.
-                    _ => leaving = key.code == KeyCode::Esc,
+                    // two. `j`/`k` still walk — an action row has nothing to
+                    // type into, and without them `j` onto `global` would be a
+                    // one-way trip out of the walk. Every other key is inert.
+                    _ => match walk_key(key) {
+                        Some(forward) => draft.step_focus(forward),
+                        None => leaving = key.code == KeyCode::Esc,
+                    },
                 }
             }
             if leaving {
@@ -167,20 +174,12 @@ pub(super) fn handle_key_edit_pairs(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Tab => {
             if let Mode::EditPairs { pairs, focused, edit, .. } = &mut app.mode {
-                let total = 2 * pairs.len();
-                if total > 0 {
-                    *focused = (*focused + 1) % total;
-                    *edit = caret_for(pair_field(pairs, *focused));
-                }
+                step_pairs(pairs, focused, edit, true);
             }
         }
         KeyCode::BackTab => {
             if let Mode::EditPairs { pairs, focused, edit, .. } = &mut app.mode {
-                let total = 2 * pairs.len();
-                if total > 0 {
-                    *focused = focused.checked_sub(1).unwrap_or(total - 1);
-                    *edit = caret_for(pair_field(pairs, *focused));
-                }
+                step_pairs(pairs, focused, edit, false);
             }
         }
         KeyCode::Char('a') if ctrl => {
@@ -199,7 +198,8 @@ pub(super) fn handle_key_edit_pairs(app: &mut App, key: KeyEvent) -> bool {
                     // The list just got shorter; keep focus on a field that
                     // still exists (0 when the last header is gone).
                     *focused = (*focused).min((2 * pairs.len()).saturating_sub(1));
-                    *edit = caret_for(pair_field(pairs, *focused));
+                    let insert = edit.insert;
+                    *edit = caret_for(pair_field(pairs, *focused), insert);
                     *error = None;
                 }
             }
@@ -225,13 +225,17 @@ pub(super) fn handle_key_edit_pairs(app: &mut App, key: KeyEvent) -> bool {
             let keys = app.keys;
             let mut leaving = None;
             if let Mode::EditPairs { draft, pairs, focused, edit, error, .. } = &mut app.mode {
-                let focused = *focused;
-                if let Some(value) = pair_field(pairs, focused) {
+                // `focused` stays a `&mut` so the walk arms below can move it;
+                // `idx` is the copy the field lookup needs.
+                let idx = *focused;
+                if let Some(value) = pair_field(pairs, idx) {
                     match edit::apply(value, edit, key, keys) {
                         Applied::Yes => *error = None,
                         // Back to the form without saving: these edits live
                         // in the draft until the request itself is written.
                         Applied::Exit => leaving = Some(draft.clone()),
+                        Applied::FocusNext => step_pairs(pairs, focused, edit, true),
+                        Applied::FocusPrev => step_pairs(pairs, focused, edit, false),
                         Applied::No => {}
                     }
                 } else if matches!(key.code, KeyCode::Esc) {
@@ -307,16 +311,12 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Tab => {
             if let Mode::NewProfile { name, params, focused, edit, .. } = &mut app.mode {
-                let total = 1 + 2 * params.len();
-                *focused = (*focused + 1) % total.max(1);
-                *edit = caret_for(profile_field(name, params, *focused));
+                step_profile(name, params, focused, edit, true);
             }
         }
         KeyCode::BackTab => {
             if let Mode::NewProfile { name, params, focused, edit, .. } = &mut app.mode {
-                let total = 1 + 2 * params.len();
-                *focused = focused.checked_sub(1).unwrap_or(total.saturating_sub(1));
-                *edit = caret_for(profile_field(name, params, *focused));
+                step_profile(name, params, focused, edit, false);
             }
         }
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -338,7 +338,8 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
                 // The list just got shorter; keep focus on a field that still
                 // exists (the name row when the last param is gone).
                 *focused = (*focused).min(2 * params.len());
-                *edit = caret_for(profile_field(name, params, *focused));
+                let insert = edit.insert;
+                *edit = caret_for(profile_field(name, params, *focused), insert);
                 *error = None;
             }
         }
@@ -351,8 +352,8 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
             if let Mode::NewProfile { draft, editing, name, params, focused, edit, error } =
                 &mut app.mode
             {
-                let focused = *focused;
-                if let Some(value) = profile_field(name, params, focused) {
+                let idx = *focused;
+                if let Some(value) = profile_field(name, params, idx) {
                     match edit::apply(value, edit, key, keys) {
                         Applied::Yes => *error = None,
                         // Back to the list without saving: `selected` returns to
@@ -361,6 +362,8 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
                         Applied::Exit => {
                             leaving = Some((draft.clone(), editing.unwrap_or(draft.profiles.len())))
                         }
+                        Applied::FocusNext => step_profile(name, params, focused, edit, true),
+                        Applied::FocusPrev => step_profile(name, params, focused, edit, false),
                         Applied::No => {}
                     }
                 }
@@ -373,10 +376,58 @@ pub(super) fn handle_key_new_profile(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-/// The caret for a field that just took focus — at its end, or a fresh one when
-/// the index no longer points at a field at all.
-fn caret_for(value: Option<&mut String>) -> Edit {
-    value.map_or_else(Edit::default, |v| Edit::at_end(v))
+/// The caret for a field that just took focus — at its end in `insert`'s mode,
+/// or a fresh one when the index no longer points at a field at all.
+///
+/// The mode is carried across the move for the reason `RequestDraft::focus`
+/// spells out: a walk is not a decision about typing, and a `j`/`k` walk that
+/// landed in insert mode would type its next key into the field.
+fn caret_for(value: Option<&mut String>, insert: bool) -> Edit {
+    value.map_or_else(Edit::default, |v| Edit::landing(v, insert))
+}
+
+/// `j`/`k` read as a row walk on a row that has no text to edit.
+///
+/// `edit::apply` reports the same two keys as `Applied::FocusNext`/`FocusPrev`
+/// for a field, and this is the same rule where there is no field: the action
+/// rows of the request form. Modified keys are refused here exactly as they are
+/// there, so an unbound `Ctrl+j` does not silently move the focus.
+fn walk_key(key: KeyEvent) -> Option<bool> {
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('j') => Some(true),
+        KeyCode::Char('k') => Some(false),
+        _ => None,
+    }
+}
+
+/// One step of the `Mode::EditPairs` walk: two fields per row, wrapping, and
+/// inert on an empty list. Tab, BackTab, and the normal-mode `j`/`k` share it.
+fn step_pairs(pairs: &mut [(String, String)], focused: &mut usize, edit: &mut Edit, forward: bool) {
+    let total = 2 * pairs.len();
+    if total == 0 {
+        return;
+    }
+    let insert = edit.insert;
+    *focused = step_row(*focused, total, forward);
+    *edit = caret_for(pair_field(pairs, *focused), insert);
+}
+
+/// One step of the `Mode::NewProfile` walk: the name row, then two fields per
+/// param.
+fn step_profile(
+    name: &mut String,
+    params: &mut [(String, String)],
+    focused: &mut usize,
+    edit: &mut Edit,
+    forward: bool,
+) {
+    let total = 1 + 2 * params.len();
+    let insert = edit.insert;
+    *focused = step_row(*focused, total, forward);
+    *edit = caret_for(profile_field(name, params, *focused), insert);
 }
 
 pub(super) fn handle_key_profile_select(app: &mut App, code: KeyCode) -> bool {
@@ -590,25 +641,24 @@ pub(super) fn handle_key_var_input(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Tab => {
             if let Mode::VarInput { vars, focused, edit, .. } = &mut app.mode {
-                let len = vars.len();
-                *focused = (*focused + 1) % len;
-                *edit = Edit::at_end(&vars[*focused].1);
+                step_vars(vars, focused, edit, true);
             }
         }
         KeyCode::BackTab => {
             if let Mode::VarInput { vars, focused, edit, .. } = &mut app.mode {
-                let len = vars.len();
-                *focused = focused.checked_sub(1).unwrap_or(len - 1);
-                *edit = Edit::at_end(&vars[*focused].1);
+                step_vars(vars, focused, edit, false);
             }
         }
         _ => {
             let keys = app.keys;
             let mut leaving = false;
             if let Mode::VarInput { vars, focused, edit, .. } = &mut app.mode {
-                let focused = *focused;
-                if let Applied::Exit = edit::apply(&mut vars[focused].1, edit, key, keys) {
-                    leaving = true;
+                let idx = *focused;
+                match edit::apply(&mut vars[idx].1, edit, key, keys) {
+                    Applied::Exit => leaving = true,
+                    Applied::FocusNext => step_vars(vars, focused, edit, true),
+                    Applied::FocusPrev => step_vars(vars, focused, edit, false),
+                    Applied::Yes | Applied::No => {}
                 }
             }
             if leaving {
@@ -634,38 +684,41 @@ pub(super) fn handle_key_test_input(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Tab => {
             if let Mode::TestInput { vars, focused, iterations, edit, .. } = &mut app.mode {
-                let len = vars.len() + 1;
-                *focused = (*focused + 1) % len;
-                *edit = Edit::at_end(test_field(vars, iterations, *focused));
+                step_test(vars, iterations, focused, edit, true);
             }
         }
         KeyCode::BackTab => {
             if let Mode::TestInput { vars, focused, iterations, edit, .. } = &mut app.mode {
-                let len = vars.len() + 1;
-                *focused = focused.checked_sub(1).unwrap_or(len - 1);
-                *edit = Edit::at_end(test_field(vars, iterations, *focused));
+                step_test(vars, iterations, focused, edit, false);
             }
         }
         _ => {
             let keys = app.keys;
             let mut leaving = false;
             if let Mode::TestInput { vars, focused, iterations, edit, .. } = &mut app.mode {
-                let focused = *focused;
+                let idx = *focused;
                 // The iterations field only ever accepts digits — but only in
                 // insert mode, or the motions would be filtered out with them.
                 let typing_non_digit = edit.insert
                     && matches!(key.code, KeyCode::Char(c) if !c.is_ascii_digit());
-                let value = if focused < vars.len() {
-                    Some(&mut vars[focused].1)
+                let value = if idx < vars.len() {
+                    Some(&mut vars[idx].1)
                 } else if typing_non_digit {
                     None
                 } else {
-                    Some(iterations)
+                    Some(&mut *iterations)
                 };
-                if let Some(value) = value
-                    && let Applied::Exit = edit::apply(value, edit, key, keys)
-                {
-                    leaving = true;
+                if let Some(value) = value {
+                    match edit::apply(value, edit, key, keys) {
+                        Applied::Exit => leaving = true,
+                        Applied::FocusNext => {
+                            step_test(vars, iterations, focused, edit, true)
+                        }
+                        Applied::FocusPrev => {
+                            step_test(vars, iterations, focused, edit, false)
+                        }
+                        Applied::Yes | Applied::No => {}
+                    }
                 }
             }
             if leaving {
@@ -674,6 +727,35 @@ pub(super) fn handle_key_test_input(app: &mut App, key: KeyEvent) -> bool {
         }
     }
     false
+}
+
+/// One step of the `Mode::VarInput` walk. Inert on an empty list, which cannot
+/// happen — the form only opens when a request has placeholders — but `% 0`
+/// panics, and a guard is cheaper than that guarantee staying true.
+fn step_vars(
+    vars: &[(String, String)],
+    focused: &mut usize,
+    edit: &mut Edit,
+    forward: bool,
+) {
+    if vars.is_empty() {
+        return;
+    }
+    *focused = step_row(*focused, vars.len(), forward);
+    *edit = Edit::landing(&vars[*focused].1, edit.insert);
+}
+
+/// One step of the `Mode::TestInput` walk: the variables, then the iteration
+/// count.
+fn step_test(
+    vars: &[(String, String)],
+    iterations: &str,
+    focused: &mut usize,
+    edit: &mut Edit,
+    forward: bool,
+) {
+    *focused = step_row(*focused, vars.len() + 1, forward);
+    *edit = Edit::landing(test_field(vars, iterations, *focused), edit.insert);
 }
 
 /// The `Mode::TestInput` field a focus index points at: the variables first,
