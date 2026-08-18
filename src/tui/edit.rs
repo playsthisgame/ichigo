@@ -11,6 +11,12 @@
 //! mode is what makes `h`/`l`/`w`/`b` motions possible at all: in insert mode
 //! those are letters someone is typing into a URL.
 //!
+//! Normal mode also walks *between* fields: `j` and `k` report
+//! [`Applied::FocusNext`] / [`Applied::FocusPrev`] instead of moving a caret,
+//! and the pane owning the form performs the move. It has to be reported rather
+//! than done here — this module sees one `String` and knows nothing of rows,
+//! action rows, or how many fields the pane has.
+//!
 //! Undo (`u`) lives here too, and its history therefore lives and dies with the
 //! focused field's [`Edit`]: undo is per-field, and moving focus starts over.
 
@@ -77,8 +83,8 @@ impl Default for Edit {
 }
 
 impl Edit {
-    /// The caret past the last character, in insert mode — what focusing a
-    /// field should give you.
+    /// The caret past the last character, in insert mode — what *opening* a
+    /// pane on a field should give you.
     pub(super) fn at_end(value: &str) -> Self {
         Self {
             caret: value.len(),
@@ -87,6 +93,23 @@ impl Edit {
             session_saved: false,
             history: Vec::new(),
         }
+    }
+
+    /// The caret at the end of `value`, in insert mode, or in normal mode with
+    /// the caret resting on the last character.
+    ///
+    /// What a *focus move* lands with, and the reason it takes the flag rather
+    /// than always opening in insert like [`at_end`](Self::at_end): the mode
+    /// belongs to the user until they change it, so a walk begun in normal mode
+    /// stays in normal mode. Landing in insert would make `jj` one move
+    /// followed by a literal `j` typed into the field it landed on.
+    pub(super) fn landing(value: &str, insert: bool) -> Self {
+        let mut edit = Self::at_end(value);
+        if !insert {
+            edit.insert = false;
+            rest_on_char(value, &mut edit);
+        }
+        edit
     }
 
     /// Records the field as it stands, before a change that is about to happen.
@@ -132,6 +155,12 @@ pub(super) enum Applied {
     /// `Esc` in normal mode: the field is done, so the pane should close. `Esc`
     /// in *insert* mode only leaves insert mode and reports `Yes`.
     Exit,
+    /// `j` in normal mode: move focus to the next row of the form, wrapping.
+    /// The pane owns the walk; all this module knows is that the key was a
+    /// motion off the end of the field rather than text.
+    FocusNext,
+    /// `k` in normal mode: the previous row, wrapping.
+    FocusPrev,
     /// Not a text-editing key — `Tab`, `Enter`, `Ctrl+<key>`. The caller's own
     /// match arms own these.
     No,
@@ -294,6 +323,13 @@ fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
             edit.caret = value.len();
             rest_on_char(value, edit);
         }
+        // Off the field entirely, to the pane's next/previous row. Reported
+        // rather than handled: which rows exist is the form's business. In
+        // insert mode these are letters — and `j`/`k` in that order is the
+        // default `insert_escape`, which is what puts you in normal mode to use
+        // them.
+        'j' => return Applied::FocusNext,
+        'k' => return Applied::FocusPrev,
         'i' => edit.insert = true,
         'a' => {
             edit.caret = next(value, edit.caret);
@@ -870,5 +906,44 @@ mod tests {
         insert_str(&mut value, &mut edit, "b");
         assert_eq!(value, "abc");
         assert_eq!(edit.caret, 2);
+    }
+
+    /// `j`/`k` in normal mode leave the field alone and hand the walk to the
+    /// pane; nothing about the value or the caret may move on the way out.
+    #[test]
+    fn normal_mode_j_and_k_report_a_row_walk() {
+        for (press, expected) in [('j', Applied::FocusNext), ('k', Applied::FocusPrev)] {
+            let mut value = "https://x".to_string();
+            let mut edit = normal_at(4);
+            assert_eq!(apply(&mut value, &mut edit, key(press), Keys::default()), expected);
+            assert_eq!(value, "https://x");
+            assert_eq!(edit.caret, 4);
+            assert!(!edit.insert);
+        }
+    }
+
+    /// The same two keys in insert mode are text — which is what `insert_escape`
+    /// exists to get you out of, and the only reason the walk is reachable.
+    #[test]
+    fn insert_mode_j_and_k_are_still_characters() {
+        let (value, edit) = run("", Edit::default(), &[key('j'), key('k')]);
+        assert_eq!(value, "jk");
+        assert!(edit.insert);
+    }
+
+    /// A field taken by a walk that began in normal mode stays in normal mode,
+    /// with the caret resting on the last character rather than past it.
+    #[test]
+    fn landing_carries_the_mode_it_is_given() {
+        let insert = Edit::landing("abc", true);
+        assert_eq!(insert.caret, 3);
+        assert!(insert.insert);
+
+        let resting = Edit::landing("abc", false);
+        assert_eq!(resting.caret, 2);
+        assert!(!resting.insert);
+
+        // Nothing to rest on, and no caret to pull back off the end.
+        assert_eq!(Edit::landing("", false).caret, 0);
     }
 }
