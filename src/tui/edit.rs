@@ -20,6 +20,21 @@
 //! Undo (`u`) lives here too, and its history therefore lives and dies with the
 //! focused field's [`Edit`]: undo is per-field, and moving focus starts over.
 //!
+//! The commands that take a second key — the `d`/`c`/`y` operators, `f`/`F`/
+//! `t`/`T`, `r`, `gg` — are one `Pending` value on the [`Edit`], armed by the
+//! first key and read by the next. [`apply`] *takes* it on the way in, so every
+//! key that does not reach the normal-mode table cancels it; that is the same
+//! trick the insert-escape sequence uses one field over, and for the same
+//! reason: a `d` left armed across an arrow key would delete a word the next
+//! time someone typed `w`. Both operators and plain motions read one table,
+//! [`simple_motion`], so `w` and `dw` cannot drift apart.
+//!
+//! The register `p` puts is **not** here: it is one `String` on `App`, so a
+//! bearer token yanked out of one header can be put into another. Undo is
+//! per-field because a field's history is only meaningful against that field's
+//! text; a register is just text, and scoping it the same way would have made
+//! `y` and `p` useless together.
+//!
 //! One field is not single-line: the request body. [`apply_multiline`] is the
 //! door for it — Enter becomes a newline, and `j`/`k` move by line before they
 //! fall off the field and become a row walk. Everything else it hands straight
@@ -29,6 +44,7 @@
 //! the same string, so every single-line field behaves exactly as before.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use crate::config::Keys;
@@ -81,6 +97,52 @@ pub(super) struct Edit {
     /// per keystroke, so undo reverses "the URL I just typed" instead of its
     /// last character. There is no redo stack: `u` pops.
     history: Vec<Snapshot>,
+    /// A normal-mode command that has been typed but not completed — `d`
+    /// waiting for its motion, `f` waiting for the character to search for,
+    /// `r` for the replacement, `g` for its second `g`.
+    ///
+    /// Separate from [`pending`](Self::pending), which is the insert-escape
+    /// sequence: the two can never be armed at once, since one only arms in
+    /// insert mode and the other only in normal mode, but keeping them apart
+    /// means neither has to reason about the other's lifetime. Cleared by the
+    /// key that completes it and by any key that cannot.
+    pending_cmd: Option<Pending>,
+    /// The last `f`/`F`/`t`/`T` performed, for `;` and `,` to repeat. Lives in
+    /// the `Edit` like the undo history, and dies with it for the same reason.
+    last_find: Option<(FindKind, char)>,
+}
+
+/// A normal-mode command waiting for the key that finishes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pending {
+    /// `d`, `c` or `y`, waiting for the motion naming its span.
+    Operator(Op),
+    /// The same, after its motion turned out to be `f`/`F`/`t`/`T` — now
+    /// waiting for the character that motion searches for.
+    OperatorFind(Op, FindKind),
+    /// `f`/`F`/`t`/`T` on its own, waiting for its target character.
+    Find(FindKind),
+    /// `r`, waiting for the character to write over the one under the caret.
+    Replace,
+    /// `g`, waiting for the second one. `gg` is the only `g` command bound, so
+    /// anything else cancels.
+    G,
+}
+
+/// What an operator does with the span its motion names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Delete,
+    Change,
+    Yank,
+}
+
+/// Which way an `f`-family motion searches, and whether it stops on its target
+/// or one short of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FindKind {
+    forward: bool,
+    till: bool,
 }
 
 impl Default for Edit {
@@ -100,6 +162,8 @@ impl Edit {
             pending: None,
             session_saved: false,
             history: Vec::new(),
+            pending_cmd: None,
+            last_find: None,
         }
     }
 
@@ -181,7 +245,13 @@ pub(super) enum Applied {
 /// header row deleted at the focused index. Healing it here rather than at each
 /// of those sites means a stale caret costs one harmless keystroke instead of
 /// panicking on the next slice.
-pub(super) fn apply(value: &mut String, edit: &mut Edit, key: KeyEvent, keys: Keys) -> Applied {
+pub(super) fn apply(
+    value: &mut String,
+    edit: &mut Edit,
+    key: KeyEvent,
+    keys: Keys,
+    register: &mut String,
+) -> Applied {
     // Ctrl+<letter> arrives as Char + CONTROL, so without this every unbound
     // one would type its letter. Alt likewise.
     if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
@@ -192,6 +262,10 @@ pub(super) fn apply(value: &mut String, edit: &mut Edit, key: KeyEvent, keys: Ke
     // sequence, which is what stops a `j` typed here and a `k` typed after three
     // cursor moves from counting as `jk`.
     let pending = edit.pending.take();
+    // Likewise for a half-typed normal-mode command: everything below except
+    // the normal-mode arm drops it, so `d`, an arrow key, then `w` moves a word
+    // instead of deleting one.
+    let pending_cmd = edit.pending_cmd.take();
 
     match key.code {
         // Arrows and Home/End work in both modes: they are unambiguous, so
@@ -246,7 +320,7 @@ pub(super) fn apply(value: &mut String, edit: &mut Edit, key: KeyEvent, keys: Ke
                 edit.pending = Some((c, Instant::now()));
             }
         }
-        KeyCode::Char(c) => return normal(value, edit, c),
+        KeyCode::Char(c) => return normal(value, edit, c, pending_cmd, register),
         _ => return Applied::No,
     }
     Applied::Yes
@@ -277,6 +351,7 @@ pub(super) fn apply_multiline(
     edit: &mut Edit,
     key: KeyEvent,
     keys: Keys,
+    register: &mut String,
 ) -> Applied {
     if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
         return Applied::No;
@@ -284,9 +359,13 @@ pub(super) fn apply_multiline(
     edit.caret = clamp(value, edit.caret);
 
     match key.code {
-        KeyCode::Enter if edit.insert => insert_str(value, edit, "\n"),
+        KeyCode::Enter if edit.insert => {
+            edit.pending_cmd = None;
+            insert_str(value, edit, "\n");
+        }
         // Normal mode: vim's Enter is a line down, to the first non-blank.
         KeyCode::Enter => {
+            edit.pending_cmd = None;
             let Some(caret) = line_down(value, edit.caret) else { return Applied::Yes };
             edit.caret = first_non_blank(value, caret);
             rest_on_char(value, edit);
@@ -295,13 +374,18 @@ pub(super) fn apply_multiline(
         KeyCode::Up => return vertical(value, edit, false),
         KeyCode::Char('j') if !edit.insert => return vertical(value, edit, true),
         KeyCode::Char('k') if !edit.insert => return vertical(value, edit, false),
-        _ => return apply(value, edit, key, keys),
+        _ => return apply(value, edit, key, keys, register),
     }
     Applied::Yes
 }
 
 /// One line down or up, or the row walk when there is no such line.
+///
+/// These are the keys `apply_multiline` keeps for itself, so they are also
+/// where a half-typed operator has to be dropped: `d` then `j` is not a
+/// linewise delete here, it is a `d` that never found its motion.
 fn vertical(value: &str, edit: &mut Edit, down: bool) -> Applied {
+    edit.pending_cmd = None;
     let moved = if down { line_down(value, edit.caret) } else { line_up(value, edit.caret) };
     match moved {
         Some(caret) => {
@@ -359,10 +443,26 @@ fn completes_escape(
 
 /// One normal-mode key. Unrecognized letters are swallowed rather than passed
 /// on: in normal mode a stray `q` is a mistyped motion, not a pane binding.
-fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
+///
+/// `pending_cmd` is the half-typed command this key might complete — the `d` of
+/// a `dw`, the `f` of an `fx`. It arrives as an argument rather than being read
+/// off `edit` because [`apply`] takes it on the way in, which is what makes
+/// every key that does not reach here cancel it.
+fn normal(
+    value: &mut String,
+    edit: &mut Edit,
+    c: char,
+    pending_cmd: Option<Pending>,
+    register: &mut String,
+) -> Applied {
+    if let Some(pending) = pending_cmd {
+        return complete(value, edit, c, pending, register);
+    }
+
     // Opening a session arms the *next* change to record. Commands that both
-    // edit and enter insert mode (`s`, `C`, `S`) record their own edit below
-    // and then mark the session saved, so the typing that follows joins it.
+    // edit and enter insert mode (`s`, `C`, `S`, and the `c` operator) record
+    // their own edit below and then mark the session saved, so the typing that
+    // follows joins it.
     if matches!(c, 'i' | 'a' | 'I' | 'A') {
         edit.session_saved = false;
     }
@@ -376,25 +476,62 @@ fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
             edit.caret = clamp(value, previous.caret);
             rest_on_char(value, edit);
         }
-        'h' => edit.caret = prev(value, edit.caret),
-        'l' => {
-            edit.caret = next(value, edit.caret);
+        // The commands that wait for one more key. Armed here and finished by
+        // `complete` on the next press.
+        'd' => edit.pending_cmd = Some(Pending::Operator(Op::Delete)),
+        'c' => edit.pending_cmd = Some(Pending::Operator(Op::Change)),
+        'y' => edit.pending_cmd = Some(Pending::Operator(Op::Yank)),
+        'r' => edit.pending_cmd = Some(Pending::Replace),
+        'g' => edit.pending_cmd = Some(Pending::G),
+        'f' | 'F' | 't' | 'T' => edit.pending_cmd = Some(Pending::Find(find_kind(c))),
+        // `Y` is vim's `yy`: the whole line, which for every field but the body
+        // is the whole value.
+        'Y' => {
+            let (start, end) = line_span(value, edit.caret);
+            if end > start {
+                *register = value[start..end].to_string();
+            }
+        }
+        // The last line's first non-blank, which in a single-line field is the
+        // only line's — the same place `^` goes, exactly as in vim.
+        'G' => {
+            edit.caret = first_non_blank(value, last_line_start(value));
             rest_on_char(value, edit);
         }
-        'w' => edit.caret = word_forward(value, edit.caret, Words::Small),
-        'W' => edit.caret = word_forward(value, edit.caret, Words::Big),
-        'b' => edit.caret = word_back(value, edit.caret, Words::Small),
-        'B' => edit.caret = word_back(value, edit.caret, Words::Big),
-        'e' => edit.caret = word_end(value, edit.caret, Words::Small),
-        'E' => edit.caret = word_end(value, edit.caret, Words::Big),
-        // Measured against the line the caret is on, not the whole value. A
-        // field with no newline in it is one line, so this is the old
-        // behaviour everywhere except the body.
-        '0' => edit.caret = line_start(value, edit.caret),
-        '^' => edit.caret = first_non_blank(value, edit.caret),
-        '$' => {
-            edit.caret = line_end(value, edit.caret);
+        // The register is charwise and only charwise — see `cut`. `p` puts it
+        // after the character under the caret, `P` before it, and both leave
+        // the caret on the last character put, as vim does.
+        'p' | 'P' => {
+            if register.is_empty() {
+                return Applied::Yes;
+            }
+            let at = if c == 'p' { next(value, edit.caret) } else { edit.caret };
+            edit.record(value);
+            value.insert_str(at, register);
+            edit.caret = prev(value, at + register.len());
             rest_on_char(value, edit);
+        }
+        // `~`: swap the case of the character under the caret and step past it.
+        // The swapped text is measured rather than assumed one character long,
+        // since a few characters change byte length when their case does.
+        '~' => {
+            let to = next(value, edit.caret);
+            if to > edit.caret && !value[edit.caret..].starts_with('\n') {
+                let swapped: String = value[edit.caret..to].chars().flat_map(swap_case).collect();
+                edit.record(value);
+                value.replace_range(edit.caret..to, &swapped);
+                edit.caret += swapped.len();
+            }
+            rest_on_char(value, edit);
+        }
+        // `;` and `,` repeat the last `f`/`F`/`t`/`T`, forwards and backwards.
+        ';' | ',' => {
+            let Some((kind, target)) = edit.last_find else { return Applied::Yes };
+            let kind = if c == ',' { kind.reversed() } else { kind };
+            if let Some((caret, _)) = find_motion(value, edit.caret, kind, target) {
+                edit.caret = caret;
+                rest_on_char(value, edit);
+            }
         }
         // Off the field entirely, to the pane's next/previous row. Reported
         // rather than handled: which rows exist is the form's business. In
@@ -417,47 +554,305 @@ fn normal(value: &mut String, edit: &mut Edit, c: char) -> Applied {
             edit.insert = true;
         }
         'x' => {
-            let to = next(value, edit.caret);
-            if to > edit.caret {
-                edit.record(value);
-                value.replace_range(edit.caret..to, "");
-            }
+            cut(value, edit, edit.caret..next(value, edit.caret), register);
             rest_on_char(value, edit);
         }
         's' => {
-            let to = next(value, edit.caret);
-            if to > edit.caret {
-                edit.record(value);
-                value.replace_range(edit.caret..to, "");
-            }
+            cut(value, edit, edit.caret..next(value, edit.caret), register);
             edit.insert = true;
             edit.session_saved = true;
         }
         'D' => {
-            delete_to_line_end(value, edit);
+            cut(value, edit, edit.caret..line_end(value, edit.caret), register);
             rest_on_char(value, edit);
         }
         'C' => {
-            delete_to_line_end(value, edit);
+            cut(value, edit, edit.caret..line_end(value, edit.caret), register);
             edit.insert = true;
             edit.session_saved = true;
         }
-        // `cc`/`dd` would need a pending-operator state; `S` is the one-key
-        // spelling of the same thing and is what a full-line rewrite wants.
+        // `S` is the one-key spelling of `cc`, and predates it. Both are bound;
+        // this is the one that needs no operator to type.
         'S' => {
-            let start = line_start(value, edit.caret);
-            let end = line_end(value, edit.caret);
-            if end > start {
-                edit.record(value);
-                value.replace_range(start..end, "");
-            }
+            let (start, end) = line_span(value, edit.caret);
             edit.caret = start;
+            cut(value, edit, start..end, register);
             edit.insert = true;
             edit.session_saved = true;
         }
-        _ => {}
+        // Everything left is either a motion from the shared table or a
+        // mistyped key, and both are swallowed: in normal mode a stray `q` is
+        // not a pane binding.
+        _ => {
+            if let Some((caret, _)) = simple_motion(value, edit.caret, c) {
+                edit.caret = caret;
+                rest_on_char(value, edit);
+            }
+        }
     }
     Applied::Yes
+}
+
+/// The key that finishes a half-typed command.
+///
+/// Anything that cannot finish it cancels: `pending_cmd` was already taken by
+/// [`apply`], so returning without re-arming *is* the cancellation. The key is
+/// not then re-read as a fresh command — vim discards it too, and re-reading
+/// would make a mistyped `dq` delete something on the next keystroke.
+fn complete(
+    value: &mut String,
+    edit: &mut Edit,
+    c: char,
+    pending: Pending,
+    register: &mut String,
+) -> Applied {
+    match pending {
+        // `gg`: the first line's first non-blank.
+        Pending::G => {
+            if c == 'g' {
+                edit.caret = first_non_blank(value, 0);
+                rest_on_char(value, edit);
+            }
+        }
+        // `r<char>`. Not allowed to write over the newline ending a line: that
+        // would join two lines, which is `J`'s job and not `r`'s.
+        Pending::Replace => {
+            let to = next(value, edit.caret);
+            if to > edit.caret && !value[edit.caret..].starts_with('\n') {
+                edit.record(value);
+                value.replace_range(edit.caret..to, c.encode_utf8(&mut [0; 4]));
+            }
+            rest_on_char(value, edit);
+        }
+        // `f<char>` and friends on their own: a motion, and the one every later
+        // `;` repeats. The search is remembered even when it fails, so that a
+        // `;` after a miss looks for the same character rather than the one
+        // before it.
+        Pending::Find(kind) => {
+            edit.last_find = Some((kind, c));
+            if let Some((caret, _)) = find_motion(value, edit.caret, kind, c) {
+                edit.caret = caret;
+                rest_on_char(value, edit);
+            }
+        }
+        // `df<char>`: the same search, with an operator waiting on its answer.
+        Pending::OperatorFind(op, kind) => {
+            edit.last_find = Some((kind, c));
+            if let Some((target, inclusive)) = find_motion(value, edit.caret, kind, c) {
+                let span = op_span(value, edit.caret, target, inclusive);
+                return operate(value, edit, op, span, register);
+            }
+        }
+        Pending::Operator(op) => return operator_motion(value, edit, c, op, register),
+    }
+    Applied::Yes
+}
+
+/// The key after `d`, `c` or `y`.
+fn operator_motion(
+    value: &mut String,
+    edit: &mut Edit,
+    c: char,
+    op: Op,
+    register: &mut String,
+) -> Applied {
+    // `dd`, `cc`, `yy`: the operator doubled is its own line. Charwise even so
+    // — see `cut` — so it takes the line's text and leaves the line itself.
+    if c == op.letter() {
+        let (start, end) = line_span(value, edit.caret);
+        edit.caret = start;
+        return operate(value, edit, op, start..end, register);
+    }
+    // A search still needs its target character, so the operator waits one more
+    // key rather than resolving anything here.
+    if matches!(c, 'f' | 'F' | 't' | 'T') {
+        edit.pending_cmd = Some(Pending::OperatorFind(op, find_kind(c)));
+        return Applied::Yes;
+    }
+    if matches!(c, ';' | ',') {
+        let Some((kind, target)) = edit.last_find else { return Applied::Yes };
+        let kind = if c == ',' { kind.reversed() } else { kind };
+        let Some((to, inclusive)) = find_motion(value, edit.caret, kind, target) else {
+            return Applied::Yes;
+        };
+        let span = op_span(value, edit.caret, to, inclusive);
+        return operate(value, edit, op, span, register);
+    }
+    // `cw` is vim's one irregular operator-motion pair: on a non-blank it acts
+    // like `ce`, so that changing a word does not swallow the space after it.
+    let end_instead = op == Op::Change
+        && matches!(c, 'w' | 'W')
+        && value[edit.caret..].starts_with(|ch: char| !ch.is_whitespace());
+    let key = match (end_instead, c) {
+        (true, 'w') => 'e',
+        (true, 'W') => 'E',
+        _ => c,
+    };
+    let Some((target, inclusive)) = simple_motion(value, edit.caret, key) else {
+        return Applied::Yes;
+    };
+    let span = op_span(value, edit.caret, target, inclusive);
+    operate(value, edit, op, span, register)
+}
+
+/// Runs `op` over `span`, a byte range whose ends are both char boundaries.
+fn operate(
+    value: &mut String,
+    edit: &mut Edit,
+    op: Op,
+    span: Range<usize>,
+    register: &mut String,
+) -> Applied {
+    match op {
+        // Vim leaves the caret at the start of what was yanked.
+        Op::Yank => {
+            if !span.is_empty() {
+                *register = value[span.clone()].to_string();
+                edit.caret = span.start;
+            }
+            rest_on_char(value, edit);
+        }
+        Op::Delete => {
+            edit.caret = span.start;
+            cut(value, edit, span, register);
+            rest_on_char(value, edit);
+        }
+        Op::Change => {
+            edit.caret = span.start;
+            cut(value, edit, span, register);
+            edit.insert = true;
+            edit.session_saved = true;
+        }
+    }
+    Applied::Yes
+}
+
+/// Removes `span` from `value`, recording the undo step and filling the
+/// register with what came out.
+///
+/// The register is **charwise and only charwise**, `dd` and `yy` included:
+/// every field but the body is a single line that must never gain a newline,
+/// and a linewise register would put one there the first time someone yanked a
+/// line in the body and put it in a URL. The cost is that `yy` then `p` inserts
+/// the line's text at the caret rather than opening a line below it.
+///
+/// Recording sits inside the emptiness guard for the reason every other
+/// mutation site's does: an undo step that restores identical text reads as a
+/// broken `u`.
+fn cut(value: &mut String, edit: &mut Edit, span: Range<usize>, register: &mut String) {
+    if span.is_empty() {
+        return;
+    }
+    edit.record(value);
+    *register = value[span.clone()].to_string();
+    value.replace_range(span, "");
+}
+
+/// The byte range an operator covers when its motion lands on `target`.
+///
+/// Backward motions are all exclusive of where they land, which is what makes
+/// `db` delete back to the start of the word and leave that character alone.
+fn op_span(value: &str, caret: usize, target: usize, inclusive: bool) -> Range<usize> {
+    if target >= caret {
+        let end = if inclusive { next(value, target) } else { target };
+        caret..end.max(caret)
+    } else {
+        target..caret
+    }
+}
+
+impl Op {
+    /// The key that types this operator, so `dd`, `cc` and `yy` are recognized
+    /// without a table spelling the pairing out three times.
+    fn letter(self) -> char {
+        match self {
+            Op::Delete => 'd',
+            Op::Change => 'c',
+            Op::Yank => 'y',
+        }
+    }
+}
+
+impl FindKind {
+    /// What `,` searches: the same character the other way.
+    fn reversed(self) -> Self {
+        Self { forward: !self.forward, ..self }
+    }
+}
+
+fn find_kind(c: char) -> FindKind {
+    FindKind { forward: matches!(c, 'f' | 't'), till: matches!(c, 't' | 'T') }
+}
+
+/// Where a motion that needs nothing but its own key lands, and whether an
+/// operator using it covers the character it lands on.
+///
+/// The single table both the plain motions and the operators read, so `w` and
+/// `dw` cannot disagree about where a word ends. `None` means "not a motion" —
+/// the caller decides whether that is a key to swallow or an operator to
+/// cancel.
+fn simple_motion(value: &str, caret: usize, c: char) -> Option<(usize, bool)> {
+    let target = match c {
+        // Clamped to the line: vim's `h` and `l` never cross one, and a caret
+        // left sitting on a `\n` is not a position normal mode has.
+        'h' => prev(value, caret).max(line_start(value, caret)),
+        'l' => next(value, caret).min(line_end(value, caret)),
+        'w' => word_forward(value, caret, Words::Small),
+        'W' => word_forward(value, caret, Words::Big),
+        'b' => word_back(value, caret, Words::Small),
+        'B' => word_back(value, caret, Words::Big),
+        'e' => return Some((word_end(value, caret, Words::Small), true)),
+        'E' => return Some((word_end(value, caret, Words::Big), true)),
+        // Measured against the line the caret is on, not the whole value. A
+        // field with no newline in it is one line, so this is the old
+        // behaviour everywhere except the body.
+        '0' => line_start(value, caret),
+        // `_` is vim's own spelling of `^` for the current line, and the one
+        // people reach for first; both are bound because both are muscle
+        // memory.
+        '^' | '_' => first_non_blank(value, caret),
+        // Exclusive of the offset it names, which is one *past* the last
+        // character — so `d$` takes the rest of the line, and `$` alone lands
+        // on its last character once `rest_on_char` has pulled it back.
+        '$' => line_end(value, caret),
+        _ => return None,
+    };
+    Some((target, false))
+}
+
+/// Where `f`/`F`/`t`/`T` land, searching for `target` within the caret's line.
+///
+/// `None` when the character is not on the line, which leaves the caret alone
+/// and cancels any operator waiting on it. That is vim's behaviour and the one
+/// that matters here: `dfx` with no `x` on the line must delete nothing at all.
+fn find_motion(value: &str, caret: usize, kind: FindKind, target: char) -> Option<(usize, bool)> {
+    let (start, end) = (line_start(value, caret), line_end(value, caret));
+    if kind.forward {
+        // The search starts after the caret so that `fx` twice moves twice, and
+        // after the character following it for `t`, which would otherwise never
+        // leave a caret already sitting one short of its target.
+        let mut from = next(value, caret).min(end);
+        if kind.till {
+            from = next(value, from).min(end);
+        }
+        let at = value[from..end].find(target).map(|i| from + i)?;
+        Some((if kind.till { prev(value, at) } else { at }, true))
+    } else {
+        let at = value[start..caret].rfind(target).map(|i| start + i)?;
+        Some((if kind.till { next(value, at) } else { at }, false))
+    }
+}
+
+/// The case-swapped form of one character. `char::to_uppercase` yields more
+/// than one character for a few of them, which is why this yields an iterator
+/// rather than a `char`.
+fn swap_case(c: char) -> impl Iterator<Item = char> {
+    let (upper, lower) = if c.is_lowercase() {
+        (Some(c.to_uppercase()), None)
+    } else {
+        (None, Some(c.to_lowercase()))
+    };
+    upper.into_iter().flatten().chain(lower.into_iter().flatten())
 }
 
 // ─── Caret arithmetic ─────────────────────────────────────────────────────────
@@ -527,14 +922,17 @@ fn line_end(value: &str, caret: usize) -> usize {
     value[caret..].find('\n').map_or(value.len(), |i| caret + i)
 }
 
-/// `D` and `C`: everything from the caret to the end of its line. Recorded only
-/// when there is something to delete, like every other mutation here.
-fn delete_to_line_end(value: &mut String, edit: &mut Edit) {
-    let end = line_end(value, edit.caret);
-    if end > edit.caret {
-        edit.record(value);
-        value.replace_range(edit.caret..end, "");
-    }
+/// The caret's whole line, newline excluded — what `dd`, `cc`, `yy`, `Y` and
+/// `S` all work over. The newline stays: removing it would join the line below
+/// onto the one above, which is not what deleting a line means.
+fn line_span(value: &str, caret: usize) -> (usize, usize) {
+    (line_start(value, caret), line_end(value, caret))
+}
+
+/// The start of the last line, which is where `G` goes. `0` for a value with no
+/// newline in it — every field but the body.
+fn last_line_start(value: &str) -> usize {
+    value.rfind('\n').map_or(0, |i| i + 1)
 }
 
 /// The same column one line down, clamped to that line's end. `None` on the
@@ -601,8 +999,14 @@ fn class(c: char, words: Words) -> Class {
     }
 }
 
-/// `w`: past the current run, then past any whitespace. Lands on the end of the
-/// line when there is no next word, which is where vim leaves it too.
+/// `w`: past the current run, then past any whitespace.
+///
+/// With no next word it returns the end of the value rather than its last
+/// character, which is one past where a normal-mode caret may rest —
+/// `rest_on_char` pulls it back, so the motion lands where vim's does. The
+/// distinction is for the operators: vim's `dw` on the last word of a line
+/// takes the rest of that line, and stopping a character short would leave one
+/// behind.
 fn word_forward(value: &str, caret: usize, words: Words) -> usize {
     let chars: Vec<(usize, char)> = value.char_indices().collect();
     let Some(mut i) = index_of(&chars, caret) else { return value.len() };
@@ -616,7 +1020,7 @@ fn word_forward(value: &str, caret: usize, words: Words) -> usize {
     while i < chars.len() && class(chars[i].1, words) == Class::Space {
         i += 1;
     }
-    chars.get(i).map_or(prev(value, value.len()), |(off, _)| *off)
+    chars.get(i).map_or(value.len(), |(off, _)| *off)
 }
 
 /// `e`: the last character of the current run when the caret is before it,
@@ -681,6 +1085,34 @@ mod tests {
         KeyEvent::new(c, KeyModifiers::NONE)
     }
 
+    /// [`apply`] with a throwaway register, for the tests that are not about
+    /// `y` and `p`. The ones that are use [`apply`] directly and keep it.
+    fn press(value: &mut String, edit: &mut Edit, key: KeyEvent, keys: Keys) -> Applied {
+        apply(value, edit, key, keys, &mut String::new())
+    }
+
+    fn press_multiline(
+        value: &mut String,
+        edit: &mut Edit,
+        key: KeyEvent,
+        keys: Keys,
+    ) -> Applied {
+        apply_multiline(value, edit, key, keys, &mut String::new())
+    }
+
+    /// Types `presses` into `value` from a normal-mode caret at `caret`,
+    /// keeping the register across them — what every operator, `y`/`p` and
+    /// `f`-family test runs through.
+    fn keys_at(value: &str, caret: usize, presses: &str) -> (String, Edit, String) {
+        let mut value = value.to_string();
+        let mut edit = normal_at(caret);
+        let mut register = String::new();
+        for c in presses.chars() {
+            apply(&mut value, &mut edit, key(c), Keys::default(), &mut register);
+        }
+        (value, edit, register)
+    }
+
     /// Types `presses` into a field starting from `edit`, with no insert-escape
     /// sequence configured.
     fn run(value: &str, edit: Edit, presses: &[KeyEvent]) -> (String, Edit) {
@@ -691,7 +1123,7 @@ mod tests {
         let mut value = value.to_string();
         let mut edit = edit;
         for k in presses {
-            apply(&mut value, &mut edit, *k, keys);
+            press(&mut value, &mut edit, *k, keys);
         }
         (value, edit)
     }
@@ -716,11 +1148,11 @@ mod tests {
     fn esc_enters_normal_mode_then_exits() {
         let mut value = "x".to_string();
         let mut edit = Edit::at_end(&value);
-        assert_eq!(apply(&mut value, &mut edit, code(KeyCode::Esc), Keys::default()), Applied::Yes);
+        assert_eq!(press(&mut value, &mut edit, code(KeyCode::Esc), Keys::default()), Applied::Yes);
         assert!(!edit.insert);
         // Vim steps off the end when leaving insert mode.
         assert_eq!(edit.caret, 0);
-        assert_eq!(apply(&mut value, &mut edit, code(KeyCode::Esc), Keys::default()), Applied::Exit);
+        assert_eq!(press(&mut value, &mut edit, code(KeyCode::Esc), Keys::default()), Applied::Exit);
     }
 
     #[test]
@@ -826,12 +1258,12 @@ mod tests {
         let mut value = "aé…b".to_string();
         let mut edit = Edit::at_end(&value);
         for _ in 0..4 {
-            apply(&mut value, &mut edit, code(KeyCode::Left), Keys::default());
+            press(&mut value, &mut edit, code(KeyCode::Left), Keys::default());
         }
         assert_eq!(edit.caret, 0);
-        apply(&mut value, &mut edit, code(KeyCode::Right), Keys::default());
+        press(&mut value, &mut edit, code(KeyCode::Right), Keys::default());
         assert_eq!(edit.caret, 1);
-        apply(&mut value, &mut edit, code(KeyCode::Delete), Keys::default());
+        press(&mut value, &mut edit, code(KeyCode::Delete), Keys::default());
         assert_eq!(value, "a…b");
     }
 
@@ -839,13 +1271,13 @@ mod tests {
     fn a_stale_caret_is_clamped_rather_than_panicking() {
         let mut value = "hi".to_string();
         let mut edit = Edit { caret: 99, insert: true, ..Edit::default() };
-        apply(&mut value, &mut edit, key('!'), Keys::default());
+        press(&mut value, &mut edit, key('!'), Keys::default());
         assert_eq!(value, "hi!");
 
         // Mid-character carets snap back to a boundary.
         let mut value = "é".to_string();
         let mut edit = Edit { caret: 1, insert: true, ..Edit::default() };
-        apply(&mut value, &mut edit, key('x'), Keys::default());
+        press(&mut value, &mut edit, key('x'), Keys::default());
         assert_eq!(value, "xé");
     }
 
@@ -854,7 +1286,7 @@ mod tests {
         let mut value = String::new();
         let mut edit = Edit::default();
         let ctrl_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
-        assert_eq!(apply(&mut value, &mut edit, ctrl_h, Keys::default()), Applied::No);
+        assert_eq!(press(&mut value, &mut edit, ctrl_h, Keys::default()), Applied::No);
         assert_eq!(value, "");
     }
 
@@ -873,10 +1305,10 @@ mod tests {
         let mut value = "a".to_string();
         let mut edit = Edit::at_end(&value);
         for k in [key('b'), key('c'), key('d'), code(KeyCode::Esc)] {
-            apply(&mut value, &mut edit, k, Keys::default());
+            press(&mut value, &mut edit, k, Keys::default());
         }
         assert_eq!(value, "abcd");
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "a", "one `u` should undo the whole session");
     }
 
@@ -886,16 +1318,16 @@ mod tests {
         let mut edit = Edit::at_end(&value);
         // Session 1: append " two". Session 2: append " three".
         for k in [key(' '), key('t'), key('w'), key('o'), code(KeyCode::Esc)] {
-            apply(&mut value, &mut edit, k, Keys::default());
+            press(&mut value, &mut edit, k, Keys::default());
         }
         for k in [key('A'), key('!'), code(KeyCode::Esc)] {
-            apply(&mut value, &mut edit, k, Keys::default());
+            press(&mut value, &mut edit, k, Keys::default());
         }
         assert_eq!(value, "one two!");
 
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "one two");
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "one");
     }
 
@@ -904,7 +1336,7 @@ mod tests {
         let mut value = "abc".to_string();
         let mut edit = normal_at(0);
         for _ in 0..5 {
-            apply(&mut value, &mut edit, key('u'), Keys::default());
+            press(&mut value, &mut edit, key('u'), Keys::default());
         }
         assert_eq!(value, "abc");
     }
@@ -913,12 +1345,12 @@ mod tests {
     fn normal_mode_edits_are_each_their_own_undo_step() {
         let mut value = "abcd".to_string();
         let mut edit = normal_at(0);
-        apply(&mut value, &mut edit, key('x'), Keys::default());
-        apply(&mut value, &mut edit, key('x'), Keys::default());
+        press(&mut value, &mut edit, key('x'), Keys::default());
+        press(&mut value, &mut edit, key('x'), Keys::default());
         assert_eq!(value, "cd");
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "bcd");
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "abcd");
     }
 
@@ -926,9 +1358,9 @@ mod tests {
     fn undo_restores_the_caret_with_the_text() {
         let mut value = "abc".to_string();
         let mut edit = normal_at(2);
-        apply(&mut value, &mut edit, key('D'), Keys::default());
+        press(&mut value, &mut edit, key('D'), Keys::default());
         assert_eq!(value, "ab");
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "abc");
         assert_eq!(edit.caret, 2);
     }
@@ -940,10 +1372,10 @@ mod tests {
         let mut value = "ab".to_string();
         let mut edit = Edit::at_end(&value);
         for k in [key('c'), code(KeyCode::Esc), key('i'), code(KeyCode::Esc)] {
-            apply(&mut value, &mut edit, k, Keys::default());
+            press(&mut value, &mut edit, k, Keys::default());
         }
         assert_eq!(value, "abc");
-        apply(&mut value, &mut edit, key('u'), Keys::default());
+        press(&mut value, &mut edit, key('u'), Keys::default());
         assert_eq!(value, "ab");
     }
 
@@ -1006,12 +1438,12 @@ mod tests {
     fn the_sequence_expires_after_the_timeout() {
         let mut value = "ab".to_string();
         let mut edit = Edit::at_end(&value);
-        apply(&mut value, &mut edit, key('j'), jk());
+        press(&mut value, &mut edit, key('j'), jk());
         // Backdate the arming past `timeoutlen`: a pause then `k` is a literal.
         edit.pending = edit
             .pending
             .map(|(c, at)| (c, at - SEQUENCE_TIMEOUT - Duration::from_millis(1)));
-        apply(&mut value, &mut edit, key('k'), jk());
+        press(&mut value, &mut edit, key('k'), jk());
         assert_eq!(value, "abjk");
         assert!(edit.insert);
     }
@@ -1036,9 +1468,9 @@ mod tests {
     fn a_paste_between_the_two_keys_disarms_the_sequence() {
         let mut value = String::new();
         let mut edit = Edit::default();
-        apply(&mut value, &mut edit, key('j'), jk());
+        press(&mut value, &mut edit, key('j'), jk());
         insert_str(&mut value, &mut edit, "X");
-        apply(&mut value, &mut edit, key('k'), jk());
+        press(&mut value, &mut edit, key('k'), jk());
         assert_eq!(value, "jXk");
         assert!(edit.insert);
     }
@@ -1056,10 +1488,10 @@ mod tests {
     /// pane; nothing about the value or the caret may move on the way out.
     #[test]
     fn normal_mode_j_and_k_report_a_row_walk() {
-        for (press, expected) in [('j', Applied::FocusNext), ('k', Applied::FocusPrev)] {
+        for (walk, expected) in [('j', Applied::FocusNext), ('k', Applied::FocusPrev)] {
             let mut value = "https://x".to_string();
             let mut edit = normal_at(4);
-            assert_eq!(apply(&mut value, &mut edit, key(press), Keys::default()), expected);
+            assert_eq!(press(&mut value, &mut edit, key(walk), Keys::default()), expected);
             assert_eq!(value, "https://x");
             assert_eq!(edit.caret, 4);
             assert!(!edit.insert);
@@ -1097,7 +1529,7 @@ mod tests {
         let mut value = value.to_string();
         let mut edit = edit;
         for k in presses {
-            apply_multiline(&mut value, &mut edit, *k, Keys::default());
+            press_multiline(&mut value, &mut edit, *k, Keys::default());
         }
         (value, edit)
     }
@@ -1124,15 +1556,15 @@ mod tests {
         let mut value = body.to_string();
         let mut edit = normal_at(1);
 
-        assert_eq!(apply_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::Yes);
+        assert_eq!(press_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::Yes);
         assert_eq!(edit.caret, 5);
-        assert_eq!(apply_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::Yes);
+        assert_eq!(press_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::Yes);
         assert_eq!(edit.caret, 9);
         // Off the bottom: now it is the pane's business.
-        assert_eq!(apply_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::FocusNext);
+        assert_eq!(press_multiline(&mut value, &mut edit, key('j'), Keys::default()), Applied::FocusNext);
 
         let mut edit = normal_at(1);
-        assert_eq!(apply_multiline(&mut value, &mut edit, key('k'), Keys::default()), Applied::FocusPrev);
+        assert_eq!(press_multiline(&mut value, &mut edit, key('k'), Keys::default()), Applied::FocusPrev);
         assert_eq!(value, body);
     }
 
@@ -1206,5 +1638,323 @@ mod tests {
         );
         assert_eq!(value, "");
         assert_eq!(edit.caret, 0);
+    }
+
+    // ─── Line motions ─────────────────────────────────────────────────────────
+
+    /// `_` is the one the issue asked for by name, and it has to agree with
+    /// `^` — both are vim's "first non-blank of this line".
+    #[test]
+    fn underscore_and_caret_are_the_same_motion() {
+        for motion in ["_", "^"] {
+            let (_, edit, _) = keys_at("   https://x", 8, motion);
+            assert_eq!(edit.caret, 3, "{motion}");
+        }
+    }
+
+    #[test]
+    fn dollar_lands_on_the_last_character_and_zero_on_the_first() {
+        let (_, edit, _) = keys_at("abcdef", 2, "$");
+        assert_eq!(edit.caret, 5);
+        let (_, edit, _) = keys_at("abcdef", 2, "0");
+        assert_eq!(edit.caret, 0);
+    }
+
+    /// `gg` and `G` are the first and last lines' first non-blank. In a
+    /// single-line field that is the same place, exactly as in vim.
+    #[test]
+    fn gg_and_g_walk_to_the_first_and_last_lines() {
+        let mut value = "  one\n  two\n  three".to_string();
+        let mut edit = normal_at(8);
+        let mut register = String::new();
+        for c in "gg".chars() {
+            apply(&mut value, &mut edit, key(c), Keys::default(), &mut register);
+        }
+        assert_eq!(edit.caret, 2);
+        apply(&mut value, &mut edit, key('G'), Keys::default(), &mut register);
+        assert_eq!(edit.caret, 14);
+    }
+
+    /// `h` at the start of a line and `l` at its end stay put rather than
+    /// stepping onto the newline, which is not a position normal mode has.
+    #[test]
+    fn h_and_l_do_not_cross_a_line_break() {
+        let (_, edit, _) = keys_at("ab\ncd", 3, "h");
+        assert_eq!(edit.caret, 3);
+        let (_, edit, _) = keys_at("ab\ncd", 1, "l");
+        assert_eq!(edit.caret, 1);
+    }
+
+    // ─── Character search ─────────────────────────────────────────────────────
+
+    #[test]
+    fn f_and_t_search_forward_and_stop_differently() {
+        let (_, edit, _) = keys_at("Bearer abc.def", 0, "f.");
+        assert_eq!(edit.caret, 10);
+        let (_, edit, _) = keys_at("Bearer abc.def", 0, "t.");
+        assert_eq!(edit.caret, 9);
+    }
+
+    #[test]
+    fn capital_f_searches_backwards() {
+        let (_, edit, _) = keys_at("a.b.c", 4, "F.");
+        assert_eq!(edit.caret, 3);
+        let (_, edit, _) = keys_at("a.b.c", 4, "T.");
+        assert_eq!(edit.caret, 4);
+    }
+
+    /// A character that is not on the line leaves the caret alone — and an
+    /// operator waiting on that search does nothing at all.
+    #[test]
+    fn a_search_that_finds_nothing_changes_nothing() {
+        let (value, edit, _) = keys_at("abc", 0, "fz");
+        assert_eq!((value.as_str(), edit.caret), ("abc", 0));
+        let (value, edit, _) = keys_at("abc", 0, "dfz");
+        assert_eq!((value.as_str(), edit.caret), ("abc", 0));
+    }
+
+    /// The search never leaves the caret's line, so `f` cannot jump into the
+    /// body's next line the way a whole-value search would.
+    #[test]
+    fn a_search_stays_on_the_caret_s_line() {
+        let (_, edit, _) = keys_at("abc\nx.y", 0, "f.");
+        assert_eq!(edit.caret, 0);
+    }
+
+    #[test]
+    fn semicolon_repeats_a_search_and_comma_reverses_it() {
+        let (_, edit, _) = keys_at("a.b.c.d", 0, "f;");
+        // `f` then `;` — the `;` is the character being searched for here, so
+        // this is a search for a semicolon that finds nothing.
+        assert_eq!(edit.caret, 0);
+
+        let (_, edit, _) = keys_at("a.b.c.d", 0, "f.;");
+        assert_eq!(edit.caret, 3);
+        let (_, edit, _) = keys_at("a.b.c.d", 0, "f.;;,");
+        assert_eq!(edit.caret, 3);
+    }
+
+    // ─── Operators ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dw_deletes_a_word_and_the_space_after_it() {
+        let (value, edit, register) = keys_at("one two three", 0, "dw");
+        assert_eq!(value, "two three");
+        assert_eq!(edit.caret, 0);
+        assert_eq!(register, "one ");
+    }
+
+    /// Vim's one irregular pair: `cw` on a non-blank behaves like `ce`, so the
+    /// space after the word survives.
+    #[test]
+    fn cw_changes_the_word_but_not_the_space_after_it() {
+        let (value, edit, _) = keys_at("one two", 0, "cw");
+        assert_eq!(value, " two");
+        assert!(edit.insert);
+        assert_eq!(edit.caret, 0);
+    }
+
+    #[test]
+    fn db_deletes_back_to_the_start_of_the_word() {
+        let (value, edit, _) = keys_at("one two three", 8, "db");
+        assert_eq!(value, "one three");
+        assert_eq!(edit.caret, 4);
+    }
+
+    #[test]
+    fn d_dollar_takes_the_rest_of_the_line_and_d0_the_start_of_it() {
+        let (value, _, register) = keys_at("abcdef", 3, "d$");
+        assert_eq!(value, "abc");
+        assert_eq!(register, "def");
+        let (value, edit, _) = keys_at("abcdef", 3, "d0");
+        assert_eq!(value, "def");
+        assert_eq!(edit.caret, 0);
+    }
+
+    /// `de` is inclusive of the character it lands on, which is what makes it
+    /// different from `dw` at the end of a line.
+    #[test]
+    fn de_includes_the_last_character_of_the_word() {
+        let (value, _, _) = keys_at("one two", 0, "de");
+        assert_eq!(value, " two");
+    }
+
+    #[test]
+    fn df_deletes_up_to_and_including_its_target() {
+        let (value, _, _) = keys_at("key=value;rest", 0, "df;");
+        assert_eq!(value, "rest");
+        let (value, _, _) = keys_at("key=value;rest", 0, "dt;");
+        assert_eq!(value, ";rest");
+    }
+
+    /// The doubled operators take the line's text and leave the newline, so a
+    /// `dd` in the body does not join the line below onto the one above.
+    #[test]
+    fn dd_empties_the_line_without_removing_it() {
+        let (value, edit, register) = keys_at("one\ntwo\nthree", 5, "dd");
+        assert_eq!(value, "one\n\nthree");
+        assert_eq!(edit.caret, 4);
+        assert_eq!(register, "two");
+    }
+
+    #[test]
+    fn cc_empties_the_line_and_opens_insert_mode() {
+        let (value, edit, _) = keys_at("one\ntwo", 5, "cc");
+        assert_eq!(value, "one\n");
+        assert!(edit.insert);
+        assert_eq!(edit.caret, 4);
+    }
+
+    /// A yank never changes the text, and leaves the caret at the start of what
+    /// it took.
+    #[test]
+    fn yank_fills_the_register_and_leaves_the_value_alone() {
+        let (value, edit, register) = keys_at("one two", 4, "yy");
+        assert_eq!(value, "one two");
+        assert_eq!(register, "one two");
+        assert_eq!(edit.caret, 0);
+
+        let (value, _, register) = keys_at("one two", 4, "yw");
+        assert_eq!(value, "one two");
+        assert_eq!(register, "two");
+    }
+
+    #[test]
+    fn capital_y_yanks_the_line_without_moving_the_caret() {
+        let (value, edit, register) = keys_at("one\ntwo", 5, "Y");
+        assert_eq!(value, "one\ntwo");
+        assert_eq!(register, "two");
+        assert_eq!(edit.caret, 5);
+    }
+
+    /// A key that is not a motion cancels the operator rather than being read
+    /// as a fresh command — a mistyped `dq` must not delete on the next key.
+    #[test]
+    fn an_operator_waiting_on_a_motion_is_cancelled_by_anything_else() {
+        let (value, edit, _) = keys_at("one two", 0, "dq");
+        assert_eq!(value, "one two");
+        assert_eq!(edit.caret, 0);
+        // The `w` that follows is a plain motion, not the tail of the `d`.
+        let (value, edit, _) = keys_at("one two", 0, "dqw");
+        assert_eq!(value, "one two");
+        assert_eq!(edit.caret, 4);
+    }
+
+    /// Anything that does not reach the normal-mode table drops the operator,
+    /// which is what `apply` taking `pending_cmd` on the way in buys.
+    #[test]
+    fn an_arrow_key_cancels_a_waiting_operator() {
+        let mut value = "one two".to_string();
+        let mut edit = normal_at(0);
+        let mut register = String::new();
+        for k in [key('d'), code(KeyCode::Right), key('w')] {
+            apply(&mut value, &mut edit, k, Keys::default(), &mut register);
+        }
+        assert_eq!(value, "one two");
+    }
+
+    #[test]
+    fn an_operator_is_one_undo_step() {
+        let (value, _, _) = keys_at("one two three", 0, "dwu");
+        assert_eq!(value, "one two three");
+    }
+
+    // ─── Register, replace, case ──────────────────────────────────────────────
+
+    /// The register is charwise, so `p` puts after the character under the
+    /// caret and leaves the caret on the last character put.
+    #[test]
+    fn p_puts_after_the_caret_and_capital_p_before_it() {
+        let (value, edit, _) = keys_at("ab", 0, "ylp");
+        assert_eq!(value, "aab");
+        assert_eq!(edit.caret, 1);
+        let (value, edit, _) = keys_at("ab", 0, "ylP");
+        assert_eq!(value, "aab");
+        assert_eq!(edit.caret, 0);
+    }
+
+    #[test]
+    fn p_with_an_empty_register_does_nothing() {
+        let (value, edit, _) = keys_at("ab", 0, "p");
+        assert_eq!(value, "ab");
+        assert_eq!(edit.caret, 0);
+    }
+
+    /// The register outlives the field: `apply` takes it by reference, so the
+    /// caller can hand the same one to the next field's edit.
+    #[test]
+    fn the_register_carries_between_two_fields() {
+        let mut register = String::new();
+        let mut from = "secret".to_string();
+        let mut edit = normal_at(0);
+        for c in "y$".chars() {
+            apply(&mut from, &mut edit, key(c), Keys::default(), &mut register);
+        }
+        let mut to = "x".to_string();
+        let mut edit = normal_at(0);
+        apply(&mut to, &mut edit, key('p'), Keys::default(), &mut register);
+        assert_eq!(from, "secret");
+        assert_eq!(to, "xsecret");
+    }
+
+    #[test]
+    fn x_and_d_fill_the_register_too() {
+        let (_, _, register) = keys_at("abc", 0, "x");
+        assert_eq!(register, "a");
+        let (_, _, register) = keys_at("abc", 0, "D");
+        assert_eq!(register, "abc");
+    }
+
+    #[test]
+    fn r_writes_one_character_without_leaving_normal_mode() {
+        let (value, edit, _) = keys_at("cat", 0, "rb");
+        assert_eq!(value, "bat");
+        assert_eq!(edit.caret, 0);
+        assert!(!edit.insert);
+    }
+
+    /// `r` must not write over the newline ending a line — joining two lines is
+    /// not what `r` means.
+    #[test]
+    fn r_on_an_empty_line_writes_nothing() {
+        let (value, _, _) = keys_at("a\n\nb", 2, "rx");
+        assert_eq!(value, "a\n\nb");
+    }
+
+    #[test]
+    fn tilde_swaps_the_case_under_the_caret_and_steps_on() {
+        let (value, edit, _) = keys_at("abc", 0, "~~");
+        assert_eq!(value, "ABc");
+        assert_eq!(edit.caret, 2);
+    }
+
+    #[test]
+    fn r_and_tilde_are_each_one_undo_step() {
+        let (value, _, _) = keys_at("cat", 0, "rbu");
+        assert_eq!(value, "cat");
+        let (value, _, _) = keys_at("cat", 0, "~u");
+        assert_eq!(value, "cat");
+    }
+
+    /// None of these are commands in insert mode: they are letters someone is
+    /// typing into a URL.
+    #[test]
+    fn the_new_commands_are_plain_characters_in_insert_mode() {
+        let (value, _) = run("", Edit::default(), &"dcyrgfp~".chars().map(key).collect::<Vec<_>>());
+        assert_eq!(value, "dcyrgfp~");
+    }
+
+    /// `j` in a body still moves by line rather than completing an operator —
+    /// `apply_multiline` owns that key, so it drops the operator instead.
+    #[test]
+    fn a_body_line_walk_cancels_a_waiting_operator() {
+        let mut value = "one\ntwo".to_string();
+        let mut edit = normal_at(0);
+        let mut register = String::new();
+        for k in [key('d'), key('j')] {
+            apply_multiline(&mut value, &mut edit, k, Keys::default(), &mut register);
+        }
+        assert_eq!(value, "one\ntwo");
+        assert_eq!(edit.caret, 4);
     }
 }

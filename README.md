@@ -226,23 +226,79 @@ usual motions work; a second `Esc` leaves the pane. The caret shows which mode
 you are in: a thin bar between characters for insert, a block over a character
 for normal.
 
+Works in either mode:
+
 | Key | Action |
 | --- | ------ |
-| ← → , Home / End | Move the caret (either mode) |
-| Backspace / Delete | Delete a character (either mode) |
-| `h` / `l` | Left / right |
-| `w` / `b` / `e` | Word forward / back / end (`W` `B` `E` skip punctuation) |
-| `0` / `^` / `$` | Start of line / first non-blank / end |
-| `i` / `a` / `I` / `A` | Insert before / after the caret, at the start / end |
-| `x` / `s` | Delete the character under the caret, with / without inserting |
-| `D` / `C` / `S` | Delete to end of line, change to end of line, change the line |
+| ← → , Home / End | Move the caret |
+| Backspace / Delete | Delete a character |
+| Tab / BackTab | Next / previous field |
+
+**Motions** (normal mode). Anywhere below, "line" means the whole field —
+every field is a single line except the request body.
+
+| Key | Action |
+| --- | ------ |
+| `h` / `l` | Left / right, never past the ends of the line |
+| `w` / `b` / `e` | Word forward / back / to word end |
+| `W` / `B` / `E` | The same, treating punctuation as part of the word |
+| `0` | First character of the line |
+| `^` / `_` | First non-blank of the line |
+| `$` | Last character of the line |
+| `gg` / `G` | First / last line (the same place in a single-line field) |
+| `j` / `k` | Next / previous field — or, in the body, next / previous line |
+| `f`*x* / `F`*x* | Jump forward / back to the next *x* on the line |
+| `t`*x* / `T`*x* | The same, stopping one character short of it |
+| `;` / `,` | Repeat the last `f`/`F`/`t`/`T` forwards / backwards |
+
+**Entering insert mode:**
+
+| Key | Action |
+| --- | ------ |
+| `i` / `a` | Insert before / after the caret |
+| `I` / `A` | Insert at the first non-blank / end of the line |
+| `s` | Delete the character under the caret and insert |
+| `C` / `S` | Change to the end of the line / change the whole line |
+
+**Editing:**
+
+| Key | Action |
+| --- | ------ |
+| `x` | Delete the character under the caret |
+| `D` | Delete to the end of the line |
+| `r`*x* | Replace the character under the caret with *x* |
+| `~` | Swap the case of the character under the caret |
 | `u` | Undo the last change |
+
+**Operators.** `d` (delete), `c` (change — delete and insert) and `y` (yank)
+take any motion from the table above: `dw`, `d$`, `db`, `ct/`, `y^`. Doubling
+the operator acts on the whole line (`dd`, `cc`, `yy`, and `Y` as a shorthand
+for `yy`). As in vim, `cw` changes the word without swallowing the space after
+it. A key that is not a motion cancels the operator rather than doing something
+else, so a mistyped `dq` is harmless.
+
+**Putting.** `p` puts the last yanked or deleted text after the caret, `P`
+before it. `x`, `s`, `d`, `c`, `D`, `C` and `S` all fill the register, so `x`
+then `p` transposes two characters exactly as in vim.
+
+The register is shared across every field, which is what makes it useful:
+yank a bearer token out of one header with `y$` and put it into another with
+`p`. It is always *charwise*, even for `dd` and `yy` — so `yy` then `p` inserts
+the line's text at the caret rather than opening a new line below. That is
+deliberate: every field but the body is a single line that must never gain a
+newline.
 
 `u` steps back one *change* at a time, not one keystroke: everything typed
 between entering insert mode and leaving it undoes together, so one `u` reverses
-the whole URL you just typed rather than its last character. The history belongs
-to the field, and moving focus starts a new one — Tab away and back and there is
-nothing left to undo. There is no redo.
+the whole URL you just typed rather than its last character. Unlike the
+register, the undo history belongs to the field, and moving focus starts a new
+one — Tab away and back and there is nothing left to undo. There is no redo.
+
+**Long values stay readable.** A value wider than the pane scrolls sideways to
+keep the caret on screen, with `‹` and `›` marking text hidden either side — so
+walking through a long bearer token with `w` or `f` never loses the cursor off
+the edge. Widen the pane by dragging the divider if you want to see more of it
+at once.
 
 Every field here is a single line, with one exception: the request body, where
 Enter types a newline, `j`/`k` move by line, and the line commands act on the
