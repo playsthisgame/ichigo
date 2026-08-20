@@ -1,6 +1,6 @@
 [package]
 name = "ichigo"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 description = "A CLI HTTP client — store named request configs in your project or globally, then run them by name or through the TUI"
 license = "MIT"
