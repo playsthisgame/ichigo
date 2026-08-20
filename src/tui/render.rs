@@ -211,6 +211,162 @@ fn input_line(value: &str, caret: Option<&Edit>, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The rows inside a bordered pane — the height its lines actually have.
+fn interior_height(area: Rect) -> u16 {
+    area.height.saturating_sub(2)
+}
+
+/// The lines of a pane its focused row occupies, recorded while the pane's
+/// lines are built.
+///
+/// A pane knows which of its rows is focused only as it draws that row, and the
+/// scroll offset needs the row's position in the finished list — so each
+/// renderer marks the range as it goes and hands it to `vscroll` at the end.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct FocusRows {
+    start: usize,
+    end: usize,
+}
+
+impl FocusRows {
+    /// Records `start..end` as the focused block, if this is the focused row.
+    /// Called with the length taken before the block was pushed and the length
+    /// after it, so a pane cannot record a range it never closes.
+    fn mark(&mut self, focused: bool, start: usize, end: usize) {
+        if focused {
+            self.start = start;
+            self.end = end;
+        }
+    }
+
+    /// The block at `row`, for a pane whose focused row is a single line.
+    fn at(row: usize) -> Self {
+        FocusRows { start: row, end: row + 1 }
+    }
+}
+
+/// How far down a pane's lines are scrolled so its focused row stays on screen.
+///
+/// The vertical half of `window`, and stateless for the same reason: a form's
+/// contents change under it — a header row deleted at the focused index, a
+/// draft that toured another pane and came back — and an offset stored and
+/// nudged would be describing a list of lines that no longer exists. Recomputed
+/// each frame from the focused row, it cannot go stale.
+///
+/// It centres that row for the same reason `window` centres the caret, and at
+/// the same price: the form slides under a focus moving through the middle of
+/// it, which is vim's own `scrolloff=999` and is the better half of the trade
+/// against a caret that is simply not on the screen. Centring also leaves half
+/// a pane of slack either side of the row, which is what lets the two wrapping
+/// panes scroll on an *estimate* of where `Wrap` broke their lines.
+fn vscroll(total: usize, rows: FocusRows, height: usize) -> u16 {
+    if height == 0 || total <= height {
+        return 0;
+    }
+    let middle = rows.start + rows.end.saturating_sub(rows.start) / 2;
+    // Never past the end of the content, and never past the focused block's own
+    // first line: a block taller than the pane shows its top rather than
+    // centring a middle that would take the top off the screen.
+    let offset = middle
+        .saturating_sub(height / 2)
+        .min(total - height)
+        .min(rows.start);
+    u16::try_from(offset).unwrap_or(u16::MAX)
+}
+
+/// The character index each rendered row of `line` starts at, in a pane `width`
+/// columns wide.
+///
+/// An *estimate* of what `Wrap { trim: false }` does — break at the last space
+/// that fits, mid-word for a word wider than the pane — because the two
+/// wrapping panes scroll by rendered rows and only the widget knows for certain
+/// where it broke them. `vscroll` centres, so a row of disagreement costs a row
+/// of centring rather than the caret. Every line has a first row, so the result
+/// is never empty.
+fn wrap_starts(line: &str, width: usize) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    if width == 0 {
+        return starts;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let mut row_start = 0;
+    // The index just past the last space seen on the current row, which is
+    // where the next row begins if the row fills before another space arrives.
+    let mut last_break: Option<usize> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        if i - row_start == width {
+            let at = last_break.filter(|b| *b > row_start).unwrap_or(i);
+            starts.push(at);
+            row_start = at;
+            last_break = None;
+            // `at` may be behind `i`, so the characters after the break are
+            // measured again against the new row rather than skipped.
+            continue;
+        }
+        if chars[i].is_whitespace() {
+            last_break = Some(i + 1);
+        }
+        i += 1;
+    }
+    starts
+}
+
+/// The rendered row each of `lines` starts on, and the rendered height of all
+/// of them, for a pane that wraps.
+fn wrapped_offsets(lines: &[Line<'static>], width: usize) -> (Vec<usize>, usize) {
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut total = 0;
+    for line in lines {
+        offsets.push(total);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        total += wrap_starts(&text, width).len();
+    }
+    (offsets, total)
+}
+
+/// The rendered row of `line` that the character at `col` falls on.
+fn wrapped_row_of(line: &str, col: usize, width: usize) -> usize {
+    wrap_starts(line, width)
+        .iter()
+        .take_while(|start| **start <= col)
+        .count()
+        .saturating_sub(1)
+}
+
+/// The body pane's caret, as the line of `data` it sits on and the rendered
+/// row *within* that line once `Wrap` has broken it.
+///
+/// The two halves are separate because only the first can be turned into a
+/// position in the pane — the rows above the data are the pane's own, and it
+/// counts those itself.
+fn body_caret_row(data: &str, caret: usize, indent: &str, width: usize) -> (usize, usize) {
+    let (line, col) = caret_line_col(data, caret);
+    let text = format!("{indent}{}", data.split('\n').nth(line).unwrap_or(""));
+    (line, wrapped_row_of(&text, indent.chars().count() + col, width))
+}
+
+/// The line of a multi-line value the caret sits on, and how many characters
+/// into that line it is.
+///
+/// Must agree with `text_area_lines`, which places the caret by the same rule:
+/// a caret at a line's end belongs to that line, and the next line starts past
+/// the newline.
+fn caret_line_col(value: &str, caret: usize) -> (usize, usize) {
+    let mut start = 0;
+    for (i, segment) in value.split('\n').enumerate() {
+        let end = start + segment.len();
+        if caret <= end {
+            let col = segment[..caret.saturating_sub(start).min(segment.len())]
+                .chars()
+                .count();
+            return (i, col);
+        }
+        start = end + 1;
+    }
+    (0, 0)
+}
+
 pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     let full = frame.area();
     let outer = Layout::default()
@@ -411,6 +567,7 @@ fn draw_profile_select(
 ) {
     let title = format!(" Profile — {} ", entry_name);
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
 
     let is_none_selected = selected == 0;
     let none_style = if is_none_selected {
@@ -418,11 +575,13 @@ fn draw_profile_select(
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    rows.mark(is_none_selected, lines.len(), lines.len() + 1);
     lines.push(Line::from(Span::styled("  (no profile)", none_style)));
     lines.push(Line::raw(""));
 
     for (i, profile) in profiles.iter().enumerate() {
         let is_selected = selected == i + 1;
+        let at = lines.len();
         let name_style = if is_selected {
             Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
         } else {
@@ -438,10 +597,12 @@ fn draw_profile_select(
                 Span::styled(v.clone(), Style::default().fg(Color::DarkGray)),
             ]));
         }
+        rows.mark(is_selected, at, lines.len());
         lines.push(Line::raw(""));
     }
 
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -466,10 +627,12 @@ fn draw_new_request(
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
 
     for (i, (label, value)) in fields.iter().enumerate() {
         let is_focused = i == focused;
         let is_required = i < 3; // name, method, url are required
+        let at = lines.len();
 
         let mut label_spans = vec![Span::styled(
             format!("  {}", label),
@@ -483,6 +646,7 @@ fn draw_new_request(
         lines.push(Line::from(label_spans));
 
         lines.push(input_line(value, caret(is_focused, edit), interior(area)));
+        rows.mark(is_focused, at, lines.len());
         lines.push(Line::raw(""));
     }
 
@@ -493,16 +657,19 @@ fn draw_new_request(
     } else {
         ("[ ] global", Color::DarkGray)
     };
+    let at = lines.len();
     lines.push(action_row(
         global_check,
         global_color,
         "Enter to toggle",
         focused == fields.len(),
     ));
+    rows.mark(focused == fields.len(), at, lines.len());
     lines.push(Line::raw(""));
 
     // Headers are edited in their own pane, but shown here so the form is not
     // silent about a part of the request it carries.
+    let at = lines.len();
     lines.push(action_row(
         "headers",
         Color::DarkGray,
@@ -524,10 +691,12 @@ fn draw_new_request(
             ]));
         }
     }
+    rows.mark(focused == fields.len() + 1, at, lines.len());
     lines.push(Line::raw(""));
 
     // Query params, on the same terms as headers and drawn right after them
     // because that is the order a request config lists them in.
+    let at = lines.len();
     lines.push(action_row(
         "query params",
         Color::DarkGray,
@@ -549,9 +718,11 @@ fn draw_new_request(
             ]));
         }
     }
+    rows.mark(focused == fields.len() + 2, at, lines.len());
     lines.push(Line::raw(""));
 
     // The body, in the config's own order: after query, before profiles.
+    let at = lines.len();
     lines.push(action_row(
         "body",
         Color::DarkGray,
@@ -576,11 +747,13 @@ fn draw_new_request(
             }
         }
     }
+    rows.mark(focused == fields.len() + 3, at, lines.len());
     lines.push(Line::raw(""));
 
     // Drawn even when empty, unlike before: it is a Tab stop now, and a row
     // that vanishes when there is nothing in it is one focus can land on
     // invisibly.
+    let at = lines.len();
     lines.push(action_row(
         "profiles",
         Color::DarkGray,
@@ -606,6 +779,7 @@ fn draw_new_request(
             }
         }
     }
+    rows.mark(focused == fields.len() + 4, at, lines.len());
     lines.push(Line::raw(""));
 
     if let Some(err) = error {
@@ -616,7 +790,8 @@ fn draw_new_request(
     }
 
     let title = if is_edit { " Edit Request " } else { " New Request " };
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -628,12 +803,14 @@ fn draw_new_request(
 /// The body as the request form shows it: at most `BODY_PREVIEW_LINES` lines,
 /// then a count of what is left.
 ///
-/// The form is one `Paragraph` with no scrolling, so an eighty-line JSON body
-/// would push `profiles` off the bottom of the pane — a Tab stop that focus can
-/// land on invisibly, which is the thing the action rows were introduced to
-/// stop. Headers and query params can do the same in principle, but a request
-/// with sixty headers is a request someone built by hand; a sixty-line body is
-/// an ordinary POST.
+/// The form scrolls to whichever row focus is on, so an eighty-line body no
+/// longer hides the rows below it — but it would still put eighty lines between
+/// `body` and `profiles`, which is a page of scrolling to cross a row that says
+/// nothing the body pane does not say better. The preview is what the *form*
+/// has to say about a body; reading one is what `EditBody` is for. Headers and
+/// query params can grow the same way in principle, but a request with sixty
+/// headers is a request someone built by hand; a sixty-line body is an ordinary
+/// POST.
 fn body_preview(data: &str) -> Vec<String> {
     let lines: Vec<&str> = data.lines().collect();
     let mut preview: Vec<String> = lines
@@ -666,6 +843,7 @@ fn draw_edit_body(
     edit: &Edit,
     error: Option<&str>,
 ) {
+    let indent = "  ";
     let mut lines: Vec<Line<'static>> = vec![
         Line::raw(""),
         Line::from(Span::styled(
@@ -683,7 +861,10 @@ fn draw_edit_body(
                 .add_modifier(Modifier::BOLD),
         )),
     ];
-    lines.extend(text_area_lines(data, caret(focused == 1, edit), "  "));
+    // Where the data's first line lands, so the caret's rendered row can be
+    // found without counting the rows above it a second time.
+    let data_at = lines.len();
+    lines.extend(text_area_lines(data, caret(focused == 1, edit), indent));
 
     if let Some(err) = error {
         lines.push(Line::raw(""));
@@ -693,7 +874,21 @@ fn draw_edit_body(
         )));
     }
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+    // This pane wraps, so it scrolls by *rendered* rows rather than by lines,
+    // and the caret's row has to be found inside the line holding it: a body
+    // that is one long line of JSON is the common case, and pinning the top of
+    // that line would leave the caret as far off the bottom as before.
+    let width = usize::from(interior(area));
+    let (offsets, total) = wrapped_offsets(&lines, width);
+    let rows = if focused == 0 {
+        FocusRows::at(offsets[2])
+    } else {
+        let (line, within) = body_caret_row(data, edit.caret, indent, width);
+        FocusRows::at(offsets.get(data_at + line).copied().unwrap_or(0) + within)
+    };
+
+    let offset = vscroll(total, rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((offset, 0)).block(
         Block::default()
             .title(" Body ")
             .borders(Borders::ALL)
@@ -738,8 +933,18 @@ fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&
         )));
     }
 
+    // The cursor is always at the end of the buffer, so the row to keep on
+    // screen is the last one there is — a pasted command longer than the pane
+    // otherwise scrolled its own tail off the bottom.
+    let (_, total) = wrapped_offsets(&lines, usize::from(interior(area)));
+    let offset = vscroll(
+        total,
+        FocusRows::at(total.saturating_sub(1)),
+        usize::from(interior_height(area)),
+    );
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
+        .scroll((offset, 0))
         .block(
             Block::default()
                 .title(" Import cURL ")
@@ -761,9 +966,11 @@ fn draw_new_profile(
     is_edit: bool,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
 
     // Profile name field
     let name_focused = focused == 0;
+    let at = lines.len();
     lines.push(Line::from(vec![
         Span::styled(
             "  profile name",
@@ -774,6 +981,7 @@ fn draw_new_profile(
         Span::styled(" *", Style::default().fg(Color::Red)),
     ]));
     lines.push(input_line(name, caret(name_focused, edit), interior(area)));
+    rows.mark(name_focused, at, lines.len());
     lines.push(Line::raw(""));
 
     // Param pairs: focused index 1+2i = key, 2+2i = value
@@ -781,6 +989,7 @@ fn draw_new_profile(
         let key_focused = focused == 1 + 2 * i;
         let val_focused = focused == 2 + 2 * i;
 
+        let at = lines.len();
         lines.push(Line::from(Span::styled(
             format!("  param {} key", i + 1),
             Style::default()
@@ -788,7 +997,9 @@ fn draw_new_profile(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(key, caret(key_focused, edit), interior(area)));
+        rows.mark(key_focused, at, lines.len());
 
+        let at = lines.len();
         lines.push(Line::from(Span::styled(
             format!("  param {} value", i + 1),
             Style::default()
@@ -796,6 +1007,7 @@ fn draw_new_profile(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(val_focused, edit), interior(area)));
+        rows.mark(val_focused, at, lines.len());
         lines.push(Line::raw(""));
     }
 
@@ -806,7 +1018,8 @@ fn draw_new_profile(
         )));
     }
 
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(if is_edit { " Edit Profile " } else { " New Profile " })
             .borders(Borders::ALL)
@@ -830,12 +1043,14 @@ fn draw_edit_pairs(
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
     let noun = kind.noun();
 
     for (i, (name, value)) in pairs.iter().enumerate() {
         let name_focused = focused == 2 * i;
         let value_focused = focused == 2 * i + 1;
 
+        let at = lines.len();
         lines.push(Line::from(Span::styled(
             format!("  {} {} name", noun, i + 1),
             Style::default()
@@ -843,7 +1058,9 @@ fn draw_edit_pairs(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(name, caret(name_focused, edit), interior(area)));
+        rows.mark(name_focused, at, lines.len());
 
+        let at = lines.len();
         lines.push(Line::from(Span::styled(
             format!("  {} {} value", noun, i + 1),
             Style::default()
@@ -851,6 +1068,7 @@ fn draw_edit_pairs(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(value_focused, edit), interior(area)));
+        rows.mark(value_focused, at, lines.len());
         lines.push(Line::raw(""));
     }
 
@@ -869,7 +1087,8 @@ fn draw_edit_pairs(
         )));
     }
 
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(kind.title())
             .borders(Borders::ALL)
@@ -888,10 +1107,12 @@ fn draw_profile_list(
     request_name: &str,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
 
     for (i, profile) in profiles.iter().enumerate() {
         let is_selected = i == selected;
         let marker = if is_selected { "  ▶ " } else { "    " };
+        let at = lines.len();
         lines.push(Line::from(vec![
             Span::styled(marker, Style::default().fg(Color::Magenta)),
             Span::styled(
@@ -918,10 +1139,12 @@ fn draw_profile_list(
                 ]));
             }
         }
+        rows.mark(is_selected, at, lines.len());
         lines.push(Line::raw(""));
     }
 
     let new_selected = selected >= profiles.len();
+    rows.mark(new_selected, lines.len(), lines.len() + 1);
     lines.push(Line::from(vec![
         Span::styled(
             if new_selected { "  ▶ " } else { "    " },
@@ -947,7 +1170,8 @@ fn draw_profile_list(
         )));
     }
 
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(format!(" Profiles — {} ", request_name))
             .borders(Borders::ALL)
@@ -966,9 +1190,11 @@ fn draw_var_input(
 ) {
     let title = format!(" Variables — {} ", entry_name);
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
 
     for (i, (name, value)) in vars.iter().enumerate() {
         let is_focused = i == focused;
+        let at = lines.len();
 
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
@@ -977,10 +1203,12 @@ fn draw_var_input(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(is_focused, edit), interior(area)));
+        rows.mark(is_focused, at, lines.len());
         lines.push(Line::raw(""));
     }
 
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -1000,9 +1228,11 @@ fn draw_test_input(
 ) {
     let title = format!(" Test — {} ", entry_name);
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
+    let mut rows = FocusRows::default();
 
     for (i, (name, value)) in vars.iter().enumerate() {
         let is_focused = i == focused;
+        let at = lines.len();
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
             Style::default()
@@ -1010,10 +1240,12 @@ fn draw_test_input(
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(is_focused, edit), interior(area)));
+        rows.mark(is_focused, at, lines.len());
         lines.push(Line::raw(""));
     }
 
     let iter_focused = focused == vars.len();
+    let at = lines.len();
     lines.push(Line::from(Span::styled(
         "  iterations",
         Style::default()
@@ -1021,8 +1253,10 @@ fn draw_test_input(
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(input_line(iterations, caret(iter_focused, edit), interior(area)));
+    rows.mark(iter_focused, at, lines.len());
 
-    let paragraph = Paragraph::new(lines).block(
+    let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
+    let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
@@ -2175,5 +2409,216 @@ mod tests {
         let line = input_line(&value, Some(&edit), 24);
         let rendered: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(rendered.contains('é'));
+    }
+
+    // ---- vertical scrolling ----------------------------------------------
+
+    /// Nothing is scrolled while everything fits: the offset exists to rescue a
+    /// row off the bottom, not to move a pane that has room for all of them.
+    #[test]
+    fn a_pane_that_fits_is_never_scrolled() {
+        assert_eq!(vscroll(10, FocusRows::at(9), 20), 0);
+        assert_eq!(vscroll(20, FocusRows::at(19), 20), 0);
+    }
+
+    /// The property the whole thing exists for: wherever focus is, its row is
+    /// on the screen.
+    #[test]
+    fn the_focused_row_is_on_screen_at_every_position() {
+        for height in [1, 2, 7, 24, 60] {
+            for total in [0, 1, 9, 24, 200] {
+                for row in 0..total {
+                    let offset = usize::from(vscroll(total, FocusRows::at(row), height));
+                    assert!(
+                        offset <= row && row < offset + height,
+                        "total {total} row {row} height {height} gave {offset}",
+                    );
+                    assert!(offset + height <= total.max(height));
+                }
+            }
+        }
+    }
+
+    /// The last row scrolls to the end of the content and no further — a pane
+    /// showing blank rows below the last line has scrolled past it.
+    #[test]
+    fn the_last_row_stops_at_the_end_of_the_content() {
+        assert_eq!(vscroll(100, FocusRows::at(99), 20), 80);
+    }
+
+    /// A block taller than the pane shows its top. Centring it would put the
+    /// label and the input row above the screen, which is the thing being
+    /// fixed rather than a new way to draw it.
+    #[test]
+    fn a_block_taller_than_the_pane_shows_its_top() {
+        assert_eq!(vscroll(200, FocusRows { start: 40, end: 90 }, 20), 40);
+    }
+
+    /// A pane dragged to no interior at all has nowhere to scroll to.
+    #[test]
+    fn a_pane_with_no_height_is_not_scrolled() {
+        assert_eq!(vscroll(50, FocusRows::at(40), 0), 0);
+    }
+
+    // ---- wrapping ---------------------------------------------------------
+
+    #[test]
+    fn a_line_that_fits_is_one_row() {
+        assert_eq!(wrap_starts("short", 20), vec![0]);
+        assert_eq!(wrap_starts("", 20), vec![0]);
+    }
+
+    /// Breaking at the last space that fits, as `Wrap` does.
+    #[test]
+    fn a_long_line_breaks_at_a_space() {
+        // "aaa bbb ccc" in 8 columns: "aaa bbb " then "ccc".
+        assert_eq!(wrap_starts("aaa bbb ccc", 8), vec![0, 8]);
+    }
+
+    /// A word wider than the pane has no space to break at, so it is broken
+    /// where the row ends — a URL or a one-line JSON body is the common case.
+    #[test]
+    fn a_word_wider_than_the_pane_is_broken_mid_word() {
+        assert_eq!(wrap_starts(&"x".repeat(25), 10), vec![0, 10, 20]);
+    }
+
+    /// A pane with no interior cannot be divided into rows.
+    #[test]
+    fn a_zero_width_pane_leaves_one_row() {
+        assert_eq!(wrap_starts("anything at all", 0), vec![0]);
+    }
+
+    // ---- the body pane's caret --------------------------------------------
+
+    /// A caret at a line's end belongs to that line, matching the rule
+    /// `text_area_lines` places it by.
+    #[test]
+    fn a_caret_at_a_lines_end_belongs_to_that_line() {
+        assert_eq!(caret_line_col("ab\ncd", 2), (0, 2));
+        assert_eq!(caret_line_col("ab\ncd", 3), (1, 0));
+        assert_eq!(caret_line_col("ab\ncd", 5), (1, 2));
+    }
+
+    /// The column is in characters, since that is what the wrap is measured in.
+    #[test]
+    fn the_caret_column_counts_characters_not_bytes() {
+        let value = "ééé";
+        assert_eq!(caret_line_col(value, value.len()), (0, 3));
+    }
+
+    /// The case the body pane's arithmetic exists for: one long line of JSON,
+    /// with the caret at the end of it. Counting only lines would put it on row
+    /// zero and leave the caret as far off the bottom as before.
+    #[test]
+    fn a_caret_deep_in_a_wrapped_line_is_rows_below_its_lines_start() {
+        let data = "x".repeat(400);
+        let (line, within) = body_caret_row(&data, data.len(), "  ", 40);
+        assert_eq!(line, 0);
+        assert_eq!(within, 10);
+    }
+
+    /// And with real lines above it, both halves count.
+    #[test]
+    fn a_caret_on_a_later_line_reports_that_line() {
+        let data = "one\ntwo\nthree";
+        let (line, within) = body_caret_row(data, data.len(), "  ", 40);
+        assert_eq!((line, within), (2, 0));
+    }
+
+    // ---- the panes themselves ---------------------------------------------
+
+    /// What the pane drew, in a terminal of the given size.
+    fn drawn(
+        width: u16,
+        height: u16,
+        draw: impl FnOnce(&mut Frame, Rect),
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, frame.area())).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Everything the pane drew, as one string.
+    fn rendered(width: u16, height: u16, draw: impl FnOnce(&mut Frame, Rect)) -> String {
+        drawn(width, height, draw)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn form_fields() -> Vec<(String, String)> {
+        ["name", "method", "url", "extract"]
+            .iter()
+            .map(|label| ((*label).to_string(), String::new()))
+            .collect()
+    }
+
+    /// The request form in a pane too short for it, with `focused` on one row.
+    fn form(focused: usize, fields: &[(String, String)]) -> String {
+        let edit = Edit::default();
+        let headers = std::collections::HashMap::new();
+        let query = std::collections::HashMap::new();
+        rendered(40, 12, |frame: &mut Frame, area: Rect| {
+            draw_new_request(
+                frame, area, fields, focused, &edit, &[], &headers, &query, None, false, false,
+                None,
+            );
+        })
+    }
+
+    /// What the issue was: the request form is taller than the pane, so the
+    /// last Tab stops were simply not drawn and focus went somewhere invisible.
+    #[test]
+    fn a_focused_row_below_the_pane_is_drawn_anyway() {
+        let fields = form_fields();
+
+        // The first field is on screen either way; the last action row is
+        // twenty-odd lines below the top of a twelve-row pane.
+        assert!(form(0, &fields).contains("name"));
+        let last = form(fields.len() + 4, &fields);
+        assert!(last.contains("profiles"), "{last}");
+    }
+
+    /// The pane still starts at the top while the focus is near it: scrolling
+    /// on the first field would hide the title row for nothing.
+    #[test]
+    fn a_form_focused_at_the_top_is_not_scrolled() {
+        let top = form(0, &form_fields());
+        assert!(top.contains("name"), "{top}");
+        assert!(top.contains("method"), "{top}");
+    }
+
+    /// The body pane wraps, so its caret is rows rather than lines below the
+    /// top — a long one-line JSON body is the case the row arithmetic is for.
+    #[test]
+    fn a_caret_at_the_end_of_a_long_body_is_on_screen() {
+        let data = "x".repeat(600);
+        let edit = Edit::landing(&data, false);
+        let pane = drawn(30, 10, |frame: &mut Frame, area: Rect| {
+            draw_edit_body(frame, area, "application/json", &data, 1, &edit, None);
+        });
+        // In normal mode the caret is the character it rests on, drawn in
+        // reverse — nothing else in this pane has a white background.
+        assert!(
+            pane.content.iter().any(|cell| cell.bg == Color::White),
+            "no caret drawn",
+        );
+    }
+
+    /// The same body with the caret back at the top: the pane must not have
+    /// scrolled away from it.
+    #[test]
+    fn a_caret_at_the_start_of_a_long_body_is_on_screen() {
+        let data = "x".repeat(600);
+        let edit = Edit::landing("", false);
+        let pane = drawn(30, 10, |frame: &mut Frame, area: Rect| {
+            draw_edit_body(frame, area, "application/json", &data, 1, &edit, None);
+        });
+        assert!(
+            pane.content.iter().any(|cell| cell.bg == Color::White),
+            "no caret drawn",
+        );
     }
 }
