@@ -11,8 +11,8 @@ Board IDs are in CLAUDE.md. Use them; don't re-query.
    and stop. Do not guess at intent.
 5. Create an isolated worktree — do NOT modify this checkout:
      git fetch origin
-     git worktree add ../ichigo-<issue-number> -b <type>/<issue-number>-<slug> origin/main
-   Then cd into ../ichigo-<issue-number> and do all remaining work there.
+     git worktree add .claude/worktrees/<issue-number> -b <type>/<issue-number>-<slug> origin/main
+   Then cd into .claude/worktrees/<issue-number> and do all remaining work there.
    Never run git checkout in the primary checkout.
 6. Run the project's install/setup step in the worktree — gitignored files like
    node_modules and .env are not carried over.
