@@ -929,10 +929,11 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
             }
         }
         KeyCode::Char('G') => {
-            if let Mode::Response { scroll, cursor, body, headers, show_headers, response_filter, .. } =
-                &mut app.mode
+            if let Mode::Response {
+                scroll, cursor, body, summary, headers, show_headers, response_filter, ..
+            } = &mut app.mode
             {
-                let text = super::response_text(headers, *show_headers, body);
+                let text = super::response_text(summary, headers, *show_headers, body);
                 let count = super::visible_response_lines(&text, response_filter).len();
                 *cursor = count.saturating_sub(1);
                 let last = count.min(u16::MAX as usize) as u16;
@@ -950,8 +951,10 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('y') => {
             let picked = match &app.mode {
-                Mode::Response { body, headers, show_headers, response_filter, cursor, anchor, .. } => {
-                    let text = super::response_text(headers, *show_headers, body);
+                Mode::Response {
+                    body, summary, headers, show_headers, response_filter, cursor, anchor, ..
+                } => {
+                    let text = super::response_text(summary, headers, *show_headers, body);
                     let lines = super::visible_response_lines(&text, response_filter);
                     let (from, to) = super::selection_range(*cursor, *anchor);
                     lines
@@ -979,8 +982,8 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
         // can see rather than the whole body behind them.
         KeyCode::Char('c') => {
             let text = match &app.mode {
-                Mode::Response { body, headers, show_headers, response_filter, .. } => {
-                    let text = super::response_text(headers, *show_headers, body);
+                Mode::Response { body, summary, headers, show_headers, response_filter, .. } => {
+                    let text = super::response_text(summary, headers, *show_headers, body);
                     super::visible_response_lines(&text, response_filter).join("\n")
                 }
                 Mode::TestResponse { results } => format_test_results_text(results),
@@ -1031,12 +1034,13 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
 /// on screen. The pane scrolls to follow the cursor rather than the other way
 /// round, so a selection cannot be extended past the edge of the view.
 fn move_cursor(app: &mut App, delta: isize, view_height: u16) {
-    let Mode::Response { body, headers, show_headers, response_filter, cursor, scroll, .. } =
-        &mut app.mode
+    let Mode::Response {
+        body, summary, headers, show_headers, response_filter, cursor, scroll, ..
+    } = &mut app.mode
     else {
         return;
     };
-    let text = super::response_text(headers, *show_headers, body);
+    let text = super::response_text(summary, headers, *show_headers, body);
     let count = super::visible_response_lines(&text, response_filter).len();
     if count == 0 {
         return;

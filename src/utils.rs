@@ -128,10 +128,97 @@ pub fn format_response_headers(headers: &reqwest::header::HeaderMap) -> String {
         .join("\n")
 }
 
+/// The line a run leads with: `200 OK · 143 ms · 4.2 KB`.
+///
+/// `detail` is whatever the response was made of — a byte count for a text
+/// body, or `media::summarize`'s whole `image/png · 100×100 · 7.9 KB` for an
+/// image. One function and one format for both, so an image response gets a
+/// single line with the size in it once rather than a run summary stacked on
+/// top of a media summary repeating it.
+///
+/// A status with no canonical reason (a server inventing `599`) prints the
+/// number alone rather than a trailing space where the words would be.
+pub fn format_run_summary(status: reqwest::StatusCode, elapsed: Duration, detail: &str) -> String {
+    let head = match status.canonical_reason() {
+        Some(reason) => format!("{} {}", status.as_u16(), reason),
+        None => status.as_u16().to_string(),
+    };
+    format!("{head} · {} · {detail}", human_duration(elapsed))
+}
+
+/// Milliseconds up to a second, then seconds — the shape `media::human_size`
+/// uses for bytes.
+///
+/// Sub-millisecond gets a decimal place because a request against localhost
+/// really does come back in under a millisecond, and rounding it to `0 ms`
+/// reads as a broken timer rather than a fast server.
+fn human_duration(elapsed: Duration) -> String {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if ms < 1.0 {
+        format!("{ms:.1} ms")
+    } else if ms < 1000.0 {
+        format!("{} ms", ms.round() as u64)
+    } else {
+        format!("{:.2} s", ms / 1000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    use reqwest::StatusCode;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_run_summary_leads_with_the_status_then_time_then_size() {
+        assert_eq!(
+            format_run_summary(StatusCode::OK, ms(143), &crate::media::human_size(4_301)),
+            "200 OK · 143 ms · 4.2 KB"
+        );
+    }
+
+    /// An image response is one line, not a run summary stacked on a media one:
+    /// `summarize`'s output is the detail rather than a second line repeating
+    /// the size.
+    #[test]
+    fn an_image_run_summary_carries_the_media_detail_inline() {
+        assert_eq!(
+            format_run_summary(
+                StatusCode::OK,
+                ms(143),
+                &crate::media::summarize("image/png", 43_112, Some((1024, 768)))
+            ),
+            "200 OK · 143 ms · image/png · 1024×768 · 42.1 KB"
+        );
+    }
+
+    #[test]
+    fn a_status_with_no_canonical_reason_prints_the_number_alone() {
+        let summary = format_run_summary(StatusCode::from_u16(599).unwrap(), ms(5), "0 B");
+        assert_eq!(summary, "599 · 5 ms · 0 B");
+    }
+
+    #[test]
+    fn durations_scale_by_unit() {
+        assert_eq!(human_duration(Duration::from_micros(400)), "0.4 ms");
+        assert_eq!(human_duration(ms(1)), "1 ms");
+        assert_eq!(human_duration(ms(999)), "999 ms");
+        assert_eq!(human_duration(ms(1_000)), "1.00 s");
+        assert_eq!(human_duration(ms(1_234)), "1.23 s");
+    }
+
+    /// A request that came back faster than the timer can resolve is still a
+    /// request that came back, not a `0 ms` that reads as a stopped clock.
+    #[test]
+    fn a_sub_millisecond_run_keeps_a_decimal_place() {
+        assert!(format_run_summary(StatusCode::OK, Duration::from_micros(430), "12 B")
+            .contains("0.4 ms"));
+    }
+
 
     fn map(pairs: &[(&str, &[u8])]) -> HeaderMap {
         let mut headers = HeaderMap::new();

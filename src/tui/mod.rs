@@ -32,7 +32,7 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path, ChainConfig, Keys, RequestConfig, UserConfig, MAX_SPLIT_PCT, MIN_SPLIT_PCT};
 
@@ -84,6 +84,12 @@ enum Mode {
     Response {
         kind: ResponseKind,
         body: String,
+        // The line a run leads with — `200 OK · 143 ms · 4.2 KB` — or empty
+        // when the pane is not showing a run at all (an error, a generated cURL
+        // command, a chain). Kept beside the body rather than glued onto the
+        // front of it so that it stays the *first* block whatever else is
+        // composed in: `H` must not push the line you read first off the top.
+        summary: String,
         // The response's headers, already rendered one `name: value` line per
         // header, and whether the pane is showing them above the body.
         //
@@ -283,7 +289,7 @@ impl Mode {
     /// A response pane showing `body`. Reach it through `App::show_message` /
     /// `show_error` unless there is no `App` yet, as at startup.
     fn message(kind: ResponseKind, body: String) -> Self {
-        Mode::response(kind, String::new(), body, None)
+        Mode::response(kind, String::new(), String::new(), body, None)
     }
 
     /// The full pane: a body, the response's headers (empty when it has none),
@@ -294,6 +300,7 @@ impl Mode {
     /// says what happened, so this is the one constructor and not two.
     fn response(
         kind: ResponseKind,
+        summary: String,
         headers: String,
         body: String,
         image: Option<Box<StatefulProtocol>>,
@@ -301,6 +308,7 @@ impl Mode {
         Mode::Response {
             kind,
             body,
+            summary,
             headers,
             // Off to start: the body is what a run is for, and headers pushing
             // it down the pane on every run would be a cost paid for the rare
@@ -1659,12 +1667,20 @@ impl App {
     }
 
     fn execute_request(&mut self, entry_name: &str, vars: &HashMap<String, String>) {
+        // Timed around `send_request` alone, which returns once the response's
+        // headers are in — the same thing `tester.rs` measures, so a single run
+        // and a load test of the same request report the same number rather
+        // than two that quietly mean different things. Reading the body is not
+        // in it.
+        let started = Instant::now();
         let result = RequestConfig::load(entry_name)
             .and_then(|config| crate::utils::send_request(&config, vars, false));
+        let elapsed = started.elapsed();
 
-        let (status, headers, body, image) = match result {
+        let (status, summary, headers, body, image) = match result {
             Ok(response) => {
-                let status = response.status().as_u16();
+                let code = response.status();
+                let status = code.as_u16();
                 // Read the type before the body: `text()` and `bytes()` both
                 // consume the response, so the branch has to be decided first.
                 // An image read as text is lossy UTF-8 over binary — the
@@ -1681,65 +1697,97 @@ impl App {
                 let headers = crate::utils::format_response_headers(response.headers());
 
                 if crate::media::is_renderable_image(&content_type) {
-                    let (body, image) = self.render_image_body(&content_type, response);
-                    (status, headers, body, image)
+                    let (summary, body, image) =
+                        self.render_image_body(&content_type, code, elapsed, response);
+                    (status, summary, headers, body, image)
                 } else {
                     let text = response.text().unwrap_or_else(|e| e.to_string());
+                    // The size is the body as it came off the wire, not as the
+                    // pane shows it: pretty-printing adds newlines and indent
+                    // the server never sent, and a summary reporting those
+                    // would be describing ichigo rather than the response.
+                    let summary = crate::utils::format_run_summary(
+                        code,
+                        elapsed,
+                        &crate::media::human_size(text.len()),
+                    );
                     // Pretty-print JSON if the body parses as such.
                     let body = serde_json::from_str::<serde_json::Value>(&text)
                         .ok()
                         .and_then(|v| serde_json::to_string_pretty(&v).ok())
                         .unwrap_or(text);
-                    (status, headers, body, None)
+                    (status, summary, headers, body, None)
                 }
             }
-            Err(e) => (0, String::new(), format!("Error: {e}"), None),
+            Err(e) => (0, String::new(), String::new(), format!("Error: {e}"), None),
         };
 
         let kind = if status == 0 { ResponseKind::Error } else { ResponseKind::Http(status) };
-        self.mode = Mode::response(kind, headers, body, image);
+        self.mode = Mode::response(kind, summary, headers, body, image);
     }
 
-    /// Turns an image response into the pane's two halves: the summary line
-    /// that is always shown, and the protocol handle that is shown when the
-    /// terminal can draw one.
+    /// Turns an image response into the pane's three parts: the summary line
+    /// that is always shown, a note explaining anything that went wrong under
+    /// it, and the protocol handle that is shown when the terminal can draw one.
+    ///
+    /// The summary is the run summary with the media detail folded into it, so
+    /// an image response leads with one line — `200 OK · 143 ms · image/png ·
+    /// 100×100 · 7.9 KB` — rather than a run summary stacked on a media summary
+    /// repeating the size.
     ///
     /// Every failure below degrades to summary-plus-note rather than to an
     /// error pane. The request itself succeeded — a `200` that we could not
     /// decode is still a `200`, and showing it as an error would misreport the
-    /// server.
+    /// server. The summary keeps its status and timing through every one of
+    /// them: those are facts about the exchange, and the exchange happened
+    /// whatever we then failed to do with the bytes.
     fn render_image_body(
         &self,
         content_type: &str,
+        status: reqwest::StatusCode,
+        elapsed: Duration,
         response: reqwest::blocking::Response,
-    ) -> (String, Option<Box<StatefulProtocol>>) {
+    ) -> (String, String, Option<Box<StatefulProtocol>>) {
+        let summarize = |detail: &str| crate::utils::format_run_summary(status, elapsed, detail);
+
         let bytes = match response.bytes() {
             Ok(bytes) => bytes,
-            Err(e) => return (format!("{content_type}\n\nCould not read body: {e}"), None),
+            // No body means no size to report, so the content type is the whole
+            // of the detail.
+            Err(e) => {
+                return (
+                    summarize(content_type),
+                    format!("Could not read body: {e}"),
+                    None,
+                );
+            }
         };
 
         let decoded = match crate::media::decode(&bytes) {
             Ok(image) => image,
             Err(e) => {
-                let summary = crate::media::summarize(content_type, bytes.len(), None);
-                return (format!("{summary}\n\nCould not decode: {e:#}"), None);
+                let summary =
+                    summarize(&crate::media::summarize(content_type, bytes.len(), None));
+                return (summary, format!("Could not decode: {e:#}"), None);
             }
         };
 
         let dims = (decoded.width(), decoded.height());
-        let summary = crate::media::summarize(content_type, bytes.len(), Some(dims));
+        let summary =
+            summarize(&crate::media::summarize(content_type, bytes.len(), Some(dims)));
 
         match &self.picker {
             Some(picker) => {
                 let decoded =
                     if self.tmux { fit_for_tmux(decoded, picker.font_size()) } else { decoded };
-                (summary, Some(Box::new(picker.new_resize_protocol(decoded))))
+                (summary, String::new(), Some(Box::new(picker.new_resize_protocol(decoded))))
             }
             // No graphics protocol: the summary is the whole of the pane, and
             // it says so rather than leaving a blank space where an image was
             // expected.
             None => (
-                format!("{summary}\n\nThis terminal has no image protocol ichigo can use."),
+                summary,
+                "This terminal has no image protocol ichigo can use.".to_string(),
                 None,
             ),
         }
@@ -2367,31 +2415,36 @@ fn profile_field<'a>(
     }
 }
 
-/// The text the response pane is showing: the headers above the body when they
-/// are toggled on, the body alone otherwise.
+/// The text the response pane is showing: its non-empty blocks in a fixed
+/// order — the run summary, then the headers when they are toggled on, then the
+/// body — with one blank line between each.
 ///
 /// Everything that reads the pane's contents — the renderer, `G`, the cursor,
 /// both copy paths — goes through this rather than through `body` directly,
-/// for the reason `visible_response_lines` exists: three sites that each decide
-/// separately what the pane contains are three sites that drift, and the first
+/// for the reason `visible_response_lines` exists: four sites that each decide
+/// separately what the pane contains are four sites that drift, and the first
 /// symptom is `y` copying a line the pane never showed.
 ///
-/// Borrowed whenever there is nothing to prepend, so the common case — a body
-/// with the headers hidden — allocates nothing per frame.
+/// The order is the point of composing here rather than gluing the blocks
+/// together as they are built: the summary is the line you read first, so `H`
+/// slides the headers in *under* it rather than pushing it off the top. Empty
+/// blocks drop out, which is what lets one rule cover an error pane (summary
+/// and headers both empty), a chain, and an image whose body is a note.
 pub(super) fn response_text<'a>(
+    summary: &'a str,
     headers: &'a str,
     show_headers: bool,
     body: &'a str,
 ) -> Cow<'a, str> {
-    if !show_headers || headers.is_empty() {
-        return Cow::Borrowed(body);
+    let blocks: Vec<&str> = [summary, if show_headers { headers } else { "" }, body]
+        .into_iter()
+        .filter(|block| !block.is_empty())
+        .collect();
+    match blocks.as_slice() {
+        [] => Cow::Borrowed(""),
+        [only] => Cow::Borrowed(only),
+        many => Cow::Owned(many.join("\n\n")),
     }
-    if body.is_empty() {
-        return Cow::Borrowed(headers);
-    }
-    // One blank line between, so the headers read as their own block rather
-    // than as the body's first lines.
-    Cow::Owned(format!("{headers}\n\n{body}"))
 }
 
 /// The response lines the filter leaves visible.
@@ -3281,9 +3334,11 @@ mod tests {
 
     const HEADERS: &str = "content-type: application/json\netag: \"abc\"";
 
+    const SUMMARY: &str = "200 OK · 143 ms · 4.2 KB";
+
     #[test]
     fn hidden_headers_leave_the_body_untouched_and_unallocated() {
-        let text = response_text(HEADERS, false, BODY);
+        let text = response_text("", HEADERS, false, BODY);
         assert_eq!(text, BODY);
         assert!(matches!(text, Cow::Borrowed(_)));
     }
@@ -3291,7 +3346,7 @@ mod tests {
     #[test]
     fn shown_headers_sit_above_the_body_with_a_blank_line_between() {
         assert_eq!(
-            response_text(HEADERS, true, "alpha"),
+            response_text("", HEADERS, true, "alpha"),
             "content-type: application/json\netag: \"abc\"\n\nalpha"
         );
     }
@@ -3301,24 +3356,64 @@ mod tests {
     /// as two blank lines the filter and the cursor could still land on.
     #[test]
     fn a_response_with_no_headers_shows_the_body_either_way() {
-        assert_eq!(response_text("", true, BODY), BODY);
+        assert_eq!(response_text("", "", true, BODY), BODY);
     }
 
     #[test]
     fn an_empty_body_is_the_headers_alone_rather_than_headers_and_blank_lines() {
-        assert_eq!(response_text(HEADERS, true, ""), HEADERS);
+        assert_eq!(response_text("", HEADERS, true, ""), HEADERS);
     }
 
     /// The point of rendering headers as ordinary lines: everything downstream
     /// keeps working on them with no header-shaped exception.
     #[test]
     fn shown_headers_are_filterable_and_copyable_like_body_lines() {
-        let text = response_text(HEADERS, true, BODY);
+        let text = response_text("", HEADERS, true, BODY);
         assert_eq!(
             visible_response_lines(&text, "etag"),
             vec!["etag: \"abc\""]
         );
         assert_eq!(visible_response_lines(&text, "").len(), 8);
+    }
+
+    #[test]
+    fn the_summary_is_the_panes_first_line() {
+        let text = response_text(SUMMARY, HEADERS, false, BODY);
+        assert_eq!(text.lines().next(), Some(SUMMARY));
+        assert_eq!(text, format!("{SUMMARY}\n\n{BODY}"));
+    }
+
+    /// `H` slides the headers in *under* the summary. Composing the blocks here
+    /// rather than gluing the summary onto the body when it is built is what
+    /// makes that true — otherwise the headers would land on top of the line
+    /// the run is meant to lead with.
+    #[test]
+    fn toggling_headers_does_not_push_the_summary_off_the_top() {
+        let text = response_text(SUMMARY, HEADERS, true, BODY);
+        assert_eq!(text.lines().next(), Some(SUMMARY));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[2], "content-type: application/json");
+        assert_eq!(lines[5], "alpha");
+    }
+
+    /// An image that could not be drawn is a summary and a note, with no body
+    /// between them — the same one rule, with the empty block dropping out.
+    #[test]
+    fn empty_blocks_drop_out_rather_than_leaving_blank_lines() {
+        assert_eq!(
+            response_text(SUMMARY, "", false, "This terminal has no image protocol ichigo can use."),
+            format!("{SUMMARY}\n\nThis terminal has no image protocol ichigo can use.")
+        );
+        assert_eq!(response_text("", "", false, ""), "");
+    }
+
+    /// A run summary alone is still borrowed — an image response the terminal
+    /// drew has nothing else in the pane.
+    #[test]
+    fn a_lone_block_is_borrowed() {
+        let text = response_text(SUMMARY, "", false, "");
+        assert_eq!(text, SUMMARY);
+        assert!(matches!(text, Cow::Borrowed(_)));
     }
 
     #[test]

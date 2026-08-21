@@ -65,7 +65,11 @@ pub fn summarize(content_type: &str, bytes: usize, dims: Option<(u32, u32)>) -> 
     out
 }
 
-fn human_size(bytes: usize) -> String {
+/// `pub(crate)` so `utils::format_run_summary` renders "4.2 KB" the same way
+/// this line does. The two summaries sit in the same slot — an image response's
+/// is this one with a run summary on the front — and a byte count that read
+/// differently between them would be the first thing anyone noticed.
+pub(crate) fn human_size(bytes: usize) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * KB;
     let n = bytes as f64;

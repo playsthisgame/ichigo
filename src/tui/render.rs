@@ -425,9 +425,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestInput { vars, focused, iterations, edit, entry_name } => {
             draw_test_input(frame, panes[1], vars, iterations, *focused, edit, entry_name);
         }
-        Mode::Response { kind, body, headers, show_headers, scroll, response_filter, response_filter_active, cursor, anchor, status, .. } => {
+        Mode::Response { kind, body, summary, headers, show_headers, scroll, response_filter, response_filter_active, cursor, anchor, status, .. } => {
             let (height, area) = draw_response(
-                frame, panes[1], kind, body, headers, *show_headers, *scroll, response_filter,
+                frame, panes[1], kind, body, summary, headers, *show_headers, *scroll, response_filter,
                 *response_filter_active, *cursor, *anchor, status.as_deref(), has_image,
             );
             response_view_height = Some(height);
@@ -1407,6 +1407,7 @@ fn draw_response(
     area: Rect,
     kind: &ResponseKind,
     body: &str,
+    summary: &str,
     headers: &str,
     show_headers: bool,
     scroll: u16,
@@ -1501,7 +1502,7 @@ fn draw_response(
     }
 
     let (from, to) = super::selection_range(cursor, anchor);
-    let text = super::response_text(headers, show_headers, body);
+    let text = super::response_text(summary, headers, show_headers, body);
     let lines: Vec<Line<'static>> = super::visible_response_lines(&text, response_filter)
         .into_iter()
         .map(colorize_json_line)

@@ -44,7 +44,7 @@ The same module's **user config** section is a different thing from a request co
 
 **`src/media.rs`** — Decides whether a response body is an image, and decodes it if so. Pure functions over a header string and a byte slice, no IO, unit tested — the same shape as `curl.rs`. Named `media` and not `image` because a top-level `mod image` is ambiguous with the `image` crate at every `use image::…` in the tree. `is_renderable_image` excludes **`image/svg+xml`**: it is markup the decoder cannot read, and its source is more useful in the text pane than a failed decode. `decode` guesses the format from the bytes rather than trusting the header — the header is what a server claims, the magic is what it sent — and runs under an encoded-size cap plus `image::Limits`, since a small file claiming enormous dimensions allocates before a pixel is read.
 
-**`src/runner.rs`** — Executes a single `RequestConfig` (or one step of a chain). Handles profile variable injection, prints the response (status + body), and extracts values from the JSON response using dot-notation paths (e.g. `$.token` → `token`). Returns extracted variables so the caller can pass them to the next chain step.
+**`src/runner.rs`** — Executes a single `RequestConfig` (or one step of a chain). Handles profile variable injection, prints the response (a `utils::format_run_summary` line + body), and extracts values from the JSON response using dot-notation paths (e.g. `$.token` → `token`). Returns extracted variables so the caller can pass them to the next chain step. The summary prints *after* the body is read, since the size is part of the line and there is no size until then — nothing prints in between, so it still leads the output — and **only under `--verbose`**: a bare `run` prints the body and nothing else, which is what keeps `ichigo run thing | jq` working.
 
 **`src/tester.rs`** — Runs a request N times sequentially (blocking), collects per-iteration timings and status code counts, then renders an ASCII bar chart (status distribution) and ASCII line graph (latency over time).
 
@@ -122,8 +122,8 @@ The Browse **detail** pane is deliberately not part of this: it has no caret and
 
 **Response headers.** `Mode::Response` carries the headers as *text* — one
 `name: value` line each, rendered by `utils::format_response_headers` — beside a
-`show_headers` flag, and `response_text` glues them onto the front of the body
-when it is set. Text and not a `Vec<(String, String)>` because the pane's unit is
+`show_headers` flag, and `response_text` composes them in above the body when it
+is set. Text and not a `Vec<(String, String)>` because the pane's unit is
 a line: past that one function nothing downstream knows a header from a body
 line, so the filter, the cursor, `V`/`y`, `visible_response_lines` and the
 image's row offset all keep working with no header-shaped exception — which is
@@ -131,8 +131,7 @@ the whole reason the feature is a text prepend rather than a second widget.
 `response_text` is the single definition of what the pane contains, for the
 reason `visible_response_lines` is the single definition of which of those lines
 show: the four sites that read the pane had already drifted once over exactly
-that. It borrows when there is nothing to prepend, so the common case allocates
-nothing per frame.
+that.
 
 They are captured in `execute_request` **before the body is consumed**, and
 unconditionally — `text()` and `bytes()` take the response by value, so there is
@@ -157,7 +156,40 @@ any. Not in the hint line: that line is already 78 of the 80 columns the rule
 gives it, and `?` is Browse-only. The badge doubles as the state indicator, which
 a hint could not do.
 
-**Image responses.** An `image/*` body is read with `bytes()` and drawn in the response pane through `ratatui-image`; everything else still goes through `text()`. The branch has to be taken *before* the body is consumed, since `text()` and `bytes()` each take the response by value — reading an image as text is the lossy-UTF-8-over-binary mojibake this exists to stop. `Mode::Response` carries the decoded image beside `body`, so it dies with the pane the way every other mode's state does; that is also what makes `Mode` un-`Clone`able, since `StatefulProtocol` is not. `body` is **always** the summary line (`image/png · 100×100 · 7.9 KB`) whether or not the image renders, which is what lets the filter, `V`/`y`, and `visible_response_lines` keep working on real text with no image-shaped exception. Every failure below the request — unreadable body, failed decode, no protocol — degrades to summary-plus-note rather than to an error pane: a `200` we could not decode is still a `200`, and showing it as an error would misreport the server.
+**The run summary.** `utils::format_run_summary` is the line a run leads with —
+`200 OK · 143 ms · 4.2 KB` — and it is one function because an image response is
+the same line with `media::summarize`'s `image/png · 100×100 · 7.9 KB` as its
+detail rather than a byte count. One line and not two: a run summary stacked on
+a media summary would print the size twice. `media::human_size` is `pub(crate)`
+for that reason, so the two summaries cannot disagree about what "4.2 KB" means,
+and `human_duration` beside it keeps a decimal below a millisecond — a localhost
+request really does come back in under one, and `0 ms` reads as a stopped clock
+rather than a fast server.
+
+The timing is taken around **`send_request` alone**, which returns once the
+response's headers are in. That is deliberately the same span `tester.rs`
+measures, so a single run and a load test of the same request quote the same
+number instead of two that quietly mean different things; reading the body is
+outside it. The size is the body **as it came off the wire** — `text().len()`
+before the JSON pretty-printer runs — since counting the newlines and indent
+ichigo added would be reporting on ichigo rather than on the response.
+
+It lives in its own `summary` field on `Mode::Response` rather than glued onto
+the front of `body`, and that is the whole reason `response_text` composes
+blocks instead of prepending: the summary has to stay the *first* block whatever
+else is switched on, or `H` would push the line the run is meant to lead with
+off the top. `response_text` is therefore "the pane's non-empty blocks, summary
+then headers then body, one blank line between" — one rule that also covers an
+error pane (summary and headers both empty), a chain, and an image whose body is
+the note explaining why it could not be drawn. Empty blocks drop out, so nothing
+contributes blank lines the filter and the cursor could land on. Both the CLI
+and the TUI go through `format_run_summary`, so the two cannot drift.
+
+Chains are deliberately untouched: one combined block over several responses has
+no single status, time, or size to lead with, and per-step timing is a different
+feature from this one.
+
+**Image responses.** An `image/*` body is read with `bytes()` and drawn in the response pane through `ratatui-image`; everything else still goes through `text()`. The branch has to be taken *before* the body is consumed, since `text()` and `bytes()` each take the response by value — reading an image as text is the lossy-UTF-8-over-binary mojibake this exists to stop. `Mode::Response` carries the decoded image beside `body`, so it dies with the pane the way every other mode's state does; that is also what makes `Mode` un-`Clone`able, since `StatefulProtocol` is not. The `summary` is **always** the run summary with the media detail folded in (`200 OK · 143 ms · image/png · 100×100 · 7.9 KB`) whether or not the image renders, which is what lets the filter, `V`/`y`, and `visible_response_lines` keep working on real text with no image-shaped exception. `render_image_body` returns it beside a `body` that is only ever the *note* explaining a failure — unreadable body, failed decode, no protocol — and empty when there is none, so a drawn image's pane is the one summary line and the picture below it. Every failure below the request — unreadable body, failed decode, no protocol — degrades to summary-plus-note rather than to an error pane: a `200` we could not decode is still a `200`, and showing it as an error would misreport the server.
 
 Chain steps get the summary line and no image. The chain pane is one combined text block, and the step's `text` is left **empty** so a step that also declares `extract` fails with the honest "response is not JSON" rather than on mojibake.
 
