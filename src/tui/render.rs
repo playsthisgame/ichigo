@@ -425,9 +425,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::TestInput { vars, focused, iterations, edit, entry_name } => {
             draw_test_input(frame, panes[1], vars, iterations, *focused, edit, entry_name);
         }
-        Mode::Response { kind, body, scroll, response_filter, response_filter_active, cursor, anchor, status, .. } => {
+        Mode::Response { kind, body, headers, show_headers, scroll, response_filter, response_filter_active, cursor, anchor, status, .. } => {
             let (height, area) = draw_response(
-                frame, panes[1], kind, body, *scroll, response_filter,
+                frame, panes[1], kind, body, headers, *show_headers, *scroll, response_filter,
                 *response_filter_active, *cursor, *anchor, status.as_deref(), has_image,
             );
             response_view_height = Some(height);
@@ -1407,6 +1407,8 @@ fn draw_response(
     area: Rect,
     kind: &ResponseKind,
     body: &str,
+    headers: &str,
+    show_headers: bool,
     scroll: u16,
     response_filter: &str,
     response_filter_active: bool,
@@ -1447,6 +1449,21 @@ fn draw_response(
             Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD),
         ));
     }
+    // The `H` toggle lives in the title rather than the hint line, which is
+    // already 78 of its 80 columns. It doubles as the indicator of which way
+    // the toggle currently sits — lit when the headers are in the pane, dim
+    // when they are behind it — and is drawn only when there are headers, so
+    // it never advertises a key that would do nothing.
+    if !headers.is_empty() {
+        title_spans.push(Span::styled(
+            " H headers ",
+            if show_headers {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+    }
     if let Some(status) = status {
         title_spans.push(Span::styled(
             format!(" {status} "),
@@ -1484,7 +1501,8 @@ fn draw_response(
     }
 
     let (from, to) = super::selection_range(cursor, anchor);
-    let lines: Vec<Line<'static>> = super::visible_response_lines(body, response_filter)
+    let text = super::response_text(headers, show_headers, body);
+    let lines: Vec<Line<'static>> = super::visible_response_lines(&text, response_filter)
         .into_iter()
         .map(colorize_json_line)
         .enumerate()

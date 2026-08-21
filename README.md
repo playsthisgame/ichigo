@@ -320,6 +320,7 @@ without fighting your terminal's text selection:
 | Esc | Cancel the selection (again to leave the pane) |
 | `f` | Filter to matching lines |
 | `c` | Copy everything the pane is showing |
+| `H` | Show / hide the response headers |
 
 Copying this way beats dragging with the mouse: a terminal's selection is
 linear, so a drag that spans more than one row also takes the request list and
@@ -348,6 +349,36 @@ reports which flag and keeps your text so you can edit it. The
 which flags are mapped, ignored, and refused.
 
 If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
+
+#### Response headers
+
+A response's headers are hidden to start — the body is what a run is for — and
+`H` folds them into the top of the pane:
+
+```
+content-type: application/json
+etag: "v1-abc"
+set-cookie: session=...
+x-ratelimit-remaining: 41
+
+{
+  "id": 42
+}
+```
+
+The ` H headers ` marker in the pane's title says which way the toggle sits. It
+appears only when there are headers to show, so `H` does nothing on an error, on
+a generated cURL command, or on a chain — whose combined block has no single set
+of headers to attach.
+
+They are **ordinary lines**, so everything in [Copying part of a
+response](#copying-part-of-a-response) works on them unchanged: `f` filters
+across the headers and the body together, the cursor walks into them, and `V`/`y`
+copies them like any other line — filter to `ratelimit`, press `y`, and you have
+the header on its own. Names are lower-cased and sorted, and a header sent more
+than once (`Set-Cookie`) gets one line per value, in the order it arrived.
+Toggling resets the cursor and any selection, for the same reason changing the
+filter does: the lines underneath them have moved.
 
 #### Image responses
 
