@@ -8,7 +8,7 @@ use ratatui::{
 };
 use ratatui_image::StatefulImage;
 use super::edit::Edit;
-use super::{App, Mode, PairKind, ResponseKind};
+use super::{App, DiscardChoice, Mode, PairKind, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
 
 /// One text field's value with the caret drawn where it sits.
@@ -405,6 +405,10 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     // methods in the same scope, so the whole match cannot become mutable.
     let mut image_area = None;
     let has_image = matches!(&app.mode, Mode::Response { image: Some(_), .. });
+    // Asked once, before the match borrows the mode: every form pane's title
+    // carries the same marker, and each of them applies its own pending edits
+    // to a copy of the draft to answer — see `Mode::unsaved`.
+    let unsaved = app.mode.unsaved();
     match &app.mode {
         Mode::Browse => {
             // Accessing app.list_state and app.entries here is fine: they are
@@ -433,22 +437,22 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             draw_test_results(frame, panes[1], results);
         }
         Mode::NewRequest { draft, error } => {
-            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.body(), draft.original_name.is_some(), draft.global, draft.is_dirty(), error.as_deref());
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.body(), draft.original_name.is_some(), draft.global, unsaved, error.as_deref());
         }
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
         }
         Mode::EditPairs { kind, pairs, focused, edit, error, .. } => {
-            draw_edit_pairs(frame, panes[1], *kind, pairs, *focused, edit, error.as_deref());
+            draw_edit_pairs(frame, panes[1], *kind, pairs, *focused, edit, unsaved, error.as_deref());
         }
         Mode::EditBody { content_type, data, focused, edit, error, .. } => {
-            draw_edit_body(frame, panes[1], content_type, data, *focused, edit, error.as_deref());
+            draw_edit_body(frame, panes[1], content_type, data, *focused, edit, unsaved, error.as_deref());
         }
         Mode::ProfileList { draft, selected } => {
-            draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1);
+            draw_profile_list(frame, panes[1], &draft.profiles, *selected, &draft.fields[0].1, unsaved);
         }
         Mode::NewProfile { name, params, focused, edit, error, editing, .. } => {
-            draw_new_profile(frame, panes[1], name, params, *focused, edit, error.as_deref(), editing.is_some());
+            draw_new_profile(frame, panes[1], name, params, *focused, edit, unsaved, error.as_deref(), editing.is_some());
         }
         Mode::ConfirmDelete { entry_name, ..} => {
             draw_confirm_delete(frame, panes[1], entry_name);
@@ -471,8 +475,8 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_help {
         draw_help_overlay(frame, full);
     }
-    if app.confirm_discard {
-        draw_confirm_discard(frame, full);
+    if let Some(choice) = app.confirm_discard {
+        draw_confirm_discard(frame, full, choice);
     }
 }
 
@@ -613,6 +617,29 @@ fn draw_profile_select(
     );
     frame.render_widget(paragraph, area);
 }
+
+/// A pane title, with the unsaved marker on it when the request behind the pane
+/// has changes no save has written.
+///
+/// One helper for all five form panes: the marker means the same thing in each,
+/// and one that read differently from one pane to the next would be a different
+/// marker. It rides in the title rather than in the body of a pane because the
+/// panes scroll and the title does not — and because the sub-panes are where
+/// the changes get made, so the frame around them is what has to say they are
+/// not written yet.
+fn pane_title(title: &str, unsaved: bool) -> Line<'static> {
+    let mut spans = vec![Span::raw(title.to_string())];
+    if unsaved {
+        spans.push(Span::styled(
+            UNSAVED_MARKER,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The marker itself, once, so the five panes and the prompt agree on it.
+const UNSAVED_MARKER: &str = "● unsaved ";
 
 #[allow(clippy::too_many_arguments)]
 fn draw_new_request(
@@ -793,21 +820,11 @@ fn draw_new_request(
         )));
     }
 
-    // The unsaved marker rides in the title rather than in the body of the
-    // form: the sub-panes are where the changes get made, so the thing that has
-    // to say "not written yet" is the frame someone comes back to, and it has
-    // to stay put whatever row the form has scrolled to.
-    let mut title = vec![Span::raw(if is_edit { " Edit Request " } else { " New Request " })];
-    if dirty {
-        title.push(Span::styled(
-            "● unsaved ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        ));
-    }
+    let title = pane_title(if is_edit { " Edit Request " } else { " New Request " }, dirty);
     let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
     let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
-            .title(Line::from(title))
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
@@ -848,6 +865,7 @@ const BODY_PREVIEW_LINES: usize = 6;
 /// one is a single `  > value` row. Hence `Wrap`: a long single-line JSON body
 /// is the common case, and clipping it at the pane edge would hide the caret
 /// along with the text.
+#[allow(clippy::too_many_arguments)]
 fn draw_edit_body(
     frame: &mut Frame,
     area: Rect,
@@ -855,6 +873,7 @@ fn draw_edit_body(
     data: &str,
     focused: usize,
     edit: &Edit,
+    unsaved: bool,
     error: Option<&str>,
 ) {
     let indent = "  ";
@@ -904,7 +923,7 @@ fn draw_edit_body(
     let offset = vscroll(total, rows, usize::from(interior_height(area)));
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((offset, 0)).block(
         Block::default()
-            .title(" Body ")
+            .title(pane_title(" Body ", unsaved))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
@@ -976,6 +995,7 @@ fn draw_new_profile(
     params: &[(String, String)],
     focused: usize,
     edit: &Edit,
+    unsaved: bool,
     error: Option<&str>,
     is_edit: bool,
 ) {
@@ -1035,7 +1055,10 @@ fn draw_new_profile(
     let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
     let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
-            .title(if is_edit { " Edit Profile " } else { " New Profile " })
+            .title(pane_title(
+                if is_edit { " Edit Profile " } else { " New Profile " },
+                unsaved,
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
     );
@@ -1047,6 +1070,7 @@ fn draw_new_profile(
 ///
 /// One renderer for both maps: `kind` supplies the title and the noun, and
 /// nothing else about the pane differs.
+#[allow(clippy::too_many_arguments)]
 fn draw_edit_pairs(
     frame: &mut Frame,
     area: Rect,
@@ -1054,6 +1078,7 @@ fn draw_edit_pairs(
     pairs: &[(String, String)],
     focused: usize,
     edit: &Edit,
+    unsaved: bool,
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
@@ -1104,7 +1129,7 @@ fn draw_edit_pairs(
     let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
     let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
-            .title(kind.title())
+            .title(pane_title(kind.title(), unsaved))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
@@ -1119,6 +1144,7 @@ fn draw_profile_list(
     profiles: &[crate::config::Profile],
     selected: usize,
     request_name: &str,
+    unsaved: bool,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
     let mut rows = FocusRows::default();
@@ -1187,7 +1213,7 @@ fn draw_profile_list(
     let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
     let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
-            .title(format!(" Profiles — {} ", request_name))
+            .title(pane_title(&format!(" Profiles — {} ", request_name), unsaved))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Magenta)),
     );
@@ -1781,37 +1807,56 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
 /// The prompt that stands between Esc and a request form with unsaved changes.
 ///
 /// Drawn as the keymap overlay is — centered, cleared, bordered — because it
-/// interrupts a pane the same way and answers back to it, and because a prompt
-/// that looked like a different kind of thing would read as a different kind of
-/// thing. The border is yellow rather than blue: this one is about to throw
-/// something away, and it matches the `unsaved` marker it is explaining.
-fn draw_confirm_discard(frame: &mut Frame, area: Rect) {
-    let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
-
-    let lines: Vec<Line<'static>> = vec![
+/// interrupts a pane the same way and answers back to it, and a prompt that
+/// looked like a different kind of thing would read as one. The border is
+/// yellow rather than blue: this one is about to throw something away, and it
+/// matches the marker it is explaining.
+///
+/// The answers are a *list* rather than three letters to memorize: `j`/`k` and
+/// the arrows walk it and Enter picks, which is what every other list in the
+/// TUI already does, and it puts the consequence of each answer on the screen
+/// next to the answer itself.
+fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) {
+    let mut lines: Vec<Line<'static>> = vec![
         Line::raw(""),
         Line::from(Span::styled(
             "  This request has unsaved changes.",
             Style::default().fg(Color::White),
         )),
         Line::raw(""),
-        Line::from(vec![
-            Span::raw("  "),
-            key("s"),
-            Span::styled("  save and close", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            key("y"),
-            Span::styled("  discard them", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            key("n"),
-            Span::styled("  keep editing", Style::default().fg(Color::DarkGray)),
-        ]),
-        Line::raw(""),
     ];
+
+    for choice in DiscardChoice::ALL {
+        let is_selected = choice == selected;
+        // The same marker-and-highlight the profile picker uses, so a list
+        // looks like a list wherever one turns up.
+        let marker = if is_selected { "  ▶ " } else { "    " };
+        let label_style = if is_selected {
+            Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(
+                format!("{:<width$}", choice.label(), width = DISCARD_LABEL_WIDTH),
+                label_style,
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            format!("      {}", choice.hint()),
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("  move    ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("  choose", Style::default().fg(Color::DarkGray)),
+    ]));
 
     let height = lines.len() as u16 + 2; // + borders
     let popup = centered_rect(DISCARD_WIDTH, height, area);
@@ -1828,8 +1873,11 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect) {
     frame.render_widget(widget, popup);
 }
 
-/// Wide enough for the longest line the prompt draws, plus its borders.
-const DISCARD_WIDTH: u16 = 40;
+/// Wide enough for the longest hint the prompt draws, plus its borders.
+const DISCARD_WIDTH: u16 = 46;
+/// Pads the highlight to a constant width, so the selected row is a bar rather
+/// than a ragged patch the length of whichever answer it happens to be on.
+const DISCARD_LABEL_WIDTH: usize = 18;
 
 /// Centers a `width` × `height` box in `area`, shrinking to fit rather than
 /// overflowing when the terminal is smaller than the box.
@@ -2663,15 +2711,56 @@ mod tests {
         assert!(!titled_form(false).contains("unsaved"), "{}", titled_form(false));
     }
 
-    /// The prompt names all three answers: a confirmation whose keys are not on
-    /// it is one people guess at.
+    /// Every form pane carries the same marker, not just the request form: the
+    /// sub-panes are where the changes get made, and coming back through four
+    /// of them without one is how the edits got lost in the first place.
+    #[test]
+    fn every_form_pane_can_show_the_marker() {
+        let edit = Edit::default();
+        let pairs = [("Accept".to_string(), "application/json".to_string())];
+        let panes: Vec<(&str, String)> = vec![
+            ("headers", rendered(60, 12, |f: &mut Frame, a: Rect| {
+                draw_edit_pairs(f, a, PairKind::Headers, &pairs, 0, &edit, true, None)
+            })),
+            ("body", rendered(60, 12, |f: &mut Frame, a: Rect| {
+                draw_edit_body(f, a, "application/json", "{}", 0, &edit, true, None)
+            })),
+            ("profile list", rendered(60, 12, |f: &mut Frame, a: Rect| {
+                draw_profile_list(f, a, &[], 0, "api", true)
+            })),
+            ("profile", rendered(60, 12, |f: &mut Frame, a: Rect| {
+                draw_new_profile(f, a, "dev", &[], 0, &edit, true, None, false)
+            })),
+        ];
+        for (name, pane) in panes {
+            assert!(pane.contains("unsaved"), "{name}: {pane}");
+        }
+    }
+
+    /// And says nothing in any of them when there is nothing to say.
+    #[test]
+    fn a_clean_sub_pane_has_no_marker() {
+        let edit = Edit::default();
+        let pane = rendered(60, 12, |f: &mut Frame, a: Rect| {
+            draw_edit_pairs(f, a, PairKind::Headers, &[], 0, &edit, false, None)
+        });
+        assert!(!pane.contains("unsaved"), "{pane}");
+    }
+
+    /// The prompt names all three answers and the keys that walk them: a list
+    /// whose bindings are not on it is one people guess at.
     #[test]
     fn the_discard_prompt_offers_save_discard_and_cancel() {
-        let pane = rendered(60, 20, draw_confirm_discard);
+        let pane = rendered(60, 24, |frame: &mut Frame, area: Rect| {
+            draw_confirm_discard(frame, area, DiscardChoice::Save)
+        });
         assert!(pane.contains("unsaved changes"), "{pane}");
-        assert!(pane.contains("save and close"), "{pane}");
-        assert!(pane.contains("discard them"), "{pane}");
-        assert!(pane.contains("keep editing"), "{pane}");
+        for choice in DiscardChoice::ALL {
+            assert!(pane.contains(choice.label()), "{pane}");
+        }
+        // The keys that walk it, so nobody has to guess at j/k.
+        assert!(pane.contains("j/k"), "{pane}");
+        assert!(pane.contains("Enter"), "{pane}");
     }
 
     /// What the issue was: the request form is taller than the pane, so the
@@ -2703,7 +2792,7 @@ mod tests {
         let data = "x".repeat(600);
         let edit = Edit::landing(&data, false);
         let pane = drawn(30, 10, |frame: &mut Frame, area: Rect| {
-            draw_edit_body(frame, area, "application/json", &data, 1, &edit, None);
+            draw_edit_body(frame, area, "application/json", &data, 1, &edit, false, None);
         });
         // In normal mode the caret is the character it rests on, drawn in
         // reverse — nothing else in this pane has a white background.
@@ -2720,7 +2809,7 @@ mod tests {
         let data = "x".repeat(600);
         let edit = Edit::landing("", false);
         let pane = drawn(30, 10, |frame: &mut Frame, area: Rect| {
-            draw_edit_body(frame, area, "application/json", &data, 1, &edit, None);
+            draw_edit_body(frame, area, "application/json", &data, 1, &edit, false, None);
         });
         assert!(
             pane.content.iter().any(|cell| cell.bg == Color::White),
