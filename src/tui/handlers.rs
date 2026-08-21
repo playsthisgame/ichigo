@@ -929,8 +929,11 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
             }
         }
         KeyCode::Char('G') => {
-            if let Mode::Response { scroll, cursor, body, response_filter, .. } = &mut app.mode {
-                let count = super::visible_response_lines(body, response_filter).len();
+            if let Mode::Response { scroll, cursor, body, headers, show_headers, response_filter, .. } =
+                &mut app.mode
+            {
+                let text = super::response_text(headers, *show_headers, body);
+                let count = super::visible_response_lines(&text, response_filter).len();
                 *cursor = count.saturating_sub(1);
                 let last = count.min(u16::MAX as usize) as u16;
                 *scroll = last.saturating_sub(view_height);
@@ -947,8 +950,9 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
         }
         KeyCode::Char('y') => {
             let picked = match &app.mode {
-                Mode::Response { body, response_filter, cursor, anchor, .. } => {
-                    let lines = super::visible_response_lines(body, response_filter);
+                Mode::Response { body, headers, show_headers, response_filter, cursor, anchor, .. } => {
+                    let text = super::response_text(headers, *show_headers, body);
+                    let lines = super::visible_response_lines(&text, response_filter);
                     let (from, to) = super::selection_range(*cursor, *anchor);
                     lines
                         .get(from..=to.min(lines.len().saturating_sub(1)))
@@ -975,8 +979,9 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
         // can see rather than the whole body behind them.
         KeyCode::Char('c') => {
             let text = match &app.mode {
-                Mode::Response { body, response_filter, .. } => {
-                    super::visible_response_lines(body, response_filter).join("\n")
+                Mode::Response { body, headers, show_headers, response_filter, .. } => {
+                    let text = super::response_text(headers, *show_headers, body);
+                    super::visible_response_lines(&text, response_filter).join("\n")
                 }
                 Mode::TestResponse { results } => format_test_results_text(results),
                 _ => return false,
@@ -994,6 +999,24 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
                 Err(e) => app.show_message(ResponseKind::Error, format!("Copy failed: {e}")),
             }
         }
+        // Toggles the response's headers in above the body. Inert when there
+        // are none — an error pane, a generated cURL command, a chain — rather
+        // than toggling an empty block nobody can see.
+        KeyCode::Char('H') => {
+            if let Mode::Response { headers, show_headers, scroll, cursor, anchor, .. } =
+                &mut app.mode
+                && !headers.is_empty()
+            {
+                *show_headers = !*show_headers;
+                // The line list just changed under them, so they are reset for
+                // the same reason an edit to the filter resets them: carrying
+                // them over leaves the cursor on an unrelated line and a
+                // selection spanning lines the user never saw.
+                *scroll = 0;
+                *cursor = 0;
+                *anchor = None;
+            }
+        }
         KeyCode::Char('f') => {
             if let Mode::Response { response_filter_active, .. } = &mut app.mode {
                 *response_filter_active = true;
@@ -1008,10 +1031,13 @@ pub(super) fn handle_key_response(app: &mut App, code: KeyCode) -> bool {
 /// on screen. The pane scrolls to follow the cursor rather than the other way
 /// round, so a selection cannot be extended past the edge of the view.
 fn move_cursor(app: &mut App, delta: isize, view_height: u16) {
-    let Mode::Response { body, response_filter, cursor, scroll, .. } = &mut app.mode else {
+    let Mode::Response { body, headers, show_headers, response_filter, cursor, scroll, .. } =
+        &mut app.mode
+    else {
         return;
     };
-    let count = super::visible_response_lines(body, response_filter).len();
+    let text = super::response_text(headers, *show_headers, body);
+    let count = super::visible_response_lines(&text, response_filter).len();
     if count == 0 {
         return;
     }

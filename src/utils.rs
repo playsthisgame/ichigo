@@ -98,3 +98,79 @@ pub(crate) fn interpolate(s: &str, vars: &HashMap<String, String>) -> String {
     result.push_str(rest);
     result
 }
+/// Renders a response's headers as one `name: value` line each.
+///
+/// Sorted by name, because `HeaderMap`'s iteration order is unspecified — a
+/// pane that reordered itself between two runs of the same request would read
+/// as a bug in the server. The sort is stable, so a header sent more than once
+/// (`Set-Cookie`) keeps its values in the order they arrived. A value that is
+/// not UTF-8 is shown lossily rather than dropped: a mangled `Set-Cookie` is
+/// still evidence that one was sent.
+///
+/// The result is plain text with no trailing newline, which is what lets the
+/// response pane treat header lines as ordinary body lines — the filter,
+/// the cursor, and `V`/`y` need no exception for them.
+pub fn format_response_headers(headers: &reqwest::header::HeaderMap) -> String {
+    let mut rendered: Vec<(&str, String)> = headers
+        .iter()
+        .map(|(name, value)| {
+            let text = value.to_str().map(str::to_string).unwrap_or_else(|_| {
+                String::from_utf8_lossy(value.as_bytes()).into_owned()
+            });
+            (name.as_str(), text)
+        })
+        .collect();
+    rendered.sort_by(|a, b| a.0.cmp(b.0));
+    rendered
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    fn map(pairs: &[(&str, &[u8])]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn formats_one_line_per_header_sorted_by_name() {
+        let headers = map(&[
+            ("x-ratelimit-remaining", b"41"),
+            ("content-type", b"application/json"),
+            ("etag", b"\"abc\""),
+        ]);
+        assert_eq!(
+            format_response_headers(&headers),
+            "content-type: application/json\netag: \"abc\"\nx-ratelimit-remaining: 41"
+        );
+    }
+
+    #[test]
+    fn keeps_repeated_headers_in_arrival_order() {
+        let headers = map(&[("set-cookie", b"a=1"), ("set-cookie", b"b=2")]);
+        assert_eq!(format_response_headers(&headers), "set-cookie: a=1\nset-cookie: b=2");
+    }
+
+    #[test]
+    fn shows_a_non_utf8_value_lossily_rather_than_dropping_it() {
+        let headers = map(&[("x-odd", &[0xff, 0xfe])]);
+        assert_eq!(format_response_headers(&headers), "x-odd: \u{fffd}\u{fffd}");
+    }
+
+    #[test]
+    fn no_headers_is_the_empty_string() {
+        assert_eq!(format_response_headers(&HeaderMap::new()), "");
+    }
+}

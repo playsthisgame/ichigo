@@ -25,6 +25,7 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     env, fs, io,
     io::{IsTerminal, Read, Write},
@@ -83,6 +84,18 @@ enum Mode {
     Response {
         kind: ResponseKind,
         body: String,
+        // The response's headers, already rendered one `name: value` line per
+        // header, and whether the pane is showing them above the body.
+        //
+        // They are kept as text rather than as pairs because the pane's unit is
+        // a line: `response_text` glues them onto the front of the body and
+        // everything downstream — the filter, the cursor, `V`/`y`, the image's
+        // row offset — goes on working on ordinary lines with no header-shaped
+        // exception. Empty whenever there is nothing to show (an error, a
+        // generated cURL command, a chain), which is also what makes `H` inert
+        // there rather than toggling a blank line into view.
+        headers: String,
+        show_headers: bool,
         scroll: u16,
         response_filter: String,
         response_filter_active: bool,
@@ -270,22 +283,29 @@ impl Mode {
     /// A response pane showing `body`. Reach it through `App::show_message` /
     /// `show_error` unless there is no `App` yet, as at startup.
     fn message(kind: ResponseKind, body: String) -> Self {
-        Mode::message_with_image(kind, body, None)
+        Mode::response(kind, String::new(), body, None)
     }
 
-    /// The same pane with a decoded image drawn under the body text.
+    /// The full pane: a body, the response's headers (empty when it has none),
+    /// and a decoded image drawn under the text.
     ///
     /// `image` is `None` whenever the response was text, the terminal has no
     /// graphics protocol, or the decode failed — in each case `body` already
     /// says what happened, so this is the one constructor and not two.
-    fn message_with_image(
+    fn response(
         kind: ResponseKind,
+        headers: String,
         body: String,
         image: Option<Box<StatefulProtocol>>,
     ) -> Self {
         Mode::Response {
             kind,
             body,
+            headers,
+            // Off to start: the body is what a run is for, and headers pushing
+            // it down the pane on every run would be a cost paid for the rare
+            // occasion you want them.
+            show_headers: false,
             scroll: 0,
             response_filter: String::new(),
             response_filter_active: false,
@@ -1642,7 +1662,7 @@ impl App {
         let result = RequestConfig::load(entry_name)
             .and_then(|config| crate::utils::send_request(&config, vars, false));
 
-        let (status, body, image) = match result {
+        let (status, headers, body, image) = match result {
             Ok(response) => {
                 let status = response.status().as_u16();
                 // Read the type before the body: `text()` and `bytes()` both
@@ -1655,10 +1675,14 @@ impl App {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
+                // Rendered here for the same reason, and rendered whether or
+                // not `H` is ever pressed: the response is about to be consumed
+                // and there is no asking it again.
+                let headers = crate::utils::format_response_headers(response.headers());
 
                 if crate::media::is_renderable_image(&content_type) {
                     let (body, image) = self.render_image_body(&content_type, response);
-                    (status, body, image)
+                    (status, headers, body, image)
                 } else {
                     let text = response.text().unwrap_or_else(|e| e.to_string());
                     // Pretty-print JSON if the body parses as such.
@@ -1666,14 +1690,14 @@ impl App {
                         .ok()
                         .and_then(|v| serde_json::to_string_pretty(&v).ok())
                         .unwrap_or(text);
-                    (status, body, None)
+                    (status, headers, body, None)
                 }
             }
-            Err(e) => (0, format!("Error: {e}"), None),
+            Err(e) => (0, String::new(), format!("Error: {e}"), None),
         };
 
         let kind = if status == 0 { ResponseKind::Error } else { ResponseKind::Http(status) };
-        self.mode = Mode::message_with_image(kind, body, image);
+        self.mode = Mode::response(kind, headers, body, image);
     }
 
     /// Turns an image response into the pane's two halves: the summary line
@@ -2341,6 +2365,33 @@ fn profile_field<'a>(
         None => Some(name),
         Some(offset) => pair_field(params, offset),
     }
+}
+
+/// The text the response pane is showing: the headers above the body when they
+/// are toggled on, the body alone otherwise.
+///
+/// Everything that reads the pane's contents — the renderer, `G`, the cursor,
+/// both copy paths — goes through this rather than through `body` directly,
+/// for the reason `visible_response_lines` exists: three sites that each decide
+/// separately what the pane contains are three sites that drift, and the first
+/// symptom is `y` copying a line the pane never showed.
+///
+/// Borrowed whenever there is nothing to prepend, so the common case — a body
+/// with the headers hidden — allocates nothing per frame.
+pub(super) fn response_text<'a>(
+    headers: &'a str,
+    show_headers: bool,
+    body: &'a str,
+) -> Cow<'a, str> {
+    if !show_headers || headers.is_empty() {
+        return Cow::Borrowed(body);
+    }
+    if body.is_empty() {
+        return Cow::Borrowed(headers);
+    }
+    // One blank line between, so the headers read as their own block rather
+    // than as the body's first lines.
+    Cow::Owned(format!("{headers}\n\n{body}"))
 }
 
 /// The response lines the filter leaves visible.
@@ -3226,6 +3277,48 @@ mod tests {
         let copied = visible_response_lines(BODY, "beta").join("\n");
         assert_eq!(copied, "BETA line\nbeta again");
         assert!(!copied.contains("alpha"));
+    }
+
+    const HEADERS: &str = "content-type: application/json\netag: \"abc\"";
+
+    #[test]
+    fn hidden_headers_leave_the_body_untouched_and_unallocated() {
+        let text = response_text(HEADERS, false, BODY);
+        assert_eq!(text, BODY);
+        assert!(matches!(text, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn shown_headers_sit_above_the_body_with_a_blank_line_between() {
+        assert_eq!(
+            response_text(HEADERS, true, "alpha"),
+            "content-type: application/json\netag: \"abc\"\n\nalpha"
+        );
+    }
+
+    /// The toggle is inert without headers, but the renderer must not depend on
+    /// the handler having enforced that — an empty block would otherwise show
+    /// as two blank lines the filter and the cursor could still land on.
+    #[test]
+    fn a_response_with_no_headers_shows_the_body_either_way() {
+        assert_eq!(response_text("", true, BODY), BODY);
+    }
+
+    #[test]
+    fn an_empty_body_is_the_headers_alone_rather_than_headers_and_blank_lines() {
+        assert_eq!(response_text(HEADERS, true, ""), HEADERS);
+    }
+
+    /// The point of rendering headers as ordinary lines: everything downstream
+    /// keeps working on them with no header-shaped exception.
+    #[test]
+    fn shown_headers_are_filterable_and_copyable_like_body_lines() {
+        let text = response_text(HEADERS, true, BODY);
+        assert_eq!(
+            visible_response_lines(&text, "etag"),
+            vec!["etag: \"abc\""]
+        );
+        assert_eq!(visible_response_lines(&text, "").len(), 8);
     }
 
     #[test]

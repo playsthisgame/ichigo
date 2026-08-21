@@ -60,7 +60,7 @@ The same module's **user config** section is a different thing from a request co
 - `ProfileSelect` → pick a profile before running
 - `VarInput` → fill in `{{VAR}}` placeholders before running
 - `TestInput` → fill vars + iteration count before a load test
-- `Response` / `TestResponse` → show results; `f` filters lines, `V`/`y` copy a line range. An `image/*` body renders inline under its summary line — see **Image responses**
+- `Response` / `TestResponse` → show results; `f` filters lines, `V`/`y` copy a line range, `H` toggles the response's headers in above the body — see **Response headers**. An `image/*` body renders inline under its summary line — see **Image responses**
 - `NewRequest` / `NewProfile` → create/edit requests and their profiles in-TUI
 - `ProfileList` → the draft's profiles; pick one to edit, add, or delete
 - `EditPairs` → the draft's headers *or* query params as name/value pairs, per its `PairKind`
@@ -119,6 +119,43 @@ Two rendering consequences. `text_area_lines` splits the data on `\n` and gives 
 The Browse **detail** pane is deliberately not part of this: it has no caret and no focused row, so scrolling it means new keys in a mode whose `j`/`k` already drive the list.
 
 **Response lines.** `visible_response_lines` is the single definition of which lines the filter leaves showing, and `draw_response`, `G`, cursor movement, and both copy paths all read it. It exists because those had already drifted: the predicate was spelled out separately at each site and the copy path never got one, so filtering to two lines and pressing `c` handed over the whole body. `cursor` and `anchor` index *that* list, not `body.lines()`, which is why every edit to the filter resets them — carrying them over leaves the cursor on an unrelated line and a selection spanning lines the user never saw. The pane scrolls to follow the cursor rather than the reverse, so a selection cannot be extended past the edge of the view. `Esc` drops a selection before it leaves the pane, and the selection highlight is a base `Line::style` so `colorize_json_line`'s colours survive it.
+
+**Response headers.** `Mode::Response` carries the headers as *text* — one
+`name: value` line each, rendered by `utils::format_response_headers` — beside a
+`show_headers` flag, and `response_text` glues them onto the front of the body
+when it is set. Text and not a `Vec<(String, String)>` because the pane's unit is
+a line: past that one function nothing downstream knows a header from a body
+line, so the filter, the cursor, `V`/`y`, `visible_response_lines` and the
+image's row offset all keep working with no header-shaped exception — which is
+the whole reason the feature is a text prepend rather than a second widget.
+`response_text` is the single definition of what the pane contains, for the
+reason `visible_response_lines` is the single definition of which of those lines
+show: the four sites that read the pane had already drifted once over exactly
+that. It borrows when there is nothing to prepend, so the common case allocates
+nothing per frame.
+
+They are captured in `execute_request` **before the body is consumed**, and
+unconditionally — `text()` and `bytes()` take the response by value, so there is
+no asking it again once `H` is pressed. `format_response_headers` sorts by name
+because `HeaderMap`'s iteration order is unspecified and a pane that reordered
+itself between two runs would read as a bug in the server; the sort is stable,
+so a repeated `Set-Cookie` keeps its values in arrival order. A non-UTF-8 value
+is shown lossily rather than dropped, since a mangled header is still evidence
+one was sent.
+
+`headers` is empty for an error, a generated cURL command, and a chain (one
+combined block over several responses has no single set to attach), and that
+emptiness is what makes `H` inert there rather than toggling a blank block into
+view. `response_text` re-checks it rather than trusting the handler to have:
+an empty block would otherwise be two blank lines the filter and the cursor
+could still land on. Toggling resets `scroll`, `cursor` and `anchor` for the
+reason every filter edit does — the lines underneath them have moved.
+
+The key is advertised in the pane **title**, as a ` H headers ` badge that is lit
+when the headers are in and dim when they are not, and drawn only when there are
+any. Not in the hint line: that line is already 78 of the 80 columns the rule
+gives it, and `?` is Browse-only. The badge doubles as the state indicator, which
+a hint could not do.
 
 **Image responses.** An `image/*` body is read with `bytes()` and drawn in the response pane through `ratatui-image`; everything else still goes through `text()`. The branch has to be taken *before* the body is consumed, since `text()` and `bytes()` each take the response by value — reading an image as text is the lossy-UTF-8-over-binary mojibake this exists to stop. `Mode::Response` carries the decoded image beside `body`, so it dies with the pane the way every other mode's state does; that is also what makes `Mode` un-`Clone`able, since `StatefulProtocol` is not. `body` is **always** the summary line (`image/png · 100×100 · 7.9 KB`) whether or not the image renders, which is what lets the filter, `V`/`y`, and `visible_response_lines` keep working on real text with no image-shaped exception. Every failure below the request — unreadable body, failed decode, no protocol — degrades to summary-plus-note rather than to an error pane: a `200` we could not decode is still a `200`, and showing it as an error would misreport the server.
 
