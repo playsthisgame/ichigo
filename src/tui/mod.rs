@@ -186,7 +186,87 @@ enum Mode {
 /// prefilled — from a profile, the environment, or the config on disk. Building
 /// them by hand meant repeating that anchoring at seven call sites and getting
 /// a caret of 0 on a filled field wherever it was forgotten.
+/// The discard prompt's rows, in the order they are drawn.
+///
+/// `Save` sits first and is where the selection starts: it is the answer that
+/// loses nothing and the one most people open the prompt wanting, so `Discard`
+/// is never the row Enter lands on by default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DiscardChoice {
+    Save,
+    Discard,
+    Keep,
+}
+
+impl DiscardChoice {
+    pub(crate) const ALL: [Self; 3] = [Self::Save, Self::Discard, Self::Keep];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Save => "Save and close",
+            Self::Discard => "Discard changes",
+            Self::Keep => "Keep editing",
+        }
+    }
+
+    /// What the row does, spelled out under it. The three answers differ in
+    /// what happens to the work, which is the whole reason the prompt is up.
+    pub(crate) fn hint(self) -> &'static str {
+        match self {
+            Self::Save => "write the request and leave the form",
+            Self::Discard => "leave the form and lose the changes",
+            Self::Keep => "back to the form, everything intact",
+        }
+    }
+
+    /// One row down or up, wrapping — through `step_row`, so the prompt cannot
+    /// end up wrapping differently from every other list in the TUI.
+    fn step(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[step_row(idx, Self::ALL.len(), forward)]
+    }
+}
+
 impl Mode {
+    /// Whether the request behind this pane has changes nothing has written to
+    /// disk — the marker every form pane carries in its title.
+    ///
+    /// A sub-pane's rows are not in the draft until they are applied, so asking
+    /// the draft alone would leave the headers pane silent about the header
+    /// being typed into it. Each pane instead applies its edits to a *copy* and
+    /// asks that: the real apply, so the marker cannot reach a different
+    /// conclusion than Enter does, and a copy, so asking changes nothing. An
+    /// apply that fails counts as unsaved — the pane is then holding something
+    /// the request does not have and cannot take as it stands.
+    ///
+    /// `ProfileList` holds no edits of its own; it is a picker over the
+    /// draft's profiles, so the draft is the whole answer.
+    fn unsaved(&self) -> bool {
+        match self {
+            Mode::NewRequest { draft, .. } | Mode::ProfileList { draft, .. } => draft.is_dirty(),
+            Mode::EditPairs { kind, draft, pairs, .. } => {
+                let mut probe = draft.clone();
+                kind.apply(&mut probe, pairs.clone()).is_err() || probe.is_dirty()
+            }
+            Mode::EditBody { draft, content_type, data, .. } => {
+                let mut probe = draft.clone();
+                apply_body(&mut probe, content_type, data).is_err() || probe.is_dirty()
+            }
+            Mode::NewProfile { draft, editing, name, params, .. } => {
+                let profile = drafted_profile(name, params);
+                // An unnamed profile is refused at save time, so there is
+                // nothing to apply to a copy — but params typed under it are
+                // still work the request does not have.
+                if profile.name.is_empty() {
+                    return draft.is_dirty() || !profile.params.is_empty();
+                }
+                let mut probe = draft.clone();
+                upsert_profile(&mut probe.profiles, profile, *editing).is_err() || probe.is_dirty()
+            }
+            _ => false,
+        }
+    }
+
     /// A response pane showing `body`. Reach it through `App::show_message` /
     /// `show_error` unless there is no `App` yet, as at startup.
     fn message(kind: ResponseKind, body: String) -> Self {
@@ -377,11 +457,38 @@ pub(crate) struct RequestDraft {
     query: HashMap<String, String>,
     body: Option<crate::config::Body>,
     extract: Option<HashMap<String, String>>,
+    // What a save of this request would have written the last time it was in
+    // step with disk — the thing `is_dirty` compares against. It travels with
+    // the draft, so a trip through the headers, body, or profiles pane comes
+    // back knowing whether it changed anything.
+    baseline: DraftSnapshot,
+}
+
+/// A request as a save would write it, in the form the unsaved-changes check
+/// compares.
+///
+/// It is the *saved* shape rather than the draft itself: the caret, the focused
+/// row, and which pane the draft has toured are not changes to the request, and
+/// a form that called itself unsaved for having been tabbed through would teach
+/// people to ignore the marker. `focused` and `edit` are therefore absent, and
+/// the text fields arrive here already normalized by `normalized_fields`.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct DraftSnapshot {
+    // name, method, url, description, as `save_new_request` writes them.
+    fields: [String; 4],
+    global: bool,
+    headers: HashMap<String, String>,
+    query: HashMap<String, String>,
+    body: Option<crate::config::Body>,
+    // Carried, never edited by the form — included anyway, so the check is
+    // about the whole request rather than the parts the form happens to reach.
+    extract: Option<HashMap<String, String>>,
+    profiles: Vec<crate::config::Profile>,
 }
 
 impl RequestDraft {
     fn blank() -> Self {
-        Self {
+        let mut draft = Self {
             fields: vec![
                 ("name".to_string(), String::new()),
                 ("method".to_string(), "GET".to_string()),
@@ -389,14 +496,18 @@ impl RequestDraft {
                 ("description".to_string(), String::new()),
             ],
             ..Default::default()
-        }
+        };
+        // An empty form is not an unsaved change: the prefilled `GET` is the
+        // form's own starting value, not something typed into it.
+        draft.baseline = draft.snapshot();
+        draft
     }
 
     /// Builds a draft from a config — an existing request being edited or
     /// cloned, or one parsed out of a pasted cURL command.
     fn from_config(config: RequestConfig, original_name: Option<String>, global: bool) -> Self {
         let name = original_name.clone().unwrap_or_default();
-        Self {
+        let mut draft = Self {
             edit: Edit::at_end(&name),
             fields: vec![
                 ("name".to_string(), name),
@@ -412,7 +523,53 @@ impl RequestDraft {
             query: config.query,
             body: config.body,
             extract: config.extract,
+            baseline: DraftSnapshot::default(),
+        };
+        // The baseline is what is on disk under this draft's identity. A
+        // request opened for editing is exactly that, so it starts clean; a
+        // clone or an imported cURL command has no file behind it, so its
+        // baseline is an empty form and every field it arrived with is an
+        // unsaved change — which it is, since Esc would drop the lot.
+        draft.baseline = if draft.original_name.is_some() {
+            draft.snapshot()
+        } else {
+            Self::blank().baseline
+        };
+        draft
+    }
+
+    /// name, method, url and description as `save_new_request` writes them.
+    ///
+    /// One definition for both, so the unsaved-changes check cannot come to a
+    /// different conclusion than the save does: a trailing space typed into a
+    /// URL is not a change the file would record, and a form that claimed
+    /// otherwise would prompt about nothing.
+    fn normalized_fields(&self) -> [String; 4] {
+        let value = |i: usize| self.fields.get(i).map(|(_, v)| v.trim()).unwrap_or_default();
+        [
+            value(0).to_string(),
+            value(1).to_uppercase(),
+            value(2).to_string(),
+            value(3).to_string(),
+        ]
+    }
+
+    fn snapshot(&self) -> DraftSnapshot {
+        DraftSnapshot {
+            fields: self.normalized_fields(),
+            global: self.global,
+            headers: self.headers.clone(),
+            query: self.query.clone(),
+            body: self.body.clone(),
+            extract: self.extract.clone(),
+            profiles: self.profiles.clone(),
         }
+    }
+
+    /// Whether saving now would write something different from what the draft
+    /// started as. Drives the form's `unsaved` marker and the discard prompt.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.snapshot() != self.baseline
     }
 
     pub(crate) fn headers(&self) -> &HashMap<String, String> {
@@ -497,6 +654,12 @@ struct App {
     // would have to remember which of the nine it interrupted, and every action
     // path would gain a state that reaches none of them.
     show_help: bool,
+    // The discard prompt: `Some(choice)` while it is up, carrying the row the
+    // selection is on. Not a `Mode` variant for the same reason `show_help` is
+    // not one: it draws *over* the form and answers back to it, so as a mode it
+    // would have to carry the draft across and hand it back untouched — a
+    // second owner of the thing it is protecting.
+    confirm_discard: Option<DiscardChoice>,
     // Read once at launch from `config.toml`. Not reloaded mid-session: a keymap
     // changing under a half-typed field would be worse than not reloading it.
     keys: Keys,
@@ -927,6 +1090,7 @@ impl App {
             filter: String::new(),
             filter_active: false,
             show_help: false,
+            confirm_discard: None,
             keys: config.keys,
             register: String::new(),
             mode,
@@ -1070,6 +1234,68 @@ impl App {
     }
 
     /// Shows a config-load failure in the Response pane. Actions call this and
+    /// Esc out of the request form.
+    ///
+    /// Straight to Browse when a save would write what the draft started as,
+    /// and through the discard prompt when it would not. The sub-panes are not
+    /// part of this: Esc in headers, query, body or profiles returns to the
+    /// form, which still holds every edit and now says so — this is the one
+    /// door out of the draft, so it is the one place worth guarding.
+    fn leave_form(&mut self) {
+        let dirty = matches!(&self.mode, Mode::NewRequest { draft, .. } if draft.is_dirty());
+        if dirty {
+            // Opens on `Save`: see `DiscardChoice`.
+            self.confirm_discard = Some(DiscardChoice::Save);
+        } else {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// The discard prompt's keys: a list walked with `j`/`k` or the arrows and
+    /// answered with Enter, rather than three letters to know in advance — the
+    /// answers are on the screen, so the keys that pick them are the ones every
+    /// other list in the TUI already uses.
+    ///
+    /// Returns whether the event loop should exit, which it never does: the
+    /// prompt has no answer that quits.
+    ///
+    /// Everything outside that set is swallowed. A prompt standing between
+    /// someone and work they are about to lose must not be dismissible by
+    /// whichever key they happened to hit next, and — unlike the help overlay —
+    /// a key that answers nothing leaves it standing.
+    fn answer_discard(&mut self, key: event::KeyEvent) -> bool {
+        // The same central refusal Browse makes: `Ctrl+j` is not `j`.
+        if key.modifiers.contains(event::KeyModifiers::CONTROL) {
+            return false;
+        }
+        let Some(choice) = self.confirm_discard else { return false };
+        match key.code {
+            event::KeyCode::Char('j') | event::KeyCode::Down => {
+                self.confirm_discard = Some(choice.step(true));
+            }
+            event::KeyCode::Char('k') | event::KeyCode::Up => {
+                self.confirm_discard = Some(choice.step(false));
+            }
+            event::KeyCode::Enter => {
+                self.confirm_discard = None;
+                match choice {
+                    // A refused save (no name, no URL, a name already taken)
+                    // leaves `Mode::NewRequest` up carrying its error, which is
+                    // why the prompt closes either way: the form comes back in
+                    // front of the user with the reason on it.
+                    DiscardChoice::Save => self.save_new_request(),
+                    DiscardChoice::Discard => self.mode = Mode::Browse,
+                    DiscardChoice::Keep => {}
+                }
+            }
+            // Esc is how the form was left in the first place, so it means the
+            // gentlest of the three answers rather than repeating the exit.
+            event::KeyCode::Esc => self.confirm_discard = None,
+            _ => {}
+        }
+        false
+    }
+
     /// then abort — falling back to the cached entry would send the stale values
     /// this whole change exists to stop sending.
     fn show_error(&mut self, e: anyhow::Error) {
@@ -1630,27 +1856,20 @@ impl App {
     }
 
     fn save_new_profile(&mut self) {
-        let (profile_name, params, editing, mut draft) = match &self.mode {
+        let (profile, editing, mut draft) = match &self.mode {
             Mode::NewProfile { name, params, editing, draft, .. } => {
-                (name.trim().to_string(), params.clone(), *editing, draft.clone())
+                (drafted_profile(name, params), *editing, draft.clone())
             }
             _ => return,
         };
 
-        if profile_name.is_empty() {
+        if profile.name.is_empty() {
             if let Mode::NewProfile { error, .. } = &mut self.mode {
                 *error = Some("Profile name is required".to_string());
             }
             return;
         }
 
-        let filtered_params: HashMap<String, String> = params
-            .into_iter()
-            .filter(|(k, _)| !k.trim().is_empty())
-            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-            .collect();
-
-        let profile = crate::config::Profile { name: profile_name, params: filtered_params };
         match upsert_profile(&mut draft.profiles, profile, editing) {
             Ok(selected) => self.mode = Mode::ProfileList { draft, selected },
             Err(message) => {
@@ -1666,10 +1885,7 @@ impl App {
             Mode::NewRequest { draft, .. } => draft.clone(),
             _ => return,
         };
-        let name = draft.fields[0].1.trim().to_string();
-        let method = draft.fields[1].1.trim().to_uppercase();
-        let url = draft.fields[2].1.trim().to_string();
-        let description = draft.fields[3].1.trim().to_string();
+        let [name, method, url, description] = draft.normalized_fields();
         let RequestDraft { profiles, original_name, global, headers, query, body, extract, .. } = draft;
 
         let set_error = |mode: &mut Mode, msg: &str| {
@@ -1762,6 +1978,11 @@ impl App {
     /// run of `Char` events, so every text field has to be served — miss one and
     /// pasting into it becomes a silent no-op.
     fn handle_paste(&mut self, text: &str) {
+        // The discard prompt is up over the form, so a paste into the field
+        // underneath would land somewhere nobody can see.
+        if self.confirm_discard.is_some() {
+            return;
+        }
         // Only the import buffer is multi-line; everywhere else a pasted newline
         // would be invisible at best.
         let single_line = || text.replace(['\r', '\n'], " ");
@@ -1840,6 +2061,15 @@ impl App {
         if self.show_help {
             self.show_help = false;
             return false;
+        }
+        // Before every mode: the prompt is up over the form, so the form must
+        // not also see these keys — a `y` answering it would otherwise be typed
+        // into the field underneath as well. Unlike help, a key that answers
+        // nothing leaves it up: this one guards work that Esc is about to
+        // throw away, and dismissing on any key would make a stray keystroke
+        // the same as a "yes".
+        if self.confirm_discard.is_some() {
+            return self.answer_discard(key);
         }
         if self.filter_active && matches!(self.mode, Mode::Browse) {
             return handlers::handle_key_filter(self, key);
@@ -2148,6 +2378,24 @@ pub(super) fn selection_range(cursor: usize, anchor: Option<usize>) -> (usize, u
 /// one name would leave the picker ambiguous and the second one unreachable,
 /// and `--profile <name>` on the CLI no better off. Editing a profile without
 /// renaming it is not a clash, which is why `editing` is needed here at all.
+/// The profile the `NewProfile` pane's fields describe, as the save builds it:
+/// the name trimmed, blank-named params dropped, the rest trimmed.
+///
+/// One definition, because two callers now ask what the pane is holding —
+/// `save_new_profile`, which writes it into the draft, and `Mode::unsaved`,
+/// which only wants to know whether it differs from what is already there. A
+/// second copy of these rules would let the marker disagree with the save.
+fn drafted_profile(name: &str, params: &[(String, String)]) -> crate::config::Profile {
+    crate::config::Profile {
+        name: name.trim().to_string(),
+        params: params
+            .iter()
+            .filter(|(k, _)| !k.trim().is_empty())
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect(),
+    }
+}
+
 fn upsert_profile(
     profiles: &mut Vec<crate::config::Profile>,
     profile: crate::config::Profile,
@@ -2250,6 +2498,193 @@ mod tests {
             extract: None,
             profiles: None,
         }
+    }
+
+    /// A form nobody has typed into has nothing to lose: the prefilled `GET` is
+    /// the form's own starting value, and prompting about it would teach people
+    /// to answer the prompt without reading it.
+    #[test]
+    fn a_blank_draft_is_not_dirty() {
+        assert!(!RequestDraft::blank().is_dirty());
+    }
+
+    #[test]
+    fn typing_into_a_field_makes_a_draft_dirty() {
+        let mut draft = RequestDraft::blank();
+        draft.fields[2].1 = "https://api.example.com".to_string();
+        assert!(draft.is_dirty());
+    }
+
+    /// Opened for editing, the draft *is* what is on disk.
+    #[test]
+    fn a_saved_request_opens_clean() {
+        let draft = RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        assert!(!draft.is_dirty());
+    }
+
+    /// The sub-panes are the case the issue was about: the edit lands in the
+    /// draft, the pane closes, and the form has to know it happened.
+    #[test]
+    fn a_sub_pane_edit_makes_a_draft_dirty() {
+        let mut draft =
+            RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+
+        let mut with_header = draft.clone();
+        with_header.headers.insert("Accept".to_string(), "application/json".to_string());
+        assert!(with_header.is_dirty());
+
+        let mut with_query = draft.clone();
+        with_query.query.insert("page".to_string(), "1".to_string());
+        assert!(with_query.is_dirty());
+
+        let mut with_body = draft.clone();
+        with_body.body = Some(Body {
+            content_type: "application/json".to_string(),
+            data: "{}".to_string(),
+        });
+        assert!(with_body.is_dirty());
+
+        draft.profiles.push(crate::config::Profile {
+            name: "dev".to_string(),
+            params: HashMap::new(),
+        });
+        assert!(draft.is_dirty());
+    }
+
+    /// A clone and an imported cURL command have no file behind them, so
+    /// everything they arrived with is unsaved — Esc would drop the lot.
+    #[test]
+    fn a_draft_with_no_file_behind_it_is_dirty() {
+        let draft = RequestDraft::from_config(step("https://api"), None, false);
+        assert!(draft.is_dirty());
+    }
+
+    /// The check compares what a *save* would write, so an edit the save would
+    /// normalize away is not an unsaved change. Prompting about a trailing
+    /// space is prompting about nothing.
+    #[test]
+    fn an_edit_the_save_normalizes_away_is_not_dirty() {
+        let mut draft =
+            RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        draft.fields[2].1 = "  https://api  ".to_string();
+        draft.fields[1].1 = "get".to_string();
+        assert!(!draft.is_dirty());
+    }
+
+    /// Moving around the form is not editing it.
+    #[test]
+    fn walking_the_form_does_not_make_it_dirty() {
+        let mut draft =
+            RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        for _ in 0..draft.rows() {
+            draft.step_focus(true);
+        }
+        assert!(!draft.is_dirty());
+    }
+
+    /// `global` decides which file a save writes, so it is part of the request
+    /// even though it is a checkbox rather than a field.
+    #[test]
+    fn toggling_global_makes_a_draft_dirty() {
+        let mut draft =
+            RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        draft.global = !draft.global;
+        assert!(draft.is_dirty());
+    }
+
+    /// A draft that came off disk and a pane that has not been typed into: the
+    /// pane opens showing what the request already has, so it owes no marker.
+    #[test]
+    fn an_untouched_sub_pane_is_not_unsaved() {
+        let draft = RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        assert!(!Mode::edit_pairs(PairKind::Headers, draft.clone()).unsaved());
+        assert!(!Mode::edit_pairs(PairKind::Query, draft.clone()).unsaved());
+        assert!(!Mode::edit_body(draft.clone()).unsaved());
+        assert!(!Mode::ProfileList { draft, selected: 0 }.unsaved());
+    }
+
+    /// The case the marker is for: the row is typed into the pane and is not in
+    /// the request until Enter applies it, so asking the draft alone would
+    /// leave the pane silent about it.
+    #[test]
+    fn a_row_typed_into_a_pane_is_unsaved_before_it_is_applied() {
+        let draft = RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+
+        let mut mode = Mode::edit_pairs(PairKind::Headers, draft.clone());
+        if let Mode::EditPairs { pairs, .. } = &mut mode {
+            pairs.push(("Accept".to_string(), "application/json".to_string()));
+        }
+        assert!(mode.unsaved());
+
+        let mut mode = Mode::edit_body(draft.clone());
+        if let Mode::EditBody { data, .. } = &mut mode {
+            data.push_str("{\"q\": 1}");
+        }
+        assert!(mode.unsaved());
+
+        assert!(Mode::new_profile(
+            draft,
+            None,
+            "dev".to_string(),
+            vec![("host".to_string(), "example.com".to_string())],
+        )
+        .unsaved());
+    }
+
+    /// A blank row is dropped by every apply, so typing one and thinking better
+    /// of it is not an unsaved change.
+    #[test]
+    fn a_blank_row_is_not_an_unsaved_change() {
+        let draft = RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        let mut mode = Mode::edit_pairs(PairKind::Headers, draft);
+        if let Mode::EditPairs { pairs, .. } = &mut mode {
+            pairs.push((String::new(), String::new()));
+        }
+        assert!(!mode.unsaved());
+    }
+
+    /// A pane holding something it cannot apply is holding something the
+    /// request does not have, which is what the marker is about.
+    #[test]
+    fn a_pane_that_cannot_apply_is_unsaved() {
+        let draft = RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        let mut mode = Mode::edit_pairs(PairKind::Headers, draft);
+        if let Mode::EditPairs { pairs, .. } = &mut mode {
+            pairs.push(("Accept".to_string(), "text/plain".to_string()));
+            pairs.push(("accept".to_string(), "application/json".to_string()));
+        }
+        assert!(mode.unsaved());
+    }
+
+    /// A pane over a draft that was already dirty says so, whatever is in the
+    /// pane itself — the marker is about the request, not about the screen.
+    #[test]
+    fn a_pane_over_a_dirty_draft_is_unsaved() {
+        let mut draft =
+            RequestDraft::from_config(step("https://api"), Some("api".to_string()), false);
+        draft.fields[2].1 = "https://elsewhere".to_string();
+        assert!(Mode::edit_pairs(PairKind::Query, draft.clone()).unsaved());
+        assert!(Mode::edit_body(draft.clone()).unsaved());
+        assert!(Mode::ProfileList { draft, selected: 0 }.unsaved());
+    }
+
+    /// The panes that are not a request form owe nothing: Browse has no draft
+    /// behind it, and a response is not editable.
+    #[test]
+    fn a_pane_with_no_draft_behind_it_is_never_unsaved() {
+        assert!(!Mode::Browse.unsaved());
+        assert!(!Mode::message(ResponseKind::Error, "boom".to_string()).unsaved());
+    }
+
+    /// The prompt is a list, so it walks and wraps like every other one.
+    #[test]
+    fn the_discard_prompt_walks_and_wraps() {
+        use DiscardChoice::*;
+        assert_eq!(Save.step(true), Discard);
+        assert_eq!(Discard.step(true), Keep);
+        assert_eq!(Keep.step(true), Save);
+        assert_eq!(Save.step(false), Keep);
+        assert_eq!(Keep.step(false), Discard);
     }
 
     #[test]

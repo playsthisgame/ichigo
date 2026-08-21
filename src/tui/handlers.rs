@@ -143,8 +143,11 @@ pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
                     },
                 }
             }
+            // Not straight to Browse: a draft with unsaved changes gets the
+            // discard prompt first, since Esc is the only way out of the form
+            // and everything the sub-panes edited lives in the draft alone.
             if leaving {
-                app.mode = Mode::Browse;
+                app.leave_form();
             }
         }
     }
