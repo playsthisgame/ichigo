@@ -433,7 +433,7 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
             draw_test_results(frame, panes[1], results);
         }
         Mode::NewRequest { draft, error } => {
-            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.body(), draft.original_name.is_some(), draft.global, error.as_deref());
+            draw_new_request(frame, panes[1], &draft.fields, draft.focused, &draft.edit, &draft.profiles, draft.headers(), draft.query(), draft.body(), draft.original_name.is_some(), draft.global, draft.is_dirty(), error.as_deref());
         }
         Mode::ImportCurl { buffer, error } => {
             draw_import_curl(frame, panes[1], buffer, error.as_deref());
@@ -470,6 +470,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     // Last, so it lands on top of both panes and the hint line.
     if app.show_help {
         draw_help_overlay(frame, full);
+    }
+    if app.confirm_discard {
+        draw_confirm_discard(frame, full);
     }
 }
 
@@ -624,6 +627,7 @@ fn draw_new_request(
     body: Option<&crate::config::Body>,
     is_edit: bool,
     global: bool,
+    dirty: bool,
     error: Option<&str>,
 ) {
     let mut lines: Vec<Line<'static>> = vec![Line::raw("")];
@@ -789,11 +793,21 @@ fn draw_new_request(
         )));
     }
 
-    let title = if is_edit { " Edit Request " } else { " New Request " };
+    // The unsaved marker rides in the title rather than in the body of the
+    // form: the sub-panes are where the changes get made, so the thing that has
+    // to say "not written yet" is the frame someone comes back to, and it has
+    // to stay put whatever row the form has scrolled to.
+    let mut title = vec![Span::raw(if is_edit { " Edit Request " } else { " New Request " })];
+    if dirty {
+        title.push(Span::styled(
+            "● unsaved ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     let offset = vscroll(lines.len(), rows, usize::from(interior_height(area)));
     let paragraph = Paragraph::new(lines).scroll((offset, 0)).block(
         Block::default()
-            .title(title)
+            .title(Line::from(title))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
@@ -1764,6 +1778,59 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(widget, popup);
 }
 
+/// The prompt that stands between Esc and a request form with unsaved changes.
+///
+/// Drawn as the keymap overlay is — centered, cleared, bordered — because it
+/// interrupts a pane the same way and answers back to it, and because a prompt
+/// that looked like a different kind of thing would read as a different kind of
+/// thing. The border is yellow rather than blue: this one is about to throw
+/// something away, and it matches the `unsaved` marker it is explaining.
+fn draw_confirm_discard(frame: &mut Frame, area: Rect) {
+    let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+
+    let lines: Vec<Line<'static>> = vec![
+        Line::raw(""),
+        Line::from(Span::styled(
+            "  This request has unsaved changes.",
+            Style::default().fg(Color::White),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::raw("  "),
+            key("s"),
+            Span::styled("  save and close", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            key("y"),
+            Span::styled("  discard them", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            key("n"),
+            Span::styled("  keep editing", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::raw(""),
+    ];
+
+    let height = lines.len() as u16 + 2; // + borders
+    let popup = centered_rect(DISCARD_WIDTH, height, area);
+
+    let widget = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Unsaved changes ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+
+    // Clear first: the form underneath has already been drawn into these cells.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(widget, popup);
+}
+
+/// Wide enough for the longest line the prompt draws, plus its borders.
+const DISCARD_WIDTH: u16 = 40;
+
 /// Centers a `width` × `height` box in `area`, shrinking to fit rather than
 /// overflowing when the terminal is smaller than the box.
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
@@ -2563,9 +2630,48 @@ mod tests {
         rendered(40, 12, |frame: &mut Frame, area: Rect| {
             draw_new_request(
                 frame, area, fields, focused, &edit, &[], &headers, &query, None, false, false,
+                false, None,
+            );
+        })
+    }
+
+    /// The request form drawn wide enough for its title, dirty or not.
+    fn titled_form(dirty: bool) -> String {
+        let fields = form_fields();
+        let edit = Edit::default();
+        let headers = std::collections::HashMap::new();
+        let query = std::collections::HashMap::new();
+        rendered(60, 12, |frame: &mut Frame, area: Rect| {
+            draw_new_request(
+                frame, area, &fields, 0, &edit, &[], &headers, &query, None, true, false, dirty,
                 None,
             );
         })
+    }
+
+    /// The cue the form owes anyone coming back from a sub-pane: the edits are
+    /// in the draft and nothing has written them yet.
+    #[test]
+    fn an_unsaved_form_says_so_in_its_title() {
+        assert!(titled_form(true).contains("unsaved"), "{}", titled_form(true));
+    }
+
+    /// And says nothing when there is nothing to say — a marker that is always
+    /// there is not a marker.
+    #[test]
+    fn a_saved_form_has_no_marker() {
+        assert!(!titled_form(false).contains("unsaved"), "{}", titled_form(false));
+    }
+
+    /// The prompt names all three answers: a confirmation whose keys are not on
+    /// it is one people guess at.
+    #[test]
+    fn the_discard_prompt_offers_save_discard_and_cancel() {
+        let pane = rendered(60, 20, draw_confirm_discard);
+        assert!(pane.contains("unsaved changes"), "{pane}");
+        assert!(pane.contains("save and close"), "{pane}");
+        assert!(pane.contains("discard them"), "{pane}");
+        assert!(pane.contains("keep editing"), "{pane}");
     }
 
     /// What the issue was: the request form is taller than the pane, so the

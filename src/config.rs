@@ -47,7 +47,7 @@ pub struct RequestConfig {
     pub profiles: Option<Vec<Profile>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Body {
     pub content_type: String,
     pub data: String,
@@ -60,7 +60,7 @@ pub struct ChainConfig {
     pub profiles: Option<Vec<Profile>>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub name: String,
     pub params: HashMap<String,String>,

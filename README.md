@@ -501,6 +501,23 @@ which is why Esc takes two presses there — the first leaves insert mode, the
 second leaves the form. On the five rows below them there is no text to edit,
 so one Esc leaves.
 
+Nothing reaches disk until you save, and the headers, query, body and profile
+panes all apply their edits into the form rather than to the file. So the form
+title says **● unsaved** the moment it holds something a save would write and a
+save has not written yet, and leaving it then puts up a prompt rather than
+dropping the lot:
+
+| Key | Action |
+| --- | ------ |
+| `s` | Save the request and close the form |
+| `y` | Discard the changes |
+| `n` / Esc | Keep editing |
+
+A form you have only walked through is not unsaved, and neither is an edit the
+save would normalize away — a trailing space typed into a URL is not a change
+the file would record. A cloned or imported request *is* unsaved from the
+moment it opens: there is no file behind it yet.
+
 #### Editing headers and query params in the TUI
 
 Headers and query params are edited in the same pane. Tab to `headers` or
