@@ -1,21 +1,21 @@
-generated_at: "2026-06-01T00:59:04Z"
+generated_at: "2026-08-21T02:42:00Z"
 dependencies:
     - name: github.com/affaan-m/everything-claude-code/skills/rust-testing
-      version: 2.0.0-rc.1
-      git_tag: v2.0.0-rc.1
+      version: 2.1.0
+      git_tag: v2.1.0
       repo_url: https://github.com/affaan-m/everything-claude-code
       subdir: skills/rust-testing
       entrypoint: SKILL.md
-      tree_hash: sha256:4ab924e1cd287af91df73ca78709826aa34258ef6206caba2ba9edab567e481f
+      tree_hash: sha256:5c4397165f0d88058a7a1612b45f49a8a6a34e563f19c15f3aad4393a4d187ba
       files:
         - SKILL.md
     - name: github.com/apollographql/skills/skills/rust-best-practices
-      version: 1.2.3
-      git_tag: v1.2.3
+      version: 1.2.9
+      git_tag: v1.2.9
       repo_url: https://github.com/apollographql/skills
       subdir: skills/rust-best-practices
       entrypoint: SKILL.md
-      tree_hash: sha256:f94adc9e0971861c0d31d875a5b0def14752c85ae29029ea4a1775213719ed5b
+      tree_hash: sha256:b6c06db9393aff11527e25f2140bbd8cab4f71ba27db5154a5be52f7d4ac1ad3
       files:
         - SKILL.md
         - references/chapter_01.md
@@ -28,8 +28,8 @@ dependencies:
         - references/chapter_08.md
         - references/chapter_09.md
     - name: github.com/jeffallan/claude-skills/skills/rust-engineer
-      version: 0.4.15
-      git_tag: v0.4.15
+      version: 0.4.16
+      git_tag: v0.4.16
       repo_url: https://github.com/jeffallan/claude-skills
       subdir: skills/rust-engineer
       entrypoint: SKILL.md
@@ -41,3 +41,13 @@ dependencies:
         - references/ownership.md
         - references/testing.md
         - references/traits.md
+    - name: github.com/mattpocock/skills/skills/productivity/grill-me
+      version: 1.2.3
+      git_tag: v1.2.3
+      repo_url: https://github.com/mattpocock/skills
+      subdir: skills/productivity/grill-me
+      entrypoint: SKILL.md
+      tree_hash: sha256:351e3174c736b92f1ba764d86881d9603de74d309afd797193b7b2a17be39c27
+      files:
+        - SKILL.md
+        - agents/openai.yaml
