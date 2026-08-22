@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 /// The palette every draw function reads.
 ///
 /// A `OnceLock` rather than a `&Theme` threaded through the renderer. Thirty
-/// three of this file's fifty two functions draw something coloured, and they
+/// three of this file's fifty two functions draw something colored, and they
 /// call each other — passing an immutable, process-wide value down all of them
 /// would add a parameter to two thirds of the file and tell a reader nothing at
 /// any of the call sites. `draw_response` already takes thirteen arguments.
@@ -546,10 +546,10 @@ fn draw_list(
         frame.render_widget(filter_widget, chunks[0]);
     }
 
-    // `highlight_style` is the whole of the selected row's colouring: ratatui
+    // `highlight_style` is the whole of the selected row's coloring: ratatui
     // applies it with `set_style` over the row's cells, which overwrites the
     // foreground every span carries. That is why `row_selected_text` has to be
-    // legible on `row_selected` by itself — a method label's own colour is not
+    // legible on `row_selected` by itself — a method label's own color is not
     // showing there, in any theme, and stepping the spans away from the
     // background the way the response pane does would be dead code.
     let (items, highlight_sym): (Vec<ListItem>, &str) = if let Some(rows) = tree_rows {
@@ -716,7 +716,7 @@ fn draw_new_request(
     }
 
     // The rows Tab reaches after the last field. Their state is on the row
-    // itself, so focus is the marker and the colour rather than a caret.
+    // itself, so focus is the marker and the color rather than a caret.
     let (global_check, global_color) = if global {
         ("[x] global", theme().info)
     } else {
@@ -1984,7 +1984,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
 /// Style applied to a `{{VAR}}` placeholder wherever one is shown verbatim.
 /// How a `{{VAR}}` placeholder is drawn.
 ///
-/// A function rather than the `const` it was, because the colour now comes from
+/// A function rather than the `const` it was, because the color now comes from
 /// the palette and a `const` cannot read one. The `Style` is still built the
 /// same way and is still the single definition the tests compare against.
 fn var_style() -> Style {
@@ -2041,10 +2041,10 @@ enum Band {
     Text,
 }
 
-/// Re-styles a coloured line for the band it is about to be drawn on.
+/// Re-styles a colored line for the band it is about to be drawn on.
 ///
-/// The line keeps its syntax colouring — that is what the base-style highlight
-/// was protecting, and it is still worth protecting — but every colour goes to
+/// The line keeps its syntax coloring — that is what the base-style highlight
+/// was protecting, and it is still worth protecting — but every color goes to
 /// its bright twin and the whole line goes bold. Contrast then comes from the
 /// ink as well as the page, which is what the two backgrounds alone could not
 /// give: `Green` on a dark blue band is legible, and `DarkGray` on one is
@@ -2420,7 +2420,7 @@ mod tests {
     /// The bug this exists for: `colorize_json_line` paints punctuation
     /// `DarkGray`, and the cursor line's background used to be `DarkGray` too,
     /// so every brace, colon and comma on the highlighted line was drawn in its
-    /// own background colour and disappeared.
+    /// own background color and disappeared.
     #[test]
     fn no_highlighted_foreground_is_its_own_background() {
         let line = highlight(colorize_json_line("  \"name\": \"berry\","), theme().cursor_line, Band::Text);
@@ -2432,7 +2432,7 @@ mod tests {
     }
 
     #[test]
-    fn a_highlighted_line_keeps_its_syntax_colours_as_bright_twins() {
+    fn a_highlighted_line_keeps_its_syntax_colors_as_bright_twins() {
         let plain = colorize_json_line("  \"name\": \"berry\",");
         let lit = highlight(plain.clone(), theme().selection, Band::Text);
 
@@ -2453,7 +2453,7 @@ mod tests {
         assert!(line.spans.iter().all(|s| s.style.bg.is_none()));
     }
 
-    /// The indent is a bare `Span` with no colour of its own; brightening must
+    /// The indent is a bare `Span` with no color of its own; brightening must
     /// leave it alone rather than inventing one.
     #[test]
     fn a_span_with_no_foreground_is_untouched() {

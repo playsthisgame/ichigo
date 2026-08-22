@@ -1,21 +1,21 @@
-//! The colours the TUI draws with, and the file that overrides them.
+//! The colors the TUI draws with, and the file that overrides them.
 //!
 //! A top-level module beside `media.rs` for the same reason that one is: it is
 //! pure — a palette, a parser, and one transform — with no IO and no knowledge
 //! of what is being drawn. `config.rs` reads [`ThemeFile`] out of
 //! `config.toml`; `tui::render` reads the resolved [`Theme`].
 //!
-//! **Roles, not colours.** Nothing in `render.rs` names a colour any more; it
-//! names what the colour is *for*. That indirection is the whole feature, and
+//! **Roles, not colors.** Nothing in `render.rs` names a color any more; it
+//! names what the color is *for*. That indirection is the whole feature, and
 //! it is also what makes the palette reviewable: `Color::Green` used to mean
-//! both "a 2xx response" and "a JSON string", so recolouring one recoloured the
+//! both "a 2xx response" and "a JSON string", so recoloring one recolored the
 //! other, and no amount of config could separate them.
 //!
-//! **The dark theme is mostly named colours on purpose.** `Color::Yellow` is
+//! **The dark theme is mostly named colors on purpose.** `Color::Yellow` is
 //! whatever the reader's terminal says yellow is, so ichigo looks like it
 //! belongs in gruvbox, nord, or solarized without shipping a palette for each.
 //! The light theme cannot do that — see [`Theme::LIGHT`] — and neither can the
-//! two bands, which are the one place a named colour caused a real bug.
+//! two bands, which are the one place a named color caused a real bug.
 
 use anyhow::{Result, bail};
 use ratatui::style::Color;
@@ -40,8 +40,8 @@ pub struct Theme {
     pub border: Color,
     /// The border of the pane that has focus.
     pub border_focus: Color,
-    /// Text drawn *on* a coloured badge, so it has to contrast with every
-    /// status colour rather than with the page.
+    /// Text drawn *on* a colored badge, so it has to contrast with every
+    /// status color rather than with the page.
     pub badge_text: Color,
     /// The band under the cursor line — a background, not ink.
     pub cursor_line: Color,
@@ -62,7 +62,7 @@ pub struct Theme {
     /// ink there has to be dark to read on the page, and a dark field then
     /// needs light ink on it — which is the pair below rather than `text`.
     pub row_selected: Color,
-    /// Ink on `row_selected`. Contrasts with that colour, not with the page —
+    /// Ink on `row_selected`. Contrasts with that color, not with the page —
     /// the distinction `text` cannot make.
     pub row_selected_text: Color,
 
@@ -78,7 +78,7 @@ pub struct Theme {
 
     // ─── JSON ─────────────────────────────────────────────────────────────
     // Separate from the status roles even where they start out the same
-    // colour. Sharing them is what made a 2xx and a JSON string impossible to
+    // color. Sharing them is what made a 2xx and a JSON string impossible to
     // tell apart in config, which is the thing this module exists to fix.
     pub json_key: Color,
     pub json_string: Color,
@@ -99,7 +99,7 @@ impl Default for Theme {
 impl Theme {
     /// What ichigo has always looked like.
     ///
-    /// Named colours nearly throughout, so the palette is the reader's: their
+    /// Named colors nearly throughout, so the palette is the reader's: their
     /// terminal decides what `Yellow` is, and ichigo sits inside gruvbox or
     /// nord without knowing either exists.
     ///
@@ -107,9 +107,9 @@ impl Theme {
     /// named background can collide with a named foreground — the cursor line
     /// was once `DarkGray`, which is what `json_punct` is, so every brace and
     /// comma on the highlighted line vanished into it. They come from the
-    /// greyscale ramp (232–255), the half of the 256 palette nothing remaps:
+    /// grayscale ramp (232–255), the half of the 256 palette nothing remaps:
     /// `base16-shell` and friends rewrite 16–21 for their extra shades, and a
-    /// band living there could become an arbitrary colour. The ramp also needs
+    /// band living there could become an arbitrary color. The ramp also needs
     /// no truecolor, so it survives a tmux without `Tc`.
     pub const DARK: Self = Self {
         text: Color::White,
@@ -140,12 +140,12 @@ impl Theme {
 
     /// For a light terminal background.
     ///
-    /// This one **cannot** use named colours, and that is the reason it exists
+    /// This one **cannot** use named colors, and that is the reason it exists
     /// as a built-in rather than as advice. On a light scheme the ANSI "bright"
     /// variants are usually *darker* than their base, so the emphasis transform
     /// that makes a highlighted line readable on `DARK` pushes the wrong way —
-    /// it is not a bad colour choice but a wrong assumption, and only real
-    /// values fix it. Every colour here is `Rgb`, which `emphasize` can reason
+    /// it is not a bad color choice but a wrong assumption, and only real
+    /// values fix it. Every color here is `Rgb`, which `emphasize` can reason
     /// about: it moves ink away from the band's own lightness rather than
     /// guessing which direction is brighter.
     pub const LIGHT: Self = Self {
@@ -212,7 +212,7 @@ impl Theme {
 ///
 /// Every field optional so adding a role never invalidates an existing file,
 /// and `deny_unknown_fields` so a misspelled role is refused rather than
-/// silently ignored — a colour that does nothing forever is the exact failure
+/// silently ignored — a color that does nothing forever is the exact failure
 /// this crate's config already refuses everywhere else.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,7 +222,7 @@ pub struct ThemeFile {
     pub colors: ColorsFile,
 }
 
-/// `[theme.colors]`, as written: role name to colour spec.
+/// `[theme.colors]`, as written: role name to color spec.
 ///
 /// A struct and not a map, so a typo is a load error naming the field rather
 /// than a key nobody reads.
@@ -237,7 +237,7 @@ macro_rules! colors_file {
         impl ColorsFile {
             /// Parses each override and writes it over the base palette.
             ///
-            /// Failures name the role, because "invalid colour" in a file with
+            /// Failures name the role, because "invalid color" in a file with
             /// twenty of them is a hunt rather than a fix.
             fn apply(self, theme: &mut Theme) -> Result<()> {
                 $(
@@ -278,14 +278,14 @@ colors_file!(
     json_punct,
 );
 
-/// Reads one colour spec.
+/// Reads one color spec.
 ///
 /// Three forms, in the order someone reaches for them:
-/// - `"#rrggbb"` — an exact colour, which no terminal theme can remap.
+/// - `"#rrggbb"` — an exact color, which no terminal theme can remap.
 /// - `"yellow"`, `"bright yellow"` — an ANSI name, which *follows* the reader's
 ///   terminal theme. This is the one to use if you want ichigo to keep matching
 ///   your scheme when you change it.
-/// - `"0"`–`"255"` — a palette index, for the greyscale ramp and the colour cube.
+/// - `"0"`–`"255"` — a palette index, for the grayscale ramp and the color cube.
 ///
 /// Anything else is refused by name rather than defaulted, which is the same
 /// bet `deny_unknown_fields` makes: a config that quietly means something other
@@ -295,7 +295,7 @@ pub fn parse_color(spec: &str) -> Result<Color> {
 
     if let Some(hex) = s.strip_prefix('#') {
         if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            bail!("{spec:?} is not a #rrggbb colour");
+            bail!("{spec:?} is not a #rrggbb color");
         }
         let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap();
         return Ok(Color::Rgb(byte(0), byte(2), byte(4)));
@@ -305,7 +305,7 @@ pub fn parse_color(spec: &str) -> Result<Color> {
         return Ok(Color::Indexed(index));
     }
     // A number that does not fit a `u8` is someone meaning an index, not a
-    // colour name, so it gets the index error rather than "unknown colour".
+    // color name, so it gets the index error rather than "unknown color".
     if s.chars().all(|c| c.is_ascii_digit()) {
         bail!("{spec:?} is out of range; palette indices are 0-255");
     }
@@ -329,17 +329,17 @@ pub fn parse_color(spec: &str) -> Result<Color> {
         "brightcyan" | "lightcyan" => Color::LightCyan,
         "white" | "brightwhite" => Color::White,
         _ => bail!(
-            "{spec:?} is not a colour; use #rrggbb, an ANSI name like \"yellow\" \
+            "{spec:?} is not a color; use #rrggbb, an ANSI name like \"yellow\" \
              or \"bright yellow\", or a palette index 0-255"
         ),
     };
     Ok(named)
 }
 
-/// The emphasised twin of a colour, for ink about to be drawn on `band`.
+/// The emphasized twin of a color, for ink about to be drawn on `band`.
 ///
 /// A highlighted line keeps its meaning — a string still reads as a string —
-/// but every colour has to step away from the band or the line is worse to read
+/// but every color has to step away from the band or the line is worse to read
 /// than the ones around it. The direction of that step is the whole problem:
 /// "brighter" is only right on a dark theme.
 ///
@@ -347,9 +347,9 @@ pub fn parse_color(spec: &str) -> Result<Color> {
 /// - `Rgb` is computed. The band's own lightness says which way is *away*, so
 ///   this is correct on light and dark themes alike, and is why [`Theme::LIGHT`]
 ///   is written in `Rgb` throughout.
-/// - A named colour becomes its ANSI bright twin. Nothing here knows what the
+/// - A named color becomes its ANSI bright twin. Nothing here knows what the
 ///   terminal will draw for either, so this is a convention rather than a
-///   calculation — it is right on the dark themes named colours are for.
+///   calculation — it is right on the dark themes named colors are for.
 /// - `Indexed(0..=7)` is the same convention: the bright half is `+8`.
 /// - Anything already bright, or a cube/ramp index chosen deliberately, is left
 ///   alone. Guessing at a value someone picked exactly is not an improvement.
@@ -378,17 +378,17 @@ pub fn emphasize(color: Color, band: Color) -> Color {
     }
 }
 
-/// How far `emphasize` moves an `Rgb` colour toward the far end from its band.
-/// Enough to separate ink from page, short of washing every colour into one.
+/// How far `emphasize` moves an `Rgb` color toward the far end from its band.
+/// Enough to separate ink from page, short of washing every color into one.
 const EMPHASIS: f32 = 0.45;
 
-/// Whether a colour is light enough to want dark ink on it.
+/// Whether a color is light enough to want dark ink on it.
 ///
 /// Relative luminance, thresholded where the two contrast ratios against black
-/// and white cross. Only `Rgb` can be answered: a named colour or a palette
+/// and white cross. Only `Rgb` can be answered: a named color or a palette
 /// index is whatever the terminal draws, and this module does not get to know.
 /// Those are assumed dark, which is what a terminal running a TUI usually is
-/// and what the named-colour path above already assumes.
+/// and what the named-color path above already assumes.
 pub fn is_light(color: Color) -> bool {
     let Color::Rgb(r, g, b) = color else {
         return matches!(color, Color::White | Color::Gray);
@@ -451,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn colours_parse_in_all_three_forms() {
+    fn colors_parse_in_all_three_forms() {
         assert_eq!(parse_color("#fabd2f").unwrap(), Color::Rgb(0xfa, 0xbd, 0x2f));
         assert_eq!(parse_color("yellow").unwrap(), Color::Yellow);
         assert_eq!(parse_color("bright yellow").unwrap(), Color::LightYellow);
@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_colour_specs_are_refused() {
+    fn bad_color_specs_are_refused() {
         for spec in ["#fff", "#gggggg", "puce", "256", "1000", ""] {
             assert!(parse_color(spec).is_err(), "{spec:?} should be refused");
         }
@@ -469,7 +469,7 @@ mod tests {
     /// The bug the whole highlight change exists for: a foreground must never
     /// end up equal to the band behind it.
     #[test]
-    fn no_emphasised_role_collides_with_its_band() {
+    fn no_emphasized_role_collides_with_its_band() {
         for (name, theme) in Theme::BUILTIN {
             for band in [theme.cursor_line, theme.selection] {
                 for role in [
@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn named_colours_emphasise_to_their_bright_twin() {
+    fn named_colors_emphasize_to_their_bright_twin() {
         assert_eq!(emphasize(Color::Green, Theme::DARK.selection), Color::LightGreen);
         assert_eq!(emphasize(Color::Indexed(2), Theme::DARK.selection), Color::Indexed(10));
         // Punctuation is rescued to White rather than the dim Gray.
@@ -517,7 +517,7 @@ mod tests {
 
     /// The two bands are a step apart in weight, not two arbitrary values: the
     /// selection is the louder, which is what makes entering visual mode read
-    /// as a change rather than as a colour swap. True in both directions —
+    /// as a change rather than as a color swap. True in both directions —
     /// louder means lighter on a dark theme and darker on a light one.
     #[test]
     fn every_theme_makes_its_selection_louder_than_its_cursor_line() {
@@ -526,7 +526,7 @@ mod tests {
             let step = |c: Color| match c {
                 Color::Indexed(i) => i as i32,
                 Color::Rgb(r, _, _) => r as i32,
-                _ => panic!("{name}: a band must be an exact colour, not a named one"),
+                _ => panic!("{name}: a band must be an exact color, not a named one"),
             };
             let away_from_page = step(theme.selection) - step(theme.cursor_line);
             if is_light(theme.selection) {
@@ -543,7 +543,7 @@ mod tests {
         assert!(!is_light(Color::Rgb(0x1c, 0x1c, 0x1c)));
         assert!(is_light(Theme::LIGHT.selection));
         assert!(!is_light(Theme::DARK.selection));
-        // Unknowable: a named colour is whatever the terminal draws.
+        // Unknowable: a named color is whatever the terminal draws.
         assert!(!is_light(Color::Yellow));
     }
 }

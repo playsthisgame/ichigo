@@ -206,7 +206,7 @@ pub struct UserConfig {
     pub keys: Keys,
     /// The palette the TUI draws with. A section per concern, like `keys` and
     /// `split_pct`: it is `[theme]` in the file and `crate::theme` owns both
-    /// its shape and its validation, so `config.rs` stays free of colours.
+    /// its shape and its validation, so `config.rs` stays free of colors.
     pub theme: crate::theme::Theme,
     /// The list pane's share of the TUI width, as a percentage. A percentage
     /// rather than a column count so the ratio survives a terminal resize —
@@ -333,7 +333,7 @@ json_null = "bright red"
         assert_eq!(config.theme.text, crate::theme::Theme::LIGHT.text);
     }
 
-    /// A misspelled role is a load error, not a colour that never applies.
+    /// A misspelled role is a load error, not a color that never applies.
     #[test]
     fn an_unknown_theme_role_is_refused() {
         let toml = "[theme.colors]
