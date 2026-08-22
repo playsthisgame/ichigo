@@ -1502,8 +1502,8 @@ fn draw_response(
     }
 
     let (from, to) = super::selection_range(cursor, anchor);
-    // The row a band has to fill: the block's interior, so it runs from border
-    // to border however the split divider has been dragged.
+    // The row the cursor line has to fill: the block's interior, so it runs from
+    // border to border however the split divider has been dragged.
     let band_width = chunks[1].width.saturating_sub(2);
     let text = super::response_text(summary, headers, show_headers, body);
     let lines: Vec<Line<'static>> = super::visible_response_lines(&text, response_filter)
@@ -1512,9 +1512,9 @@ fn draw_response(
         .enumerate()
         .map(|(i, line)| {
             if anchor.is_some() && i >= from && i <= to {
-                highlight(line, SELECTION_BG, band_width)
+                highlight(line, SELECTION_BG, Band::Text)
             } else if anchor.is_none() && i == cursor {
-                highlight(line, CURSOR_LINE_BG, band_width)
+                highlight(line, CURSOR_LINE_BG, Band::Row(band_width))
             } else {
                 line
             }
@@ -1984,22 +1984,52 @@ fn var_spans(text: &str, base: Style) -> Vec<Span<'static>> {
 
 /// The band under the cursor line, and the one under a selection.
 ///
-/// Indexed rather than named colours, which is the whole point: `Blue` and
+/// Two neutral greys, a step apart: the cursor line is always somewhere, so it
+/// is the quieter, and entering visual mode lifts it to something you cannot
+/// miss. That step is the vim `CursorLine` → `Visual` relationship, and the
+/// values are calibrated against it — gruvbox puts its `CursorLine` about ΔE 8
+/// from the page and its `Visual` about ΔE 25, and these land at 8.3 and 21.3.
+///
+/// Indexed rather than named colours, which matters twice over. `Blue` and
 /// `DarkGray` are whatever the reader's theme says they are, and that is
 /// exactly how the old highlight went wrong — `colorize_json_line` paints
 /// punctuation `DarkGray`, so the cursor line's `DarkGray` background erased
 /// every brace, colon and comma on the line it was meant to be showing you. A
-/// background a foreground can collide with has to be a known value.
+/// background a foreground can collide with has to be a known value. These come
+/// from the **greyscale ramp** (232–255) rather than the colour cube, which is
+/// the half of the 256 palette nothing remaps: `base16-shell` and friends
+/// rewrite 16–21 to carry their extra shades, so a band living there could
+/// become an arbitrary colour and re-create the collision. The ramp also needs
+/// no truecolor, so it survives a tmux without `Tc`.
 ///
-/// Both are dark, because everything drawn on them is brightened below and
-/// bright ink wants a dark page. They share a hue and differ in weight: the
-/// cursor line is always somewhere, so it is the quieter of the two, and a
-/// selection is something you asked for, so it is the louder.
-const CURSOR_LINE_BG: Color = Color::Indexed(17); // #00005f, dark indigo
-const SELECTION_BG: Color = Color::Indexed(19); // #0000af, blue
+/// Grey rather than a hue because a neutral band sits inside any palette — a
+/// warm scheme like gruvbox reads these as its own greys (ΔE 2.4 from its
+/// `bg1`) and a cold one does the same. When themes land these become the dark
+/// theme's values rather than the only ones.
+const CURSOR_LINE_BG: Color = Color::Indexed(237); // #3a3a3a, medium grey
+const SELECTION_BG: Color = Color::Indexed(240); // #585858, a step lighter
 
-/// Re-styles a coloured line for the band it is about to be drawn on, padded
-/// out to `width` so the band is the whole row.
+/// How far a band runs, which is the difference between marking a *position*
+/// and marking an *extent*.
+///
+/// The cursor line runs to the end of the row: it says where you are, and a
+/// band that stopped at the last character would jump about in width as you
+/// moved through lines of different lengths — the one thing a position marker
+/// must not do. A selection stops at the end of its text, because its right
+/// edge is information: it is showing you exactly what `y` is about to take,
+/// and padding it out to the row would claim trailing spaces that are not in
+/// any of those lines. This is vim's own distinction between `cursorline` and
+/// charwise-ragged `Visual`, and it is the reason the two are one enum rather
+/// than a `bool` nobody could read at the call site.
+#[derive(Clone, Copy)]
+enum Band {
+    /// To the end of the row, `u16` wide.
+    Row(u16),
+    /// To the end of the text.
+    Text,
+}
+
+/// Re-styles a coloured line for the band it is about to be drawn on.
 ///
 /// The line keeps its syntax colouring — that is what the base-style highlight
 /// was protecting, and it is still worth protecting — but every colour goes to
@@ -2008,18 +2038,20 @@ const SELECTION_BG: Color = Color::Indexed(19); // #0000af, blue
 /// give: `Green` on a dark blue band is legible, and `DarkGray` on one is
 /// technically legible and practically not.
 ///
-/// The padding is what makes a *line* selection look like one. A base style
-/// only paints the cells its spans occupy, so without it the band stopped at
-/// the last character and a selection over lines of different lengths had a
-/// ragged right edge — which reads as several highlighted words rather than as
-/// three whole lines being taken. Lines longer than the pane are clipped by the
-/// `Paragraph` as before; the padding only ever adds.
+/// A base `Line::style` only paints the cells its spans occupy, so `Band::Row`
+/// is delivered by padding the line with blanks. Lines longer than the pane are
+/// clipped by the `Paragraph` as before; the padding only ever adds, and it is
+/// added at render time so it never reaches `body` — `y` and `c` copy the lines
+/// without it.
 ///
 /// The background and the bold live on the `Line` rather than on each span,
 /// because a base style paints behind the spans and patches their modifiers
 /// without touching the foregrounds they set.
-fn highlight(line: Line<'static>, bg: Color, width: u16) -> Line<'static> {
-    let pad = (width as usize).saturating_sub(line.width());
+fn highlight(line: Line<'static>, bg: Color, band: Band) -> Line<'static> {
+    let pad = match band {
+        Band::Row(width) => (width as usize).saturating_sub(line.width()),
+        Band::Text => 0,
+    };
     let mut spans: Vec<Span<'static>> = line
         .spans
         .into_iter()
@@ -2404,7 +2436,7 @@ mod tests {
     /// own background colour and disappeared.
     #[test]
     fn no_highlighted_foreground_is_its_own_background() {
-        let line = highlight(colorize_json_line("  \"name\": \"berry\","), CURSOR_LINE_BG, 0);
+        let line = highlight(colorize_json_line("  \"name\": \"berry\","), CURSOR_LINE_BG, Band::Text);
         for span in &line.spans {
             assert_ne!(span.style.fg, Some(CURSOR_LINE_BG));
             assert_ne!(span.style.fg, Some(SELECTION_BG));
@@ -2415,7 +2447,7 @@ mod tests {
     #[test]
     fn a_highlighted_line_keeps_its_syntax_colours_as_bright_twins() {
         let plain = colorize_json_line("  \"name\": \"berry\",");
-        let lit = highlight(plain.clone(), SELECTION_BG, 0);
+        let lit = highlight(plain.clone(), SELECTION_BG, Band::Text);
 
         assert_eq!(plain.spans.len(), lit.spans.len());
         // The key was Yellow and the string Green; both keep their identity.
@@ -2427,7 +2459,7 @@ mod tests {
 
     #[test]
     fn the_band_and_the_bold_go_on_the_line_not_the_spans() {
-        let line = highlight(colorize_json_line("  \"n\": 42"), CURSOR_LINE_BG, 0);
+        let line = highlight(colorize_json_line("  \"n\": 42"), CURSOR_LINE_BG, Band::Text);
         assert_eq!(line.style.bg, Some(CURSOR_LINE_BG));
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         // A span setting its own background would punch a hole in the band.
@@ -2438,7 +2470,7 @@ mod tests {
     /// leave it alone rather than inventing one.
     #[test]
     fn a_span_with_no_foreground_is_untouched() {
-        let line = highlight(colorize_json_line("    \"n\": 42"), CURSOR_LINE_BG, 0);
+        let line = highlight(colorize_json_line("    \"n\": 42"), CURSOR_LINE_BG, Band::Text);
         assert_eq!(line.spans[0].content.as_ref(), "    ");
         assert_eq!(line.spans[0].style.fg, None);
     }
@@ -2446,11 +2478,14 @@ mod tests {
     /// A line selection has to look like whole lines. Without the padding the
     /// band stopped at the last character, so a selection over lines of
     /// different lengths had a ragged edge and read as highlighted words.
+    /// The cursor line marks a position, so its band is the whole row — a band
+    /// that stopped at the last character would change width as you moved
+    /// through lines of different lengths.
     #[test]
-    fn a_band_is_padded_out_to_the_full_row() {
+    fn the_cursor_line_band_fills_the_row() {
         let plain = colorize_json_line("  \"n\": 42");
         let text_width = plain.width();
-        let line = highlight(plain, CURSOR_LINE_BG, 40);
+        let line = highlight(plain, CURSOR_LINE_BG, Band::Row(40));
         assert_eq!(line.width(), 40);
         // The pad is the tail, and it is blank: it exists to carry the band,
         // not to add characters a copy would pick up.
@@ -2459,14 +2494,37 @@ mod tests {
         assert!(tail.content.chars().all(|c| c == ' '));
     }
 
+    /// A selection marks an extent, so its right edge is information: it shows
+    /// exactly what `y` is about to take, and must not claim trailing spaces
+    /// that are in none of those lines.
+    #[test]
+    fn a_selection_band_stops_at_the_end_of_the_text() {
+        let plain = colorize_json_line("  \"n\": 42");
+        let text_width = plain.width();
+        let line = highlight(plain, SELECTION_BG, Band::Text);
+        assert_eq!(line.width(), text_width);
+    }
+
     /// Padding only ever adds: a line already wider than the pane keeps every
     /// character, and the `Paragraph` clips it exactly as it did before.
     #[test]
     fn a_line_wider_than_the_row_is_left_alone() {
         let long = colorize_json_line("  \"key\": \"a rather long value indeed\",");
         let width = long.width();
-        let line = highlight(long, SELECTION_BG, 10);
+        let line = highlight(long, CURSOR_LINE_BG, Band::Row(10));
         assert_eq!(line.width(), width);
+    }
+
+    /// The two bands are a step apart in weight, not two arbitrary greys: the
+    /// selection is the lighter, which is what makes entering visual mode read
+    /// as a change.
+    #[test]
+    fn the_selection_band_is_lighter_than_the_cursor_line() {
+        let grey = |c: Color| match c {
+            Color::Indexed(i) => i,
+            _ => panic!("bands are indexed greys"),
+        };
+        assert!(grey(SELECTION_BG) > grey(CURSOR_LINE_BG));
     }
 
     #[test]
