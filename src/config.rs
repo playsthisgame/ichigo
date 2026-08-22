@@ -181,6 +181,8 @@ struct UserConfigFile {
     keys: KeysFile,
     #[serde(default)]
     layout: LayoutFile,
+    #[serde(default)]
+    theme: crate::theme::ThemeFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -202,6 +204,10 @@ struct LayoutFile {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UserConfig {
     pub keys: Keys,
+    /// The palette the TUI draws with. A section per concern, like `keys` and
+    /// `split_pct`: it is `[theme]` in the file and `crate::theme` owns both
+    /// its shape and its validation, so `config.rs` stays free of colours.
+    pub theme: crate::theme::Theme,
     /// The list pane's share of the TUI width, as a percentage. A percentage
     /// rather than a column count so the ratio survives a terminal resize —
     /// and so a config written on one terminal means the same on another.
@@ -223,7 +229,11 @@ impl UserConfig {
     /// What every field means when the file does not say. Not `Default`, which
     /// derives a `split_pct` of 0 — a value the validator would reject.
     pub fn defaults() -> Self {
-        Self { keys: Keys::default(), split_pct: DEFAULT_SPLIT_PCT }
+        Self {
+            keys: Keys::default(),
+            theme: crate::theme::Theme::default(),
+            split_pct: DEFAULT_SPLIT_PCT,
+        }
     }
 
     fn from_file(file: UserConfigFile) -> Result<Self> {
@@ -235,7 +245,11 @@ impl UserConfig {
                  (got {pct}); it is the request list's share of the width as a percentage"
             ),
         };
-        Ok(Self { keys: Keys::from_file(file.keys)?, split_pct })
+        Ok(Self {
+            keys: Keys::from_file(file.keys)?,
+            theme: crate::theme::Theme::from_file(file.theme)?,
+            split_pct,
+        })
     }
 }
 
@@ -288,6 +302,45 @@ pub(crate) fn prune_empty_parents(path: &std::path::Path, base: &std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `basic_toml` has to handle the nested `[theme.colors]` table, and the
+    /// whole file has to round-trip through one parse — the theme is not read
+    /// separately, it is a section of the same config.
+    #[test]
+    fn a_full_config_file_parses_including_the_nested_theme_table() {
+        let toml = r##"
+[keys]
+insert_escape = "jk"
+
+[layout]
+split_pct = 40
+
+[theme]
+name = "light"
+
+[theme.colors]
+accent = "#fabd2f"
+json_null = "bright red"
+"##;
+        let file: UserConfigFile = basic_toml::from_str(toml).expect("should parse");
+        let config = UserConfig::from_file(file).expect("should validate");
+
+        assert_eq!(config.keys.insert_escape, Some(('j', 'k')));
+        assert_eq!(config.split_pct, 40);
+        assert_eq!(config.theme.accent, ratatui::style::Color::Rgb(0xfa, 0xbd, 0x2f));
+        assert_eq!(config.theme.json_null, ratatui::style::Color::LightRed);
+        // Untouched roles still come from the named base.
+        assert_eq!(config.theme.text, crate::theme::Theme::LIGHT.text);
+    }
+
+    /// A misspelled role is a load error, not a colour that never applies.
+    #[test]
+    fn an_unknown_theme_role_is_refused() {
+        let toml = "[theme.colors]
+accnt = \"red\"\n";
+        assert!(basic_toml::from_str::<UserConfigFile>(toml).is_err());
+    }
+
 
     fn parse_config(toml: &str) -> Result<UserConfig> {
         let file: UserConfigFile = basic_toml::from_str(toml)?;

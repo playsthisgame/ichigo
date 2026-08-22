@@ -10,6 +10,7 @@ mod curl;
 mod media;
 mod runner;
 mod tester;
+mod theme;
 mod tui;
 mod utils;
 
