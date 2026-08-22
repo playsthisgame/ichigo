@@ -210,7 +210,7 @@ The hint line at the bottom of the screen carries only the handful of keys you
 reach for most; press `?` for the full keymap, grouped by what it does. Any key
 dismisses it.
 
-The TUI ships a dark and a light palette, and every colour in it is
+The TUI ships a dark and a light palette, and every color in it is
 configurable — see [Themes](#themes).
 
 **Resizing the panes.** Drag the divider between the list and the detail pane
@@ -326,8 +326,8 @@ without fighting your terminal's text selection:
 | `c` | Copy everything the pane is showing |
 | `H` | Show / hide the response headers |
 
-The cursor line and the selection are drawn as bands whose colours — like every
-other colour in the TUI — you can change; see [Themes](#themes).
+The cursor line and the selection are drawn as bands whose colors — like every
+other color in the TUI — you can change; see [Themes](#themes).
 
 Copying this way beats dragging with the mouse: a terminal's selection is
 linear, so a drag that spans more than one row also takes the request list and
@@ -724,7 +724,7 @@ Every option ichigo currently understands.
 | `keys.insert_escape` | string, exactly two characters | unset — `Esc` only | A two-key sequence that leaves insert mode in a TUI text field, the equivalent of vim's `inoremap jk <Esc>`. See [Editing text fields](#editing-text-fields). |
 | `layout.split_pct` | integer, 15–85 | `35` | The request list's share of the TUI width, as a percentage. The rest goes to the detail pane. |
 | `theme.name` | `"dark"` or `"light"` | `"dark"` | Which built-in palette to start from. See [Themes](#themes). |
-| `theme.colors.*` | colour spec | from `theme.name` | Overrides one role of that palette. Twenty-two roles; see [Themes](#themes). |
+| `theme.colors.*` | color spec | from `theme.name` | Overrides one role of that palette. Twenty-two roles; see [Themes](#themes). |
 
 A complete file, with every option set:
 
@@ -792,15 +792,15 @@ name = "dark"    # the default: what ichigo has always looked like
 # name = "light" # for a light terminal background
 ```
 
-**`dark` is mostly ANSI colour names on purpose.** It asks the terminal for
+**`dark` is mostly ANSI color names on purpose.** It asks the terminal for
 "yellow" rather than for `#fabd2f`, so it inherits *your* scheme — gruvbox,
 nord, solarized, whatever you switch to next — without ichigo shipping a
 palette for each. `light` cannot work that way (see below) and so is written in
-exact colours throughout.
+exact colors throughout.
 
 #### Overriding roles
 
-Nothing in ichigo names a colour; it names what the colour is *for*. Those roles
+Nothing in ichigo names a color; it names what the color is *for*. Those roles
 are what you override, on top of whichever `name` you picked:
 
 ```toml
@@ -808,28 +808,28 @@ are what you override, on top of whichever `name` you picked:
 name = "dark"
 
 [theme.colors]
-accent      = "#fabd2f"   # exact colour, immune to your terminal's palette
+accent      = "#fabd2f"   # exact color, immune to your terminal's palette
 json_string = "green"     # an ANSI name, which follows your terminal's theme
 cursor_line = "237"       # a 0-255 palette index
 ```
 
-Three forms of colour spec, and the choice matters: **`#rrggbb`** is exact and
+Three forms of color spec, and the choice matters: **`#rrggbb`** is exact and
 never remapped, an **ANSI name** (`"green"`, `"bright green"`) follows your
 terminal so ichigo keeps matching when you change schemes, and an **index**
-`0`–`255` reaches the greyscale ramp and the colour cube.
+`0`–`255` reaches the grayscale ramp and the color cube.
 
 Every role, and what it paints:
 
 **UI**
 
-| Role | What it colours |
+| Role | What it colors |
 | ---- | --------------- |
 | `text` | Primary text: field values, list rows, the filter you are typing |
 | `dim` | Everything secondary — labels, hints, tree prefixes, descriptions, disabled rows |
 | `accent` | The focused thing: a focused field's label, the key names in the hint line, the active filter border |
 | `border` | Pane borders at rest |
 | `border_focus` | The border of the pane that has focus |
-| `badge_text` | Ink drawn *on* a coloured badge, such as the status code beside " Response " |
+| `badge_text` | Ink drawn *on* a colored badge, such as the status code beside " Response " |
 | `cursor_line` | The band under the cursor line in the response pane |
 | `selection` | The band under a `V` selection, a step louder than `cursor_line` |
 | `row_selected` | The highlighted row in the request list and the profile pickers, and the `VISUAL` badge |
@@ -837,18 +837,18 @@ Every role, and what it paints:
 | `variable` | `{{VAR}}` placeholders, profile names, the `CHAIN` badge, and the profile panes' borders |
 | `folder` | Folder rows and their borders, and the `?` overlay's column headings |
 
-**Status** — each also colours the matching HTTP method in the request list:
+**Status** — each also colors the matching HTTP method in the request list:
 
-| Role | What it colours |
+| Role | What it colors |
 | ---- | --------------- |
 | `success` | 2xx, and `POST` |
 | `info` | 3xx, and `GET` |
 | `warning` | 4xx, and `PUT` / `PATCH` |
 | `error` | 5xx, `DELETE`, and error panes |
 
-**JSON** — the response body's syntax colouring:
+**JSON** — the response body's syntax coloring:
 
-| Role | What it colours |
+| Role | What it colors |
 | ---- | --------------- |
 | `json_key` | `"name"` |
 | `json_string` | `"strawberry"` |
@@ -858,26 +858,26 @@ Every role, and what it paints:
 | `json_punct` | Braces, brackets, colons, commas |
 
 Status and JSON are separate on purpose even where they start out the same
-colour: `success` and `json_string` are both green in the dark theme, and
-splitting them is what lets you recolour a 2xx without recolouring every string
+color: `success` and `json_string` are both green in the dark theme, and
+splitting them is what lets you recolor a 2xx without recoloring every string
 in every response body.
 
 `row_selected_text` is a separate role rather than reusing `text` because it has
 to contrast with the *selection* rather than with the page — a distinction a
 light theme makes obvious and a dark one hides.
 
-#### Colour specs
+#### Color specs
 
 | Form | Example | Notes |
 | ---- | ------- | ----- |
 | Hex | `"#fabd2f"` | Exact. No terminal theme can remap it. Six digits, `#` required. |
 | ANSI name | `"green"`, `"bright green"` | Follows your terminal, so ichigo keeps matching when you change schemes. |
-| Index | `"237"` | `0`–`255`: the 16 ANSI colours, the colour cube, and the greyscale ramp (232–255). |
+| Index | `"237"` | `0`–`255`: the 16 ANSI colors, the color cube, and the grayscale ramp (232–255). |
 
 The accepted names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
 `cyan`, `white`, and `gray` (`grey` also works), each with a `bright` form —
 `bright red`, `bright green`, and so on. `dark gray` and `bright black` are the
-same colour. Spaces, dashes and underscores are ignored and case does not
+same color. Spaces, dashes and underscores are ignored and case does not
 matter, so `"bright green"`, `"bright-green"` and `"BrightGreen"` are one thing.
 
 #### A worked example
@@ -924,17 +924,17 @@ any other key in this file.
 
 #### Why `light` is not just `dark` with different values
 
-On a highlighted line ichigo steps every colour away from the band behind it, or
+On a highlighted line ichigo steps every color away from the band behind it, or
 the line you are reading would be the least legible one on screen. On a dark
 theme "away" means brighter, and asking the terminal for the *bright* variant of
-a colour name does it. On a light theme the ANSI bright variants are usually
+a color name does it. On a light theme the ANSI bright variants are usually
 **darker** than their base, so the same move pushes the wrong way — that is a
-wrong assumption rather than a bad colour, and no palette of names can fix it.
+wrong assumption rather than a bad color, and no palette of names can fix it.
 `light` is written in `#rrggbb` throughout precisely so ichigo can compute the
 direction from the band's own lightness instead of guessing.
 
 The practical upshot: if you are building a light palette of your own, use hex
-rather than colour names, or highlighted lines will fight you.
+rather than color names, or highlighted lines will fight you.
 
 ### When the file is wrong
 

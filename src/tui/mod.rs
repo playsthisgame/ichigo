@@ -786,7 +786,7 @@ fn split_pct_at(column: u16, total: u16) -> Option<u16> {
 ///
 /// `Halfblocks` is refused deliberately. It is `ratatui-image`'s universal
 /// fallback and would render *something* in any terminal, but a quarter-scale
-/// mosaic of colour blocks sitting in the response pane reads as what the
+/// mosaic of color blocks sitting in the response pane reads as what the
 /// server sent, and it isn't.
 ///
 /// Halfblocks is *also* what `from_query_stdio` reports when the terminal
