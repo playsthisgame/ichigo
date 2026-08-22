@@ -3,6 +3,7 @@ use colored::Colorize;
 use colored_json::ToColoredJson;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::{config::RequestConfig, utils::send_request};
 
@@ -13,27 +14,15 @@ pub fn run_request(config: &RequestConfig, vars: &mut HashMap<String, String>, v
                 vars.extend(found.params.clone());
             }
 
+    // Timed around `send_request` alone, which returns once the response's
+    // headers are in — the same thing `tester.rs` measures, so a single run and
+    // a load test of the same request report the same number rather than two
+    // that quietly mean different things. Reading the body is not in it.
+    let started = Instant::now();
     let response = send_request(config, vars, verbose)?;
+    let elapsed = started.elapsed();
 
-    if verbose {
-        let status = response.status();
-        let status_line = format!(
-            "{} {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("")
-        );
-        let status_colored = if status.is_success() {
-            status_line.green().bold()
-        } else if status.is_client_error() {
-            status_line.yellow().bold()
-        } else if status.is_server_error() {
-            status_line.red().bold()
-        } else {
-            status_line.normal().bold()
-        };
-        println!("{}", status_colored);
-        println!();
-    }
+    let status = response.status();
 
     let is_json = response
         .headers()
@@ -43,6 +32,31 @@ pub fn run_request(config: &RequestConfig, vars: &mut HashMap<String, String>, v
         .unwrap_or(false);
 
     let body_text = response.text().context("Failed to read response body")?;
+
+    // Printed after the body is read rather than before, because the size is
+    // part of the line and there is no size until then. Nothing else prints in
+    // between, so the summary still leads the output.
+    //
+    // Only under `--verbose`: a bare `run` prints the body and nothing else, so
+    // `ichigo run thing | jq` keeps working.
+    if verbose {
+        let summary = crate::utils::format_run_summary(
+            status,
+            elapsed,
+            &crate::media::human_size(body_text.len()),
+        );
+        let summary_colored = if status.is_success() {
+            summary.green().bold()
+        } else if status.is_client_error() {
+            summary.yellow().bold()
+        } else if status.is_server_error() {
+            summary.red().bold()
+        } else {
+            summary.normal().bold()
+        };
+        println!("{}", summary_colored);
+        println!();
+    }
 
     if !is_chain || verbose {
         if body_text.is_empty() {

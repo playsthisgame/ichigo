@@ -135,7 +135,8 @@ Variables replace `{{PLACEHOLDER}}` tokens anywhere in the config (url, headers,
 Flags:
 
 - `-v, --var KEY=VALUE` — set a variable
-- `--verbose` — print the full response (status, headers, body)
+- `--verbose` — print the full response: a `200 OK · 143 ms · 4.2 KB` summary
+  line, then the body
 - `-p, --profile` — use a named profile (see [Profiles](#profiles))
 
 ### Chaining requests
@@ -350,6 +351,38 @@ which flags are mapped, ignored, and refused.
 
 If the selected request has profiles, a profile picker appears before the variable input screen. Use `j`/`k` to choose a profile (or `(no profile)` to skip), then press Enter. Any variables not covered by the profile can still be filled in manually.
 
+#### The run summary
+
+Every run leads with one line saying what came back and how long it took:
+
+```
+200 OK · 143 ms · 4.2 KB
+
+{
+  "id": 42
+}
+```
+
+The time is measured around the request itself — sent to headers-in — which is
+exactly what [`test`](#test) averages, so a single run and a load test of the
+same request are quoting the same number. Downloading the body is not in it.
+The size is the body **as the server sent it**, not as the pane shows it:
+ichigo pretty-prints JSON, and counting the newlines it added would be
+reporting on ichigo rather than on the response.
+
+An image response folds its media detail into the same line rather than
+stacking a second summary under it:
+
+```
+200 OK · 143 ms · image/jpeg · 2121×1414 · 1.2 MB
+```
+
+The summary is ordinary text like everything else in the pane, so `c` copies it
+along with the body. Filter or use `y` if you want the body on its own.
+
+`ichigo run --verbose` prints the same line. A bare `ichigo run` still prints
+the body and nothing else, so piping into `jq` is unaffected.
+
 #### Response headers
 
 A response's headers are hidden to start — the body is what a run is for — and
@@ -383,10 +416,10 @@ filter does: the lines underneath them have moved.
 #### Image responses
 
 A response whose content type is `image/*` is drawn in the response pane,
-underneath a summary line:
+underneath its summary line:
 
 ```
-image/jpeg · 2121×1414 · 1.2 MB
+200 OK · 143 ms · image/jpeg · 2121×1414 · 1.2 MB
 ```
 
 The summary is always there, and it is real text — `f`, `y`, `V` and `c` work on
