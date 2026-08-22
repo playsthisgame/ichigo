@@ -210,6 +210,9 @@ The hint line at the bottom of the screen carries only the handful of keys you
 reach for most; press `?` for the full keymap, grouped by what it does. Any key
 dismisses it.
 
+The TUI ships a dark and a light palette, and every colour in it is
+configurable — see [Themes](#themes).
+
 **Resizing the panes.** Drag the divider between the list and the detail pane
 with the mouse; it works in every mode, so you can widen the detail pane while a
 response or a form is up. The width a session *starts* at is
@@ -322,6 +325,9 @@ without fighting your terminal's text selection:
 | `f` | Filter to matching lines |
 | `c` | Copy everything the pane is showing |
 | `H` | Show / hide the response headers |
+
+The cursor line and the selection are drawn as bands whose colours — like every
+other colour in the TUI — you can change; see [Themes](#themes).
 
 Copying this way beats dragging with the mouse: a terminal's selection is
 linear, so a drag that spans more than one row also takes the request list and
@@ -812,24 +818,106 @@ never remapped, an **ANSI name** (`"green"`, `"bright green"`) follows your
 terminal so ichigo keeps matching when you change schemes, and an **index**
 `0`–`255` reaches the greyscale ramp and the colour cube.
 
-The twenty-two roles:
+Every role, and what it paints:
 
-| Group | Roles |
-| ----- | ----- |
-| **UI** | `text`, `dim`, `accent`, `border`, `border_focus`, `badge_text`, `cursor_line`, `selection`, `row_selected`, `row_selected_text`, `variable`, `folder` |
-| **Status** | `success` (2xx, `POST`), `info` (3xx, `GET`), `warning` (4xx, `PUT`/`PATCH`), `error` (5xx, `DELETE`) |
-| **JSON** | `json_key`, `json_string`, `json_number`, `json_bool`, `json_null`, `json_punct` |
+**UI**
+
+| Role | What it colours |
+| ---- | --------------- |
+| `text` | Primary text: field values, list rows, the filter you are typing |
+| `dim` | Everything secondary — labels, hints, tree prefixes, descriptions, disabled rows |
+| `accent` | The focused thing: a focused field's label, the key names in the hint line, the active filter border |
+| `border` | Pane borders at rest |
+| `border_focus` | The border of the pane that has focus |
+| `badge_text` | Ink drawn *on* a coloured badge, such as the status code beside " Response " |
+| `cursor_line` | The band under the cursor line in the response pane |
+| `selection` | The band under a `V` selection, a step louder than `cursor_line` |
+| `row_selected` | The highlighted row in the request list and the profile pickers, and the `VISUAL` badge |
+| `row_selected_text` | Ink on `row_selected` |
+| `variable` | `{{VAR}}` placeholders, profile names, the `CHAIN` badge, and the profile panes' borders |
+| `folder` | Folder rows and their borders, and the `?` overlay's column headings |
+
+**Status** — each also colours the matching HTTP method in the request list:
+
+| Role | What it colours |
+| ---- | --------------- |
+| `success` | 2xx, and `POST` |
+| `info` | 3xx, and `GET` |
+| `warning` | 4xx, and `PUT` / `PATCH` |
+| `error` | 5xx, `DELETE`, and error panes |
+
+**JSON** — the response body's syntax colouring:
+
+| Role | What it colours |
+| ---- | --------------- |
+| `json_key` | `"name"` |
+| `json_string` | `"strawberry"` |
+| `json_number` | `42` |
+| `json_bool` | `true`, `false` |
+| `json_null` | `null` |
+| `json_punct` | Braces, brackets, colons, commas |
 
 Status and JSON are separate on purpose even where they start out the same
 colour: `success` and `json_string` are both green in the dark theme, and
 splitting them is what lets you recolour a 2xx without recolouring every string
 in every response body.
 
-`cursor_line` and `selection` are the two bands in the response pane — the row
-under the cursor, and a `V` selection. `row_selected` is the highlighted row in
-the request list and the profile pickers, with `row_selected_text` as the ink on
-it. That ink is a separate role because it has to contrast with the *selection*
-rather than with the page, which is exactly what a light theme makes obvious.
+`row_selected_text` is a separate role rather than reusing `text` because it has
+to contrast with the *selection* rather than with the page — a distinction a
+light theme makes obvious and a dark one hides.
+
+#### Colour specs
+
+| Form | Example | Notes |
+| ---- | ------- | ----- |
+| Hex | `"#fabd2f"` | Exact. No terminal theme can remap it. Six digits, `#` required. |
+| ANSI name | `"green"`, `"bright green"` | Follows your terminal, so ichigo keeps matching when you change schemes. |
+| Index | `"237"` | `0`–`255`: the 16 ANSI colours, the colour cube, and the greyscale ramp (232–255). |
+
+The accepted names are `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+`cyan`, `white`, and `gray` (`grey` also works), each with a `bright` form —
+`bright red`, `bright green`, and so on. `dark gray` and `bright black` are the
+same colour. Spaces, dashes and underscores are ignored and case does not
+matter, so `"bright green"`, `"bright-green"` and `"BrightGreen"` are one thing.
+
+#### A worked example
+
+Matching ichigo to gruvbox exactly, rather than letting it inherit the ANSI
+approximations:
+
+```toml
+[theme]
+name = "dark"
+
+[theme.colors]
+text              = "#ebdbb2"
+dim               = "#928374"
+accent            = "#fabd2f"
+border            = "#504945"
+border_focus      = "#8ec07c"
+badge_text        = "#282828"
+cursor_line       = "#3c3836"   # gruvbox bg1
+selection         = "#665c54"   # gruvbox bg3
+row_selected      = "#458588"
+row_selected_text = "#fbf1c7"
+variable          = "#d3869b"
+folder            = "#83a598"
+
+success = "#b8bb26"
+info    = "#83a598"
+warning = "#fabd2f"
+error   = "#fb4934"
+
+json_key    = "#fabd2f"
+json_string = "#b8bb26"
+json_number = "#d3869b"
+json_bool   = "#fe8019"
+json_null   = "#fb4934"
+json_punct  = "#928374"
+```
+
+You rarely need all of it. Setting `name` and two or three roles is the common
+case — everything you leave out keeps the value from the theme you named.
 
 A misspelled role is refused by name rather than silently ignored, the same as
 any other key in this file.
