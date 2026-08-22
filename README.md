@@ -717,6 +717,8 @@ Every option ichigo currently understands.
 | ------ | ---- | ------- | ------------ |
 | `keys.insert_escape` | string, exactly two characters | unset — `Esc` only | A two-key sequence that leaves insert mode in a TUI text field, the equivalent of vim's `inoremap jk <Esc>`. See [Editing text fields](#editing-text-fields). |
 | `layout.split_pct` | integer, 15–85 | `35` | The request list's share of the TUI width, as a percentage. The rest goes to the detail pane. |
+| `theme.name` | `"dark"` or `"light"` | `"dark"` | Which built-in palette to start from. See [Themes](#themes). |
+| `theme.colors.*` | colour spec | from `theme.name` | Overrides one role of that palette. Twenty-two roles; see [Themes](#themes). |
 
 A complete file, with every option set:
 
@@ -726,6 +728,12 @@ insert_escape = "jk"
 
 [layout]
 split_pct = 35
+
+[theme]
+name = "dark"
+
+[theme.colors]
+accent = "#fabd2f"      # override as many or as few roles as you like
 ```
 
 Any option you leave out keeps its default, and an empty file — or no file at
@@ -767,6 +775,78 @@ Because the TUI captures the mouse to do this, your terminal's own click-drag
 text selection is unavailable while ichigo is running. Most terminals still give
 it to you with **Shift** held down (**Option** on macOS), and the response
 pane's own `V`/`y` copy works regardless.
+
+### Themes
+
+ichigo ships two palettes:
+
+```toml
+[theme]
+name = "dark"    # the default: what ichigo has always looked like
+# name = "light" # for a light terminal background
+```
+
+**`dark` is mostly ANSI colour names on purpose.** It asks the terminal for
+"yellow" rather than for `#fabd2f`, so it inherits *your* scheme — gruvbox,
+nord, solarized, whatever you switch to next — without ichigo shipping a
+palette for each. `light` cannot work that way (see below) and so is written in
+exact colours throughout.
+
+#### Overriding roles
+
+Nothing in ichigo names a colour; it names what the colour is *for*. Those roles
+are what you override, on top of whichever `name` you picked:
+
+```toml
+[theme]
+name = "dark"
+
+[theme.colors]
+accent      = "#fabd2f"   # exact colour, immune to your terminal's palette
+json_string = "green"     # an ANSI name, which follows your terminal's theme
+cursor_line = "237"       # a 0-255 palette index
+```
+
+Three forms of colour spec, and the choice matters: **`#rrggbb`** is exact and
+never remapped, an **ANSI name** (`"green"`, `"bright green"`) follows your
+terminal so ichigo keeps matching when you change schemes, and an **index**
+`0`–`255` reaches the greyscale ramp and the colour cube.
+
+The twenty-two roles:
+
+| Group | Roles |
+| ----- | ----- |
+| **UI** | `text`, `dim`, `accent`, `border`, `border_focus`, `badge_text`, `cursor_line`, `selection`, `row_selected`, `row_selected_text`, `variable`, `folder` |
+| **Status** | `success` (2xx, `POST`), `info` (3xx, `GET`), `warning` (4xx, `PUT`/`PATCH`), `error` (5xx, `DELETE`) |
+| **JSON** | `json_key`, `json_string`, `json_number`, `json_bool`, `json_null`, `json_punct` |
+
+Status and JSON are separate on purpose even where they start out the same
+colour: `success` and `json_string` are both green in the dark theme, and
+splitting them is what lets you recolour a 2xx without recolouring every string
+in every response body.
+
+`cursor_line` and `selection` are the two bands in the response pane — the row
+under the cursor, and a `V` selection. `row_selected` is the highlighted row in
+the request list and the profile pickers, with `row_selected_text` as the ink on
+it. That ink is a separate role because it has to contrast with the *selection*
+rather than with the page, which is exactly what a light theme makes obvious.
+
+A misspelled role is refused by name rather than silently ignored, the same as
+any other key in this file.
+
+#### Why `light` is not just `dark` with different values
+
+On a highlighted line ichigo steps every colour away from the band behind it, or
+the line you are reading would be the least legible one on screen. On a dark
+theme "away" means brighter, and asking the terminal for the *bright* variant of
+a colour name does it. On a light theme the ANSI bright variants are usually
+**darker** than their base, so the same move pushes the wrong way — that is a
+wrong assumption rather than a bad colour, and no palette of names can fix it.
+`light` is written in `#rrggbb` throughout precisely so ichigo can compute the
+direction from the band's own lightness instead of guessing.
+
+The practical upshot: if you are building a light palette of your own, use hex
+rather than colour names, or highlighted lines will fight you.
 
 ### When the file is wrong
 

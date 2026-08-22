@@ -10,6 +10,32 @@ use ratatui_image::StatefulImage;
 use super::edit::Edit;
 use super::{App, DiscardChoice, Mode, PairKind, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
+use crate::theme::{Theme, emphasize};
+use std::sync::OnceLock;
+
+/// The palette every draw function reads.
+///
+/// A `OnceLock` rather than a `&Theme` threaded through the renderer. Thirty
+/// three of this file's fifty two functions draw something coloured, and they
+/// call each other — passing an immutable, process-wide value down all of them
+/// would add a parameter to two thirds of the file and tell a reader nothing at
+/// any of the call sites. `draw_response` already takes thirteen arguments.
+///
+/// Written once from `App::new`, before the first frame, and never again: the
+/// config is read at launch and there is no reload. First write wins, so a
+/// second call cannot swap the palette mid-session.
+static THEME: OnceLock<Theme> = OnceLock::new();
+
+/// Installs the configured palette. Call before the first `draw`.
+pub(super) fn install_theme(theme: Theme) {
+    THEME.set(theme).ok();
+}
+
+/// The palette, or the dark one if nothing was installed — a renderer test
+/// draws with the default rather than panicking on an empty cell.
+fn theme() -> &'static Theme {
+    THEME.get_or_init(Theme::default)
+}
 
 /// One text field's value with the caret drawn where it sits.
 ///
@@ -41,17 +67,17 @@ fn spans_with_caret(value: &str, caret: Option<(usize, bool)>, color: Color) -> 
         .last()
         .unwrap_or(0);
     let (before, after) = value.split_at(caret);
-    let cursor = Style::default().fg(Color::Black).bg(Color::White);
+    let cursor = Style::default().fg(theme().badge_text).bg(theme().text);
 
     let mut spans = vec![Span::styled(before.to_string(), text)];
     match (insert, after.chars().next()) {
         (true, _) => {
-            spans.push(Span::styled("│", Style::default().fg(Color::White)));
+            spans.push(Span::styled("│", Style::default().fg(theme().text)));
             spans.push(Span::styled(after.to_string(), text));
         }
         // Normal mode past the end of the line happens only on an empty value;
         // `Edit` pulls the caret back onto a character otherwise.
-        (false, None) => spans.push(Span::styled("█", Style::default().fg(Color::White))),
+        (false, None) => spans.push(Span::styled("█", Style::default().fg(theme().text))),
         (false, Some(under)) => {
             spans.push(Span::styled(under.to_string(), cursor));
             spans.push(Span::styled(after[under.len_utf8()..].to_string(), text));
@@ -69,7 +95,7 @@ fn spans_with_caret(value: &str, caret: Option<(usize, bool)>, color: Color) -> 
 /// ending in a newline, which is exactly the empty last line the caret sits on
 /// after pressing Enter.
 fn text_area_lines(value: &str, edit: Option<&Edit>, indent: &str) -> Vec<Line<'static>> {
-    let color = if edit.is_some() { Color::White } else { Color::DarkGray };
+    let color = if edit.is_some() { theme().text } else { theme().dim };
     let mut start = 0;
     let mut lines = Vec::new();
     for segment in value.split('\n') {
@@ -102,19 +128,19 @@ fn action_row(label: &str, color: Color, hint: &str, is_focused: bool) -> Line<'
     let mut spans = vec![
         Span::styled(
             if is_focused { "▸ " } else { "  " },
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().success).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             label.to_string(),
             Style::default()
-                .fg(if is_focused { Color::Green } else { color })
+                .fg(if is_focused { theme().success } else { color })
                 .add_modifier(Modifier::BOLD),
         ),
     ];
     if is_focused {
         spans.push(Span::styled(
             format!("  {hint}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         ));
     }
     Line::from(spans)
@@ -179,8 +205,8 @@ fn window(len: usize, caret: usize, width: usize) -> Window {
 /// window is drawn whole and clipped by the pane, which is what every row did
 /// before there was a window at all.
 fn input_line(value: &str, caret: Option<&Edit>, width: u16) -> Line<'static> {
-    let color = if caret.is_some() { Color::White } else { Color::DarkGray };
-    let mut spans = vec![Span::styled("  > ", Style::default().fg(Color::DarkGray))];
+    let color = if caret.is_some() { theme().text } else { theme().dim };
+    let mut spans = vec![Span::styled("  > ", Style::default().fg(theme().dim))];
 
     // Only the focused row has a caret to keep on screen. The rest are cut off
     // at the border as before: without a caret there is no one place in the
@@ -196,7 +222,7 @@ fn input_line(value: &str, caret: Option<&Edit>, width: u16) -> Line<'static> {
 
     let from = chars.get(win.start).map_or(value.len(), |(i, _)| *i);
     let to = chars.get(win.end).map_or(value.len(), |(i, _)| *i);
-    let marker = Style::default().fg(Color::DarkGray);
+    let marker = Style::default().fg(theme().dim);
     if win.left {
         spans.push(Span::styled("‹", marker));
     }
@@ -509,29 +535,37 @@ fn draw_list(
         let display = if filter_active { format!("{}█", filter) } else { filter.to_string() };
         let filter_widget = Paragraph::new(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(display, Style::default().fg(Color::White)),
+            Span::styled(display, Style::default().fg(theme().text)),
         ]))
         .block(
             Block::default()
                 .title(" Filter ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if filter_active { Color::Yellow } else { Color::DarkGray })),
+                .border_style(Style::default().fg(if filter_active { theme().accent } else { theme().border })),
         );
         frame.render_widget(filter_widget, chunks[0]);
     }
 
+    // `highlight_style` is the whole of the selected row's colouring: ratatui
+    // applies it with `set_style` over the row's cells, which overwrites the
+    // foreground every span carries. That is why `row_selected_text` has to be
+    // legible on `row_selected` by itself — a method label's own colour is not
+    // showing there, in any theme, and stepping the spans away from the
+    // background the way the response pane does would be dead code.
     let (items, highlight_sym): (Vec<ListItem>, &str) = if let Some(rows) = tree_rows {
-        let items = rows.iter().map(|row| match row {
+        let items = rows.iter().map(|row| ListItem::new(match row {
             VisibleRow::Folder { path, expanded, prefix, .. } => {
                 make_tree_folder_item(path, *expanded, prefix, use_nerd_fonts)
             }
             VisibleRow::Leaf { entry_idx, prefix, .. } => {
                 make_tree_leaf_item(&entries[*entry_idx], prefix, use_nerd_fonts)
             }
-        }).collect();
+        })).collect();
         (items, "▶ ")
     } else {
-        let items = filtered.iter().map(|&i| make_list_item(&entries[i])).collect();
+        let items = filtered.iter()
+            .map(|&i| ListItem::new(make_list_item(&entries[i])))
+            .collect();
         (items, "▶ ")
     };
 
@@ -540,12 +574,12 @@ fn draw_list(
             Block::default()
                 .title(" Requests ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Blue)),
+                .border_style(Style::default().fg(theme().folder)),
         )
         .highlight_style(
             Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
+                .bg(theme().row_selected)
+                .fg(theme().row_selected_text)
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol(highlight_sym);
@@ -560,7 +594,7 @@ fn draw_detail_browse(frame: &mut Frame, area: Rect, selected: Option<&Entry>) {
         Block::default()
             .title(" Details ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
+            .border_style(Style::default().fg(theme().folder)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -578,9 +612,9 @@ fn draw_profile_select(
 
     let is_none_selected = selected == 0;
     let none_style = if is_none_selected {
-        Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
+        Style::default().fg(theme().row_selected_text).bg(theme().row_selected).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme().dim)
     };
     rows.mark(is_none_selected, lines.len(), lines.len() + 1);
     lines.push(Line::from(Span::styled("  (no profile)", none_style)));
@@ -590,9 +624,9 @@ fn draw_profile_select(
         let is_selected = selected == i + 1;
         let at = lines.len();
         let name_style = if is_selected {
-            Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme().row_selected_text).bg(theme().row_selected).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme().text)
         };
         lines.push(Line::from(Span::styled(
             format!("  {}", profile.name),
@@ -600,8 +634,8 @@ fn draw_profile_select(
         )));
         for (k, v) in &profile.params {
             lines.push(Line::from(vec![
-                Span::styled(format!("    {}: ", k), Style::default().fg(Color::DarkGray)),
-                Span::styled(v.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("    {}: ", k), Style::default().fg(theme().dim)),
+                Span::styled(v.clone(), Style::default().fg(theme().dim)),
             ]));
         }
         rows.mark(is_selected, at, lines.len());
@@ -613,7 +647,7 @@ fn draw_profile_select(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .border_style(Style::default().fg(theme().variable)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -632,7 +666,7 @@ fn pane_title(title: &str, unsaved: bool) -> Line<'static> {
     if unsaved {
         spans.push(Span::styled(
             UNSAVED_MARKER,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
         ));
     }
     Line::from(spans)
@@ -668,11 +702,11 @@ fn draw_new_request(
         let mut label_spans = vec![Span::styled(
             format!("  {}", label),
             Style::default()
-                .fg(if is_focused { Color::Green } else { Color::DarkGray })
+                .fg(if is_focused { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )];
         if is_required {
-            label_spans.push(Span::styled(" *", Style::default().fg(Color::Red)));
+            label_spans.push(Span::styled(" *", Style::default().fg(theme().error)));
         }
         lines.push(Line::from(label_spans));
 
@@ -684,9 +718,9 @@ fn draw_new_request(
     // The rows Tab reaches after the last field. Their state is on the row
     // itself, so focus is the marker and the colour rather than a caret.
     let (global_check, global_color) = if global {
-        ("[x] global", Color::Cyan)
+        ("[x] global", theme().info)
     } else {
-        ("[ ] global", Color::DarkGray)
+        ("[ ] global", theme().dim)
     };
     let at = lines.len();
     lines.push(action_row(
@@ -703,22 +737,22 @@ fn draw_new_request(
     let at = lines.len();
     lines.push(action_row(
         "headers",
-        Color::DarkGray,
+        theme().dim,
         "Enter to edit",
         focused == fields.len() + 1,
     ));
     if headers.is_empty() {
         lines.push(Line::from(Span::styled(
             "    none",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
     } else {
         let mut sorted: Vec<(&String, &String)> = headers.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (k, v) in sorted {
             lines.push(Line::from(vec![
-                Span::styled(format!("    {}: ", k), Style::default().fg(Color::Cyan)),
-                Span::styled(v.clone(), Style::default().fg(Color::White)),
+                Span::styled(format!("    {}: ", k), Style::default().fg(theme().info)),
+                Span::styled(v.clone(), Style::default().fg(theme().text)),
             ]));
         }
     }
@@ -730,22 +764,22 @@ fn draw_new_request(
     let at = lines.len();
     lines.push(action_row(
         "query params",
-        Color::DarkGray,
+        theme().dim,
         "Enter to edit",
         focused == fields.len() + 2,
     ));
     if query.is_empty() {
         lines.push(Line::from(Span::styled(
             "    none",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
     } else {
         let mut sorted: Vec<(&String, &String)> = query.iter().collect();
         sorted.sort_by(|a, b| a.0.cmp(b.0));
         for (k, v) in sorted {
             lines.push(Line::from(vec![
-                Span::styled(format!("    {}: ", k), Style::default().fg(Color::Cyan)),
-                Span::styled(v.clone(), Style::default().fg(Color::White)),
+                Span::styled(format!("    {}: ", k), Style::default().fg(theme().info)),
+                Span::styled(v.clone(), Style::default().fg(theme().text)),
             ]));
         }
     }
@@ -756,24 +790,24 @@ fn draw_new_request(
     let at = lines.len();
     lines.push(action_row(
         "body",
-        Color::DarkGray,
+        theme().dim,
         "Enter to edit",
         focused == fields.len() + 3,
     ));
     match body {
         None => lines.push(Line::from(Span::styled(
             "    none",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         ))),
         Some(body) => {
             lines.push(Line::from(vec![
-                Span::styled("    content type: ", Style::default().fg(Color::Cyan)),
-                Span::styled(body.content_type.clone(), Style::default().fg(Color::White)),
+                Span::styled("    content type: ", Style::default().fg(theme().info)),
+                Span::styled(body.content_type.clone(), Style::default().fg(theme().text)),
             ]));
             for line in body_preview(&body.data) {
                 lines.push(Line::from(Span::styled(
                     format!("    {line}"),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme().text),
                 )));
             }
         }
@@ -787,25 +821,25 @@ fn draw_new_request(
     let at = lines.len();
     lines.push(action_row(
         "profiles",
-        Color::DarkGray,
+        theme().dim,
         "Enter to edit",
         focused == fields.len() + 4,
     ));
     if profiles.is_empty() {
         lines.push(Line::from(Span::styled(
             "    none",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
     } else {
         for profile in profiles {
             lines.push(Line::from(vec![
                 Span::styled("    ", Style::default()),
-                Span::styled(profile.name.clone(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(profile.name.clone(), Style::default().fg(theme().variable).add_modifier(Modifier::BOLD)),
             ]));
             for (k, v) in &profile.params {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("      {}: ", k), Style::default().fg(Color::DarkGray)),
-                    Span::styled(v.clone(), Style::default().fg(Color::White)),
+                    Span::styled(format!("      {}: ", k), Style::default().fg(theme().dim)),
+                    Span::styled(v.clone(), Style::default().fg(theme().text)),
                 ]));
             }
         }
@@ -816,7 +850,7 @@ fn draw_new_request(
     if let Some(err) = error {
         lines.push(Line::from(Span::styled(
             format!("  error: {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error),
         )));
     }
 
@@ -826,7 +860,7 @@ fn draw_new_request(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
+            .border_style(Style::default().fg(theme().success)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -882,7 +916,7 @@ fn draw_edit_body(
         Line::from(Span::styled(
             "  content type",
             Style::default()
-                .fg(if focused == 0 { Color::Green } else { Color::DarkGray })
+                .fg(if focused == 0 { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )),
         input_line(content_type, caret(focused == 0, edit), interior(area)),
@@ -890,7 +924,7 @@ fn draw_edit_body(
         Line::from(Span::styled(
             "  body",
             Style::default()
-                .fg(if focused == 1 { Color::Green } else { Color::DarkGray })
+                .fg(if focused == 1 { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )),
     ];
@@ -903,7 +937,7 @@ fn draw_edit_body(
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("  error: {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error),
         )));
     }
 
@@ -925,7 +959,7 @@ fn draw_edit_body(
         Block::default()
             .title(pane_title(" Body ", unsaved))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
+            .border_style(Style::default().fg(theme().success)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -935,15 +969,15 @@ fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&
         Line::raw(""),
         Line::from(Span::styled(
             "  Paste a cURL command, then Ctrl+s to import",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )),
         Line::raw(""),
     ];
 
     if buffer.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("  > ", Style::default().fg(Color::DarkGray)),
-            Span::styled("█", Style::default().fg(Color::White)),
+            Span::styled("  > ", Style::default().fg(theme().dim)),
+            Span::styled("█", Style::default().fg(theme().text)),
         ]));
     } else {
         // The cursor sits at the end of the last line: the buffer is only ever
@@ -953,7 +987,7 @@ fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&
             let text = if i == last { format!("{}█", line) } else { line.to_string() };
             lines.push(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(text, Style::default().fg(Color::White)),
+                Span::styled(text, Style::default().fg(theme().text)),
             ]));
         }
     }
@@ -962,7 +996,7 @@ fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             format!("  error: {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error),
         )));
     }
 
@@ -982,7 +1016,7 @@ fn draw_import_curl(frame: &mut Frame, area: Rect, buffer: &str, error: Option<&
             Block::default()
                 .title(" Import cURL ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)),
+                .border_style(Style::default().fg(theme().success)),
         );
     frame.render_widget(paragraph, area);
 }
@@ -1009,10 +1043,10 @@ fn draw_new_profile(
         Span::styled(
             "  profile name",
             Style::default()
-                .fg(if name_focused { Color::Green } else { Color::DarkGray })
+                .fg(if name_focused { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" *", Style::default().fg(Color::Red)),
+        Span::styled(" *", Style::default().fg(theme().error)),
     ]));
     lines.push(input_line(name, caret(name_focused, edit), interior(area)));
     rows.mark(name_focused, at, lines.len());
@@ -1027,7 +1061,7 @@ fn draw_new_profile(
         lines.push(Line::from(Span::styled(
             format!("  param {} key", i + 1),
             Style::default()
-                .fg(if key_focused { Color::Green } else { Color::DarkGray })
+                .fg(if key_focused { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(key, caret(key_focused, edit), interior(area)));
@@ -1037,7 +1071,7 @@ fn draw_new_profile(
         lines.push(Line::from(Span::styled(
             format!("  param {} value", i + 1),
             Style::default()
-                .fg(if val_focused { Color::Green } else { Color::DarkGray })
+                .fg(if val_focused { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(val_focused, edit), interior(area)));
@@ -1048,7 +1082,7 @@ fn draw_new_profile(
     if let Some(err) = error {
         lines.push(Line::from(Span::styled(
             format!("  error: {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error),
         )));
     }
 
@@ -1060,7 +1094,7 @@ fn draw_new_profile(
                 unsaved,
             ))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .border_style(Style::default().fg(theme().variable)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -1093,7 +1127,7 @@ fn draw_edit_pairs(
         lines.push(Line::from(Span::styled(
             format!("  {} {} name", noun, i + 1),
             Style::default()
-                .fg(if name_focused { Color::Green } else { Color::DarkGray })
+                .fg(if name_focused { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(name, caret(name_focused, edit), interior(area)));
@@ -1103,7 +1137,7 @@ fn draw_edit_pairs(
         lines.push(Line::from(Span::styled(
             format!("  {} {} value", noun, i + 1),
             Style::default()
-                .fg(if value_focused { Color::Green } else { Color::DarkGray })
+                .fg(if value_focused { theme().success } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(value_focused, edit), interior(area)));
@@ -1114,7 +1148,7 @@ fn draw_edit_pairs(
     if pairs.is_empty() {
         lines.push(Line::from(Span::styled(
             kind.empty_hint(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
         lines.push(Line::raw(""));
     }
@@ -1122,7 +1156,7 @@ fn draw_edit_pairs(
     if let Some(err) = error {
         lines.push(Line::from(Span::styled(
             format!("  error: {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().error),
         )));
     }
 
@@ -1131,7 +1165,7 @@ fn draw_edit_pairs(
         Block::default()
             .title(pane_title(kind.title(), unsaved))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme().border_focus)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -1154,16 +1188,16 @@ fn draw_profile_list(
         let marker = if is_selected { "  ▶ " } else { "    " };
         let at = lines.len();
         lines.push(Line::from(vec![
-            Span::styled(marker, Style::default().fg(Color::Magenta)),
+            Span::styled(marker, Style::default().fg(theme().variable)),
             Span::styled(
                 profile.name.clone(),
                 Style::default()
-                    .fg(if is_selected { Color::White } else { Color::Magenta })
+                    .fg(if is_selected { theme().text } else { theme().variable })
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("   {} var{}", profile.params.len(), if profile.params.len() == 1 { "" } else { "s" }),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme().dim),
             ),
         ]));
 
@@ -1174,8 +1208,8 @@ fn draw_profile_list(
             params.sort_by(|a, b| a.0.cmp(b.0));
             for (k, v) in params {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("      {}: ", k), Style::default().fg(Color::DarkGray)),
-                    Span::styled(v.clone(), Style::default().fg(Color::White)),
+                    Span::styled(format!("      {}: ", k), Style::default().fg(theme().dim)),
+                    Span::styled(v.clone(), Style::default().fg(theme().text)),
                 ]));
             }
         }
@@ -1188,12 +1222,12 @@ fn draw_profile_list(
     lines.push(Line::from(vec![
         Span::styled(
             if new_selected { "  ▶ " } else { "    " },
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme().success),
         ),
         Span::styled(
             "+ new profile",
             Style::default()
-                .fg(if new_selected { Color::White } else { Color::Green })
+                .fg(if new_selected { theme().text } else { theme().success })
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1202,11 +1236,11 @@ fn draw_profile_list(
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "  No profiles yet. A profile bundles {{VAR}} values under a name,",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
         lines.push(Line::from(Span::styled(
             "  so you can switch environments without retyping them.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
     }
 
@@ -1215,7 +1249,7 @@ fn draw_profile_list(
         Block::default()
             .title(pane_title(&format!(" Profiles — {} ", request_name), unsaved))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
+            .border_style(Style::default().fg(theme().variable)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -1239,7 +1273,7 @@ fn draw_var_input(
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
             Style::default()
-                .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
+                .fg(if is_focused { theme().accent } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(is_focused, edit), interior(area)));
@@ -1252,7 +1286,7 @@ fn draw_var_input(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(theme().accent)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -1276,7 +1310,7 @@ fn draw_test_input(
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
             Style::default()
-                .fg(if is_focused { Color::Yellow } else { Color::DarkGray })
+                .fg(if is_focused { theme().accent } else { theme().dim })
                 .add_modifier(Modifier::BOLD),
         )));
         lines.push(input_line(value, caret(is_focused, edit), interior(area)));
@@ -1289,7 +1323,7 @@ fn draw_test_input(
     lines.push(Line::from(Span::styled(
         "  iterations",
         Style::default()
-            .fg(if iter_focused { Color::Yellow } else { Color::DarkGray })
+            .fg(if iter_focused { theme().accent } else { theme().dim })
             .add_modifier(Modifier::BOLD),
     )));
     lines.push(input_line(iterations, caret(iter_focused, edit), interior(area)));
@@ -1300,7 +1334,7 @@ fn draw_test_input(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(theme().border_focus)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -1311,14 +1345,14 @@ fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::Tes
         Span::raw(" Test Results "),
         Span::styled(
             format!(" {} iterations ", iterations),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(theme().badge_text).bg(theme().info),
         ),
     ]);
 
     let outer = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme().border_focus));
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -1338,26 +1372,26 @@ fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::Tes
         gauge_lines.push(Line::from(vec![
             Span::styled(format!("  {:>3}  ", sc.status), Style::default().fg(color).add_modifier(Modifier::BOLD)),
             Span::styled("█".repeat(filled), Style::default().fg(color)),
-            Span::styled("░".repeat(empty), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("  ×{}", sc.count), Style::default().fg(Color::White)),
+            Span::styled("░".repeat(empty), Style::default().fg(theme().dim)),
+            Span::styled(format!("  ×{}", sc.count), Style::default().fg(theme().text)),
         ]));
     }
     let gauge_widget = Paragraph::new(gauge_lines).block(
         Block::default()
             .title(" Status Distribution ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
+            .border_style(Style::default().fg(theme().border)),
     );
     frame.render_widget(gauge_widget, chunks[0]);
 
     // Timing stats
     let stats = Paragraph::new(Line::from(vec![
-        Span::styled("  avg ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.2?}", results.avg), Style::default().fg(Color::Yellow)),
-        Span::styled("   min ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.2?}", results.min), Style::default().fg(Color::Green)),
-        Span::styled("   max ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{:.2?}", results.max), Style::default().fg(Color::Red)),
+        Span::styled("  avg ", Style::default().fg(theme().dim)),
+        Span::styled(format!("{:.2?}", results.avg), Style::default().fg(theme().accent)),
+        Span::styled("   min ", Style::default().fg(theme().dim)),
+        Span::styled(format!("{:.2?}", results.min), Style::default().fg(theme().success)),
+        Span::styled("   max ", Style::default().fg(theme().dim)),
+        Span::styled(format!("{:.2?}", results.max), Style::default().fg(theme().error)),
     ]));
     frame.render_widget(stats, chunks[1]);
 
@@ -1372,14 +1406,14 @@ fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::Tes
     let latency_dataset = Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(theme().info))
         .data(&latency_points);
     let latency_chart = Chart::new(vec![latency_dataset])
         .block(
             Block::default()
                 .title(" Latency (ms) ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme().border)),
         )
         .x_axis(
             Axis::default()
@@ -1394,10 +1428,10 @@ fn draw_test_results(frame: &mut Frame, area: Rect, results: &crate::tester::Tes
 }
 
 fn status_color(status: u16) -> Color {
-    if status < 300 { Color::Green }
-    else if status < 400 { Color::Cyan }
-    else if status < 500 { Color::Yellow }
-    else { Color::Red }
+    if status < 300 { theme().success }
+    else if status < 400 { theme().info }
+    else if status < 500 { theme().warning }
+    else { theme().error }
 }
 
 /// Returns the height of the body viewport (inside the borders).
@@ -1421,33 +1455,33 @@ fn draw_response(
     // A generated command is neither a response nor an error, so it gets its
     // own heading rather than borrowing a status code it doesn't have.
     let (heading, badge_color, badge) = match kind {
-        ResponseKind::Error => (" Response ", Color::Red, " Error ".to_string()),
+        ResponseKind::Error => (" Response ", theme().error, " Error ".to_string()),
         ResponseKind::Http(status) => {
             let color = if *status < 300 {
-                Color::Green
+                theme().success
             } else if *status < 400 {
-                Color::Cyan
+                theme().info
             } else if *status < 500 {
-                Color::Yellow
+                theme().accent
             } else {
-                Color::Red
+                theme().error
             };
             (" Response ", color, format!(" {} ", status))
         }
-        ResponseKind::Curl { copied: Ok(()) } => (" cURL ", Color::Green, " copied ".to_string()),
+        ResponseKind::Curl { copied: Ok(()) } => (" cURL ", theme().success, " copied ".to_string()),
         ResponseKind::Curl { copied: Err(e) } => {
-            (" cURL ", Color::Red, format!(" copy failed: {} ", e))
+            (" cURL ", theme().error, format!(" copy failed: {} ", e))
         }
     };
 
     let mut title_spans = vec![
         Span::raw(heading),
-        Span::styled(badge, Style::default().fg(Color::Black).bg(badge_color)),
+        Span::styled(badge, Style::default().fg(theme().badge_text).bg(badge_color)),
     ];
     if anchor.is_some() {
         title_spans.push(Span::styled(
             " VISUAL ",
-            Style::default().fg(Color::Black).bg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().row_selected_text).bg(theme().row_selected).add_modifier(Modifier::BOLD),
         ));
     }
     // The `H` toggle lives in the title rather than the hint line, which is
@@ -1459,16 +1493,16 @@ fn draw_response(
         title_spans.push(Span::styled(
             " H headers ",
             if show_headers {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme().badge_text).bg(theme().info).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme().dim)
             },
         ));
     }
     if let Some(status) = status {
         title_spans.push(Span::styled(
             format!(" {status} "),
-            Style::default().fg(Color::Black).bg(Color::Green),
+            Style::default().fg(theme().badge_text).bg(theme().success),
         ));
     }
     let title = Line::from(title_spans);
@@ -1490,13 +1524,13 @@ fn draw_response(
         let display = if response_filter_active { format!("{}█", response_filter) } else { response_filter.to_string() };
         let filter_widget = Paragraph::new(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(display, Style::default().fg(Color::White)),
+            Span::styled(display, Style::default().fg(theme().text)),
         ]))
         .block(
             Block::default()
                 .title(" Filter ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(if response_filter_active { Color::Yellow } else { Color::DarkGray })),
+                .border_style(Style::default().fg(if response_filter_active { theme().accent } else { theme().border })),
         );
         frame.render_widget(filter_widget, chunks[0]);
     }
@@ -1512,9 +1546,9 @@ fn draw_response(
         .enumerate()
         .map(|(i, line)| {
             if anchor.is_some() && i >= from && i <= to {
-                highlight(line, SELECTION_BG, Band::Text)
+                highlight(line, theme().selection, Band::Text)
             } else if anchor.is_none() && i == cursor {
-                highlight(line, CURSOR_LINE_BG, Band::Row(band_width))
+                highlight(line, theme().cursor_line, Band::Row(band_width))
             } else {
                 line
             }
@@ -1566,52 +1600,52 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         // come to 61, so there is room but not much — measure before adding an
         // eighth, and put it in `HELP_COLUMNS` instead if it does not fit.
         Mode::Browse => vec![
-            Span::styled(" r ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("run", Style::default().fg(Color::DarkGray)),
-            Span::styled("   t ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("test", Style::default().fg(Color::DarkGray)),
-            Span::styled("   n ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("new", Style::default().fg(Color::DarkGray)),
-            Span::styled("   e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("edit", Style::default().fg(Color::DarkGray)),
-            Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("filter", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ? ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("help", Style::default().fg(Color::DarkGray)),
-            Span::styled("   q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" r ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("run", Style::default().fg(theme().dim)),
+            Span::styled("   t ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("test", Style::default().fg(theme().dim)),
+            Span::styled("   n ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("new", Style::default().fg(theme().dim)),
+            Span::styled("   e ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("edit", Style::default().fg(theme().dim)),
+            Span::styled("   f ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("filter", Style::default().fg(theme().dim)),
+            Span::styled("   ? ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("help", Style::default().fg(theme().dim)),
+            Span::styled("   q ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("quit", Style::default().fg(theme().dim)),
         ],
         Mode::ImportCurl { .. } => vec![
-            Span::styled(" Ctrl+s ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("import", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("newline", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Ctrl+s ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("import", Style::default().fg(theme().dim)),
+            Span::styled("   Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("newline", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         Mode::ProfileSelect { .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("select", Style::default().fg(Color::DarkGray)),
-            Span::styled("   j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("navigate", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("select", Style::default().fg(theme().dim)),
+            Span::styled("   j/k ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("navigate", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         Mode::VarInput { .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("run", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("switch field", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("run", Style::default().fg(theme().dim)),
+            Span::styled("   Tab/S-Tab ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("switch field", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         Mode::TestInput { .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("run test", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab/S-Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("switch field", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("run test", Style::default().fg(theme().dim)),
+            Span::styled("   Tab/S-Tab ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("switch field", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         // 75 columns, and it has to stay under 80 — a terminal that narrow
         // truncates silently, hiding the tail rather than wrapping it. Adding
@@ -1624,102 +1658,102 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
         // is documented rather than hinted: `Tab` is already listed, and the
         // `body` row it reaches carries its own `Enter to edit`.
         Mode::NewRequest { .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("save", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("fields", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^e ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("headers", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("query", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^p ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("profiles", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("save", Style::default().fg(theme().dim)),
+            Span::styled("   Tab ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(theme().dim)),
+            Span::styled("   ^e ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("headers", Style::default().fg(theme().dim)),
+            Span::styled("   ^q ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("query", Style::default().fg(theme().dim)),
+            Span::styled("   ^p ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("profiles", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         // The noun follows `kind`, so the pane never says "header" while
         // editing query params.
         Mode::EditPairs { kind, .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("apply", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("fields", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("add {}", kind.noun()), Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("remove {}", kind.noun()), Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("apply", Style::default().fg(theme().dim)),
+            Span::styled("   Tab ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(theme().dim)),
+            Span::styled("   ^a ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("add {}", kind.noun()), Style::default().fg(theme().dim)),
+            Span::styled("   ^d ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("remove {}", kind.noun()), Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         // `^s apply` first, because it is the one key here that is not where a
         // form usually puts it — Enter types a newline in a body, so it cannot
         // also be the key that leaves.
         Mode::EditBody { .. } => vec![
-            Span::styled(" ^s ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("apply", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("newline", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("fields", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" ^s ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("apply", Style::default().fg(theme().dim)),
+            Span::styled("   Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("newline", Style::default().fg(theme().dim)),
+            Span::styled("   Tab ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         Mode::ProfileList { .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("edit", Style::default().fg(Color::DarkGray)),
-            Span::styled("   j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("navigate", Style::default().fg(Color::DarkGray)),
-            Span::styled("   n ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("new", Style::default().fg(Color::DarkGray)),
-            Span::styled("   d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("delete", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("back to request", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("edit", Style::default().fg(theme().dim)),
+            Span::styled("   j/k ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("navigate", Style::default().fg(theme().dim)),
+            Span::styled("   n ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("new", Style::default().fg(theme().dim)),
+            Span::styled("   d ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("delete", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("back to request", Style::default().fg(theme().dim)),
         ],
         Mode::NewProfile { .. } => vec![
-            Span::styled(" Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("save profile", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Tab ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("fields", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^a ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("add param", Style::default().fg(Color::DarkGray)),
-            Span::styled("   ^d ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("remove param", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("save profile", Style::default().fg(theme().dim)),
+            Span::styled("   Tab ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("fields", Style::default().fg(theme().dim)),
+            Span::styled("   ^a ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("add param", Style::default().fg(theme().dim)),
+            Span::styled("   ^d ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("remove param", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         Mode::ConfirmDelete { .. } => vec![
-            Span::styled(" y/Enter ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("confirm delete", Style::default().fg(Color::DarkGray)),
-            Span::styled("   n/Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" y/Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("confirm delete", Style::default().fg(theme().dim)),
+            Span::styled("   n/Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         // While selecting, the hints are only the keys that finish or abandon
         // the selection — everything else is noise with a half-made one on
         // screen.
         Mode::Response { anchor: Some(_), .. } => vec![
-            Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("extend", Style::default().fg(Color::DarkGray)),
-            Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy selection", Style::default().fg(Color::DarkGray)),
-            Span::styled("   V/Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(" j/k ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("extend", Style::default().fg(theme().dim)),
+            Span::styled("   y ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("copy selection", Style::default().fg(theme().dim)),
+            Span::styled("   V/Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
         Mode::Response { .. } | Mode::TestResponse { .. } => vec![
-            Span::styled(" j/k ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("move", Style::default().fg(Color::DarkGray)),
-            Span::styled("   V ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("select", Style::default().fg(Color::DarkGray)),
-            Span::styled("   y ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy line", Style::default().fg(Color::DarkGray)),
-            Span::styled("   f ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("filter", Style::default().fg(Color::DarkGray)),
-            Span::styled("   c ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("copy all", Style::default().fg(Color::DarkGray)),
-            Span::styled("   Esc ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("back", Style::default().fg(Color::DarkGray)),
-            Span::styled("   q ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled("quit", Style::default().fg(Color::DarkGray)),
+            Span::styled(" j/k ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("move", Style::default().fg(theme().dim)),
+            Span::styled("   V ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("select", Style::default().fg(theme().dim)),
+            Span::styled("   y ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("copy line", Style::default().fg(theme().dim)),
+            Span::styled("   f ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("filter", Style::default().fg(theme().dim)),
+            Span::styled("   c ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("copy all", Style::default().fg(theme().dim)),
+            Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("back", Style::default().fg(theme().dim)),
+            Span::styled("   q ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("quit", Style::default().fg(theme().dim)),
         ],
     };
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -1773,7 +1807,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     for (title, _) in HELP_COLUMNS {
         header.push(Span::styled(
             format!("{:<width$}", title, width = HELP_KEY_WIDTH + HELP_LABEL_WIDTH),
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme().folder).add_modifier(Modifier::BOLD),
         ));
     }
     lines.push(Line::from(header));
@@ -1786,11 +1820,11 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
                 Some((key, label)) => {
                     spans.push(Span::styled(
                         format!("{:<width$}", key, width = HELP_KEY_WIDTH),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
                     ));
                     spans.push(Span::styled(
                         format!("{:<width$}", label, width = HELP_LABEL_WIDTH),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(theme().text),
                     ));
                 }
                 // Columns are ragged; pad so the next one still lines up.
@@ -1803,10 +1837,10 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("  quit          ", Style::default().fg(Color::DarkGray)),
-        Span::styled("any key", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("  close this", Style::default().fg(Color::DarkGray)),
+        Span::styled("q", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  quit          ", Style::default().fg(theme().dim)),
+        Span::styled("any key", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  close this", Style::default().fg(theme().dim)),
     ]));
 
     let height = lines.len() as u16 + 2; // + borders
@@ -1816,7 +1850,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         Block::default()
             .title(" Keys ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
+            .border_style(Style::default().fg(theme().folder)),
     );
 
     // Clear first: the pane underneath has already been drawn into these cells.
@@ -1841,7 +1875,7 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) 
         Line::raw(""),
         Line::from(Span::styled(
             "  This request has unsaved changes.",
-            Style::default().fg(Color::White),
+            Style::default().fg(theme().text),
         )),
         Line::raw(""),
     ];
@@ -1852,9 +1886,9 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) 
         // looks like a list wherever one turns up.
         let marker = if is_selected { "  ▶ " } else { "    " };
         let label_style = if is_selected {
-            Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD)
+            Style::default().fg(theme().row_selected_text).bg(theme().row_selected).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme().text)
         };
         lines.push(Line::from(vec![
             Span::raw(marker),
@@ -1865,17 +1899,17 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) 
         ]));
         lines.push(Line::from(Span::styled(
             format!("      {}", choice.hint()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )));
         lines.push(Line::raw(""));
     }
 
     lines.push(Line::from(vec![
         Span::raw("  "),
-        Span::styled("j/k", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("  move    ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Enter", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        Span::styled("  choose", Style::default().fg(Color::DarkGray)),
+        Span::styled("j/k", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  move    ", Style::default().fg(theme().dim)),
+        Span::styled("Enter", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  choose", Style::default().fg(theme().dim)),
     ]));
 
     let height = lines.len() as u16 + 2; // + borders
@@ -1885,7 +1919,7 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) 
         Block::default()
             .title(" Unsaved changes ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
+            .border_style(Style::default().fg(theme().accent)),
     );
 
     // Clear first: the form underneath has already been drawn into these cells.
@@ -1916,23 +1950,23 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
     let lines: Vec<Line<'static>> = vec![
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  Delete  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(entry_name.to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-            Span::styled("?", Style::default().fg(Color::DarkGray)),
+            Span::styled("  Delete  ", Style::default().fg(theme().dim)),
+            Span::styled(entry_name.to_string(), Style::default().fg(theme().text).add_modifier(Modifier::BOLD)),
+            Span::styled("?", Style::default().fg(theme().dim)),
         ]),
         Line::raw(""),
         Line::from(Span::styled(
             "  This action cannot be undone.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme().dim),
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  y / Enter  ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::styled("yes, delete", Style::default().fg(Color::DarkGray)),
+            Span::styled("  y / Enter  ", Style::default().fg(theme().error).add_modifier(Modifier::BOLD)),
+            Span::styled("yes, delete", Style::default().fg(theme().dim)),
         ]),
         Line::from(vec![
-            Span::styled("  n / Esc    ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled("  n / Esc    ", Style::default().fg(theme().success).add_modifier(Modifier::BOLD)),
+            Span::styled("cancel", Style::default().fg(theme().dim)),
         ]),
     ];
 
@@ -1940,7 +1974,7 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
         Block::default()
             .title(" Confirm Delete ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)),
+            .border_style(Style::default().fg(theme().error)),
     );
     frame.render_widget(paragraph, area);
 }
@@ -1948,11 +1982,16 @@ fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Style applied to a `{{VAR}}` placeholder wherever one is shown verbatim.
-const VAR_STYLE: Style = Style::new()
-    .fg(Color::Magenta)
-    .add_modifier(Modifier::BOLD);
+/// How a `{{VAR}}` placeholder is drawn.
+///
+/// A function rather than the `const` it was, because the colour now comes from
+/// the palette and a `const` cannot read one. The `Style` is still built the
+/// same way and is still the single definition the tests compare against.
+fn var_style() -> Style {
+    Style::new().fg(theme().variable).add_modifier(Modifier::BOLD)
+}
 
-/// Splits `text` into spans so `{{VAR}}` placeholders render in [`VAR_STYLE`]
+/// Splits `text` into spans so `{{VAR}}` placeholders render in [`var_style`]
 /// and everything else keeps `base`.
 ///
 /// The scan matches `extract_var_names` in `mod.rs` — the pane must highlight
@@ -1971,7 +2010,7 @@ fn var_spans(text: &str, base: Style) -> Vec<Span<'static>> {
         }
         spans.push(Span::styled(
             format!("{{{{{}}}}}", &after[..end]),
-            VAR_STYLE,
+            var_style(),
         ));
         rest = &after[end + 2..];
     }
@@ -1981,33 +2020,6 @@ fn var_spans(text: &str, base: Style) -> Vec<Span<'static>> {
     }
     spans
 }
-
-/// The band under the cursor line, and the one under a selection.
-///
-/// Two neutral greys, a step apart: the cursor line is always somewhere, so it
-/// is the quieter, and entering visual mode lifts it to something you cannot
-/// miss. That step is the vim `CursorLine` → `Visual` relationship, and the
-/// values are calibrated against it — gruvbox puts its `CursorLine` about ΔE 8
-/// from the page and its `Visual` about ΔE 25, and these land at 8.3 and 21.3.
-///
-/// Indexed rather than named colours, which matters twice over. `Blue` and
-/// `DarkGray` are whatever the reader's theme says they are, and that is
-/// exactly how the old highlight went wrong — `colorize_json_line` paints
-/// punctuation `DarkGray`, so the cursor line's `DarkGray` background erased
-/// every brace, colon and comma on the line it was meant to be showing you. A
-/// background a foreground can collide with has to be a known value. These come
-/// from the **greyscale ramp** (232–255) rather than the colour cube, which is
-/// the half of the 256 palette nothing remaps: `base16-shell` and friends
-/// rewrite 16–21 to carry their extra shades, so a band living there could
-/// become an arbitrary colour and re-create the collision. The ramp also needs
-/// no truecolor, so it survives a tmux without `Tc`.
-///
-/// Grey rather than a hue because a neutral band sits inside any palette — a
-/// warm scheme like gruvbox reads these as its own greys (ΔE 2.4 from its
-/// `bg1`) and a cold one does the same. When themes land these become the dark
-/// theme's values rather than the only ones.
-const CURSOR_LINE_BG: Color = Color::Indexed(237); // #3a3a3a, medium grey
-const SELECTION_BG: Color = Color::Indexed(240); // #585858, a step lighter
 
 /// How far a band runs, which is the difference between marking a *position*
 /// and marking an *extent*.
@@ -2056,10 +2068,7 @@ fn highlight(line: Line<'static>, bg: Color, band: Band) -> Line<'static> {
         .spans
         .into_iter()
         .map(|span| match span.style.fg {
-            Some(fg) => {
-                let style = span.style.fg(brighten(fg));
-                Span::styled(span.content, style)
-            }
+            Some(fg) => Span::styled(span.content, span.style.fg(emphasize(fg, bg))),
             // No foreground of its own: the indent, which is spaces.
             None => span,
         })
@@ -2070,47 +2079,24 @@ fn highlight(line: Line<'static>, bg: Color, band: Band) -> Line<'static> {
     Line::from(spans).style(Style::default().bg(bg).add_modifier(Modifier::BOLD))
 }
 
-/// The bright twin of a syntax colour.
-///
-/// `DarkGray` is the one that is not a twin but a rescue: its bright partner
-/// would be `Gray`, which is still dim enough to lose against a highlight, and
-/// punctuation is the part of a JSON line you most need in order to read the
-/// structure. It goes to `White`.
-///
-/// Anything already bright, or with no dark twin, is returned unchanged, so
-/// this stays safe to run over spans it was not written for.
-fn brighten(color: Color) -> Color {
-    match color {
-        Color::DarkGray => Color::White,
-        Color::Red => Color::LightRed,
-        Color::Green => Color::LightGreen,
-        Color::Yellow => Color::LightYellow,
-        Color::Blue => Color::LightBlue,
-        Color::Magenta => Color::LightMagenta,
-        Color::Cyan => Color::LightCyan,
-        Color::Gray => Color::White,
-        other => other,
-    }
-}
-
 fn colorize_json_value(val: &str) -> Vec<Span<'static>> {
     let (content, trailing) = val.strip_suffix(',').map_or((val, ""), |s| (s, ","));
 
     let color = if content.starts_with('"') {
-        Color::Green
+        theme().json_string
     } else if matches!(content, "true" | "false") {
-        Color::Magenta
+        theme().json_bool
     } else if content == "null" {
-        Color::Red
+        theme().json_null
     } else if matches!(content, "{" | "}" | "[" | "]" | "{}" | "[]") {
-        Color::DarkGray
+        theme().json_punct
     } else {
-        Color::Cyan // numbers
+        theme().json_number
     };
 
     let mut spans = vec![Span::styled(content.to_string(), Style::default().fg(color))];
     if !trailing.is_empty() {
-        spans.push(Span::styled(",".to_string(), Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(",".to_string(), Style::default().fg(theme().json_punct)));
     }
     spans
 }
@@ -2123,7 +2109,7 @@ fn colorize_json_line(line: &str) -> Line<'static> {
     if matches!(trimmed, "{" | "}" | "[" | "]" | "}," | "]," | "{}" | "[]" | "{}," | "[],") {
         return Line::from(vec![
             Span::raw(indent),
-            Span::styled(trimmed.to_string(), Style::default().fg(Color::DarkGray)),
+            Span::styled(trimmed.to_string(), Style::default().fg(theme().json_punct)),
         ]);
     }
 
@@ -2134,8 +2120,8 @@ fn colorize_json_line(line: &str) -> Line<'static> {
             let value = &trimmed[pos + 3..];          // skip ": "
             let mut spans = vec![
                 Span::raw(indent),
-                Span::styled(key, Style::default().fg(Color::Yellow)),
-                Span::styled(": ".to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(key, Style::default().fg(theme().json_key)),
+                Span::styled(": ".to_string(), Style::default().fg(theme().json_punct)),
             ];
             spans.extend(colorize_json_value(value));
             return Line::from(spans);
@@ -2204,12 +2190,16 @@ fn run_clipboard_backend(program: &str, args: &[&str], text: &str) -> bool {
 }
 
 fn method_color(method: &str) -> Color {
+    // Deliberately the status roles rather than four more of their own: a
+    // method and a response class mean the same things — safe, creates,
+    // changes, destroys — and giving them separate roles would be two knobs
+    // nobody wants to turn in opposite directions.
     match method {
-        "GET" => Color::Cyan,
-        "POST" => Color::Green,
-        "PUT" | "PATCH" => Color::Yellow,
-        "DELETE" => Color::Red,
-        _ => Color::White,
+        "GET" => theme().info,
+        "POST" => theme().success,
+        "PUT" | "PATCH" => theme().warning,
+        "DELETE" => theme().error,
+        _ => theme().text,
     }
 }
 
@@ -2236,7 +2226,7 @@ fn folder_name_spans(name: &str) -> Vec<Span<'static>> {
         Some(pos) => vec![
             Span::styled(
                 format!("{}/ ", &name[..pos]),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme().dim),
             ),
             Span::styled(
                 name[pos + 1..].to_string(),
@@ -2250,19 +2240,19 @@ fn folder_name_spans(name: &str) -> Vec<Span<'static>> {
     }
 }
 
-fn make_list_item(entry: &Entry) -> ListItem<'static> {
+fn make_list_item(entry: &Entry) -> Line<'static> {
     let scope = if entry.global { " global" } else { " local" };
-    let line = match &entry.kind {
+    match &entry.kind {
         EntryKind::Chain { .. } => {
             let mut spans = vec![
                 Span::styled(
                     " CHAIN ",
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme().variable).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ];
             spans.extend(folder_name_spans(&entry.name));
-            spans.push(Span::styled(scope, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(scope, Style::default().fg(theme().dim)));
             Line::from(spans)
         }
         EntryKind::Request { method, description, .. } => {
@@ -2280,58 +2270,55 @@ fn make_list_item(entry: &Entry) -> ListItem<'static> {
             {
                 spans.push(Span::styled(
                     format!(" — {}", desc),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme().dim),
                 ));
             }
-            spans.push(Span::styled(scope, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(scope, Style::default().fg(theme().dim)));
             Line::from(spans)
         }
-    };
-    ListItem::new(line)
+    }
 }
 
-fn make_tree_folder_item(path: &str, expanded: bool, prefix: &str, use_nerd_fonts: bool) -> ListItem<'static> {
+fn make_tree_folder_item(path: &str, expanded: bool, prefix: &str, use_nerd_fonts: bool) -> Line<'static> {
     let display_name = path.rsplit('/').next().unwrap_or(path).to_string();
-    let line = if use_nerd_fonts {
+    if use_nerd_fonts {
         let icon = if expanded { "\u{f07c} " } else { "\u{f07b} " };
         Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(icon.to_string(), Style::default().fg(Color::Yellow)),
-            Span::styled(display_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(prefix.to_string(), Style::default().fg(theme().dim)),
+            Span::styled(icon.to_string(), Style::default().fg(theme().accent)),
+            Span::styled(display_name, Style::default().fg(theme().text).add_modifier(Modifier::BOLD)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}/", display_name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(prefix.to_string(), Style::default().fg(theme().dim)),
+            Span::styled(format!("{}/", display_name), Style::default().fg(theme().text).add_modifier(Modifier::BOLD)),
         ])
-    };
-    ListItem::new(line)
+    }
 }
 
-fn make_tree_leaf_item(entry: &Entry, prefix: &str, _use_nerd_fonts: bool) -> ListItem<'static> {
+fn make_tree_leaf_item(entry: &Entry, prefix: &str, _use_nerd_fonts: bool) -> Line<'static> {
     let leaf_name = entry.name.rsplit('/').next().unwrap_or(&entry.name).to_string();
-    let line = match &entry.kind {
+    match &entry.kind {
         EntryKind::Chain { .. } => Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(" CHAIN ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(prefix.to_string(), Style::default().fg(theme().dim)),
+            Span::styled(" CHAIN ", Style::default().fg(theme().variable).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
             Span::styled(leaf_name, Style::default().add_modifier(Modifier::BOLD)),
         ]),
         EntryKind::Request { method, description, .. } => {
             let color = method_color(method);
             let mut spans = vec![
-                Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(prefix.to_string(), Style::default().fg(theme().dim)),
                 Span::styled(format!(" {:<6}", method), Style::default().fg(color).add_modifier(Modifier::BOLD)),
                 Span::raw(" "),
                 Span::styled(leaf_name, Style::default().add_modifier(Modifier::BOLD)),
             ];
             if let Some(desc) = description.as_ref().filter(|d| !d.is_empty()) {
-                spans.push(Span::styled(format!(" — {}", desc), Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(format!(" — {}", desc), Style::default().fg(theme().dim)));
             }
             Line::from(spans)
         }
-    };
-    ListItem::new(line)
+    }
 }
 
 fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
@@ -2342,7 +2329,7 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
             let mut header = vec![
                 Span::styled(
                     " CHAIN ",
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme().variable).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ];
@@ -2351,13 +2338,13 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
                 " Steps",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme().dim),
             )));
             for (i, step) in steps.iter().enumerate() {
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("  {}. ", i + 1),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(theme().dim),
                     ),
                     Span::raw(step.clone()),
                 ]));
@@ -2375,14 +2362,14 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
             header.extend(folder_name_spans(&entry.name));
             lines.push(Line::from(header));
             lines.push(Line::raw(""));
-            let mut url_line = vec![Span::styled(" url    ", Style::default().fg(Color::DarkGray))];
-            url_line.extend(var_spans(url, Style::default().fg(Color::Cyan)));
+            let mut url_line = vec![Span::styled(" url    ", Style::default().fg(theme().dim))];
+            url_line.extend(var_spans(url, Style::default().fg(theme().info)));
             lines.push(Line::from(url_line));
             if let Some(desc) = description
                 && !desc.is_empty()
             {
                 lines.push(Line::from(vec![
-                    Span::styled(" desc   ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(" desc   ", Style::default().fg(theme().dim)),
                     Span::raw(desc.clone()),
                 ]));
             }
@@ -2390,11 +2377,11 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled(
                     " Headers",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme().dim),
                 )));
                 for (k, v) in headers {
                     let mut row =
-                        vec![Span::styled(format!("  {}: ", k), Style::default().fg(Color::Yellow))];
+                        vec![Span::styled(format!("  {}: ", k), Style::default().fg(theme().accent))];
                     row.extend(var_spans(v, Style::default()));
                     lines.push(Line::from(row));
                 }
@@ -2403,11 +2390,11 @@ fn make_detail_lines(entry: &Entry) -> Vec<Line<'static>> {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(Span::styled(
                     " Query",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme().dim),
                 )));
                 for (k, v) in query {
                     let mut row =
-                        vec![Span::styled(format!("  {}: ", k), Style::default().fg(Color::Yellow))];
+                        vec![Span::styled(format!("  {}: ", k), Style::default().fg(theme().accent))];
                     row.extend(var_spans(v, Style::default()));
                     lines.push(Line::from(row));
                 }
@@ -2426,7 +2413,7 @@ mod tests {
     fn split(text: &str) -> Vec<(String, bool)> {
         var_spans(text, Style::default())
             .into_iter()
-            .map(|s| (s.content.to_string(), s.style == VAR_STYLE))
+            .map(|s| (s.content.to_string(), s.style == var_style()))
             .collect()
     }
 
@@ -2436,10 +2423,10 @@ mod tests {
     /// own background colour and disappeared.
     #[test]
     fn no_highlighted_foreground_is_its_own_background() {
-        let line = highlight(colorize_json_line("  \"name\": \"berry\","), CURSOR_LINE_BG, Band::Text);
+        let line = highlight(colorize_json_line("  \"name\": \"berry\","), theme().cursor_line, Band::Text);
         for span in &line.spans {
-            assert_ne!(span.style.fg, Some(CURSOR_LINE_BG));
-            assert_ne!(span.style.fg, Some(SELECTION_BG));
+            assert_ne!(span.style.fg, Some(theme().cursor_line));
+            assert_ne!(span.style.fg, Some(theme().selection));
         }
         assert!(line.spans.iter().any(|s| s.style.fg == Some(Color::White)));
     }
@@ -2447,7 +2434,7 @@ mod tests {
     #[test]
     fn a_highlighted_line_keeps_its_syntax_colours_as_bright_twins() {
         let plain = colorize_json_line("  \"name\": \"berry\",");
-        let lit = highlight(plain.clone(), SELECTION_BG, Band::Text);
+        let lit = highlight(plain.clone(), theme().selection, Band::Text);
 
         assert_eq!(plain.spans.len(), lit.spans.len());
         // The key was Yellow and the string Green; both keep their identity.
@@ -2459,8 +2446,8 @@ mod tests {
 
     #[test]
     fn the_band_and_the_bold_go_on_the_line_not_the_spans() {
-        let line = highlight(colorize_json_line("  \"n\": 42"), CURSOR_LINE_BG, Band::Text);
-        assert_eq!(line.style.bg, Some(CURSOR_LINE_BG));
+        let line = highlight(colorize_json_line("  \"n\": 42"), theme().cursor_line, Band::Text);
+        assert_eq!(line.style.bg, Some(theme().cursor_line));
         assert!(line.style.add_modifier.contains(Modifier::BOLD));
         // A span setting its own background would punch a hole in the band.
         assert!(line.spans.iter().all(|s| s.style.bg.is_none()));
@@ -2470,7 +2457,7 @@ mod tests {
     /// leave it alone rather than inventing one.
     #[test]
     fn a_span_with_no_foreground_is_untouched() {
-        let line = highlight(colorize_json_line("    \"n\": 42"), CURSOR_LINE_BG, Band::Text);
+        let line = highlight(colorize_json_line("    \"n\": 42"), theme().cursor_line, Band::Text);
         assert_eq!(line.spans[0].content.as_ref(), "    ");
         assert_eq!(line.spans[0].style.fg, None);
     }
@@ -2485,7 +2472,7 @@ mod tests {
     fn the_cursor_line_band_fills_the_row() {
         let plain = colorize_json_line("  \"n\": 42");
         let text_width = plain.width();
-        let line = highlight(plain, CURSOR_LINE_BG, Band::Row(40));
+        let line = highlight(plain, theme().cursor_line, Band::Row(40));
         assert_eq!(line.width(), 40);
         // The pad is the tail, and it is blank: it exists to carry the band,
         // not to add characters a copy would pick up.
@@ -2501,7 +2488,7 @@ mod tests {
     fn a_selection_band_stops_at_the_end_of_the_text() {
         let plain = colorize_json_line("  \"n\": 42");
         let text_width = plain.width();
-        let line = highlight(plain, SELECTION_BG, Band::Text);
+        let line = highlight(plain, theme().selection, Band::Text);
         assert_eq!(line.width(), text_width);
     }
 
@@ -2511,34 +2498,13 @@ mod tests {
     fn a_line_wider_than_the_row_is_left_alone() {
         let long = colorize_json_line("  \"key\": \"a rather long value indeed\",");
         let width = long.width();
-        let line = highlight(long, CURSOR_LINE_BG, Band::Row(10));
+        let line = highlight(long, theme().cursor_line, Band::Row(10));
         assert_eq!(line.width(), width);
     }
 
-    /// The two bands are a step apart in weight, not two arbitrary greys: the
-    /// selection is the lighter, which is what makes entering visual mode read
-    /// as a change.
-    #[test]
-    fn the_selection_band_is_lighter_than_the_cursor_line() {
-        let grey = |c: Color| match c {
-            Color::Indexed(i) => i,
-            _ => panic!("bands are indexed greys"),
-        };
-        assert!(grey(SELECTION_BG) > grey(CURSOR_LINE_BG));
-    }
-
-    #[test]
-    fn brightening_is_idempotent_and_leaves_unknown_colours_alone() {
-        assert_eq!(brighten(brighten(Color::Green)), Color::LightGreen);
-        assert_eq!(brighten(Color::LightCyan), Color::LightCyan);
-        assert_eq!(brighten(Color::Indexed(42)), Color::Indexed(42));
-    }
-
-    /// The two bands have to stay distinguishable — a selection that looked
-    /// like the cursor line would make `V` feel like it had done nothing.
     #[test]
     fn the_cursor_line_and_a_selection_are_different_bands() {
-        assert_ne!(CURSOR_LINE_BG, SELECTION_BG);
+        assert_ne!(theme().cursor_line, theme().selection);
     }
 
     #[test]

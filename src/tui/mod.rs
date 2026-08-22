@@ -1107,6 +1107,11 @@ impl App {
                 Mode::message(ResponseKind::Error, format!("Config: {e:#}")),
             ),
         };
+        // Installed before the first frame, and from the *resolved* config —
+        // so a config that failed to load draws its own error message in the
+        // default palette rather than in a half-applied one.
+        render::install_theme(config.theme);
+
         Ok(Self {
             entries,
             tree,
