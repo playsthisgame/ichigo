@@ -1,10 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::HashMap;
-use std::fs;
-use crate::config::{dir_for, prune_empty_parents, global_config_path, local_config_path};
 use super::edit::{self, Applied, Edit};
 use super::{App, Focus, Mode, PairKind, PendingAction, RequestDraft, ResponseKind, apply_body, body_field, pair_field, profile_field, step_row};
-use super::tree::{VisibleRow, visible_rows, build_tree, load_entries};
+use super::tree::{VisibleRow, visible_rows};
 
 pub(super) fn handle_key_new_request(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
@@ -623,11 +621,7 @@ pub(super) fn handle_key_browse(app: &mut App, code: KeyCode) -> bool {
         // parts of a request, not things to do to one, so they are reached by
         // Tabbing to their row inside the form — one door instead of two, and
         // no way to edit a request's headers without seeing the request.
-        KeyCode::Char('d') => {
-            let Some(idx) = app.selected_entry_index() else { return false };
-            let entry = &app.entries[idx];
-            app.mode = Mode::ConfirmDelete { entry_name: entry.name.clone(), global: entry.global };
-        }
+        KeyCode::Char('d') => app.confirm_delete_selected(),
         KeyCode::Char('f') => {
             app.filter_active = true;
             let count = app.filtered_indices().len();
@@ -699,39 +693,6 @@ pub(super) fn handle_key_response_filter(app: &mut App, key: KeyEvent) -> bool {
             }
             _ => {}
         }
-    }
-    false
-}
-
-pub(super) fn handle_key_confirm_delete(app: &mut App, code: KeyCode) -> bool {
-    match code {
-        KeyCode::Char('y') | KeyCode::Enter => {
-            let (entry_name, global) = match &app.mode {
-                Mode::ConfirmDelete { entry_name , global} => (entry_name.clone(), *global),
-                _ => return false,
-            };
-
-            let path = if global {
-                global_config_path(&entry_name)
-            } else {
-                local_config_path(&entry_name)
-            };
-            let _ = fs::remove_file(&path);
-            prune_empty_parents(&path, &dir_for(global));
-            if let Ok(entries) = load_entries() {
-                app.tree = build_tree(&entries);
-                app.entries = entries;
-                let count = app.visible_count();
-                let new_pos = app.list_state.selected()
-                    .map(|i| i.min(count.saturating_sub(1)));
-                app.list_state.select(if count == 0 { None } else { new_pos });
-            }
-            app.mode = Mode::Browse;
-        }
-        KeyCode::Char('n') | KeyCode::Esc => {
-            app.mode = Mode::Browse;
-        }
-        _ => {}
     }
     false
 }

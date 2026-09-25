@@ -138,10 +138,6 @@ enum Mode {
         buffer: String,
         error: Option<String>,
     },
-    ConfirmDelete {
-        entry_name: String,
-        global: bool,
-    },
     // The draft's headers *or* query params as an editable key/value list.
     // focused: 2i = pairs[i].name, 2i+1 = pairs[i].value
     //
@@ -244,6 +240,64 @@ impl DiscardChoice {
         let idx = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
         Self::ALL[step_row(idx, Self::ALL.len(), forward)]
     }
+}
+
+/// The delete prompt's rows, in the order they are drawn.
+///
+/// `Keep` sits first and is where the selection starts, for the reason
+/// `DiscardChoice::Save` does: it is the answer that loses nothing, so the
+/// irreversible one is never the row a reflexive Enter lands on. There are two
+/// answers rather than three because a deletion has nothing to save — the row
+/// that would have been `Save` is the one that is missing, not the one that is
+/// selected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeleteChoice {
+    Keep,
+    Delete,
+}
+
+impl DeleteChoice {
+    pub(crate) const ALL: [Self; 2] = [Self::Keep, Self::Delete];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Keep => "Keep it",
+            Self::Delete => "Delete it",
+        }
+    }
+
+    /// What the row does, spelled out under it — the same reason
+    /// `DiscardChoice::hint` exists: the answers differ in what happens to
+    /// something on disk, which is the whole reason the prompt is up.
+    pub(crate) fn hint(self) -> &'static str {
+        match self {
+            Self::Keep => "back to the list, nothing removed",
+            Self::Delete => "remove the config file from disk",
+        }
+    }
+
+    /// One row down or up, wrapping — through `step_row`, as every other list
+    /// in the TUI does.
+    fn step(self, forward: bool) -> Self {
+        let idx = Self::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        Self::ALL[step_row(idx, Self::ALL.len(), forward)]
+    }
+}
+
+/// The delete prompt while it is up: which request it is about, and the row the
+/// selection is on.
+///
+/// It is an overlay on `App` rather than a `Mode`, which is what this replaced.
+/// As a mode it took the detail pane over, so the request it was about stopped
+/// being visible the moment it asked about it, and it looked like a different
+/// kind of question from the unsaved-changes prompt while being exactly the same
+/// kind: a prompt that interrupts a pane and answers back to it. Both now draw
+/// through one renderer and walk through one key handler, so a fix to either
+/// cannot be made in one and forgotten in the other.
+pub(crate) struct DeletePrompt {
+    pub(crate) entry_name: String,
+    pub(crate) global: bool,
+    pub(crate) choice: DeleteChoice,
 }
 
 impl Mode {
@@ -688,6 +742,12 @@ struct App {
     // would have to carry the draft across and hand it back untouched — a
     // second owner of the thing it is protecting.
     confirm_discard: Option<DiscardChoice>,
+    // The delete prompt: `Some` while it is up, carrying the request it is
+    // about and the row the selection is on. An overlay for the same reason the
+    // discard prompt is one — it draws over Browse and answers back to it, and
+    // the list stays on screen behind it, so the name in the prompt can be
+    // checked against the row it came from.
+    confirm_delete: Option<DeletePrompt>,
     // Read once at launch from `config.toml`. Not reloaded mid-session: a keymap
     // changing under a half-typed field would be worse than not reloading it.
     keys: Keys,
@@ -1124,6 +1184,7 @@ impl App {
             filter_active: false,
             show_help: false,
             confirm_discard: None,
+            confirm_delete: None,
             keys: config.keys,
             register: String::new(),
             mode,
@@ -1327,6 +1388,76 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// Opens the delete prompt for the selected request.
+    ///
+    /// Nothing is removed until the prompt is answered, and the prompt opens on
+    /// `Keep`: see `DeleteChoice`.
+    fn confirm_delete_selected(&mut self) {
+        let Some(idx) = self.selected_entry_index() else { return };
+        let entry = &self.entries[idx];
+        self.confirm_delete = Some(DeletePrompt {
+            entry_name: entry.name.clone(),
+            global: entry.global,
+            choice: DeleteChoice::Keep,
+        });
+    }
+
+    /// The delete prompt's keys, which are the discard prompt's keys: a list
+    /// walked with `j`/`k` or the arrows and answered with Enter. `y` and `n`
+    /// are kept as they were before this was a list, since they were the only
+    /// way to answer it for as long as it existed and cost nothing to honour.
+    ///
+    /// Everything else is swallowed, for the reason `answer_discard` swallows
+    /// it: a prompt guarding something about to be lost must not be answerable
+    /// by whichever key was hit next.
+    fn answer_delete(&mut self, key: event::KeyEvent) -> bool {
+        // The same central refusal Browse makes: `Ctrl+j` is not `j`.
+        if key.modifiers.contains(event::KeyModifiers::CONTROL) {
+            return false;
+        }
+        let Some(prompt) = &mut self.confirm_delete else { return false };
+        let choice = prompt.choice;
+        match key.code {
+            event::KeyCode::Char('j') | event::KeyCode::Down => prompt.choice = choice.step(true),
+            event::KeyCode::Char('k') | event::KeyCode::Up => prompt.choice = choice.step(false),
+            event::KeyCode::Char('y') => self.answer_delete_with(DeleteChoice::Delete),
+            event::KeyCode::Char('n') | event::KeyCode::Esc => self.confirm_delete = None,
+            event::KeyCode::Enter => self.answer_delete_with(choice),
+            _ => {}
+        }
+        false
+    }
+
+    /// Closes the prompt and does what the answer says.
+    fn answer_delete_with(&mut self, choice: DeleteChoice) {
+        let Some(prompt) = self.confirm_delete.take() else { return };
+        if choice == DeleteChoice::Delete {
+            self.delete_entry(&prompt.entry_name, prompt.global);
+        }
+    }
+
+    /// Removes a request's config file and resyncs the list around it.
+    ///
+    /// The selection is clamped rather than reset: deleting a row in the middle
+    /// of a long list and being sent back to the top of it is the kind of thing
+    /// that makes people stop using the key.
+    fn delete_entry(&mut self, entry_name: &str, global: bool) {
+        let path = if global {
+            global_config_path(entry_name)
+        } else {
+            local_config_path(entry_name)
+        };
+        let _ = fs::remove_file(&path);
+        prune_empty_parents(&path, &dir_for(global));
+        if let Ok(entries) = load_entries() {
+            self.tree = build_tree(&entries);
+            self.entries = entries;
+            let count = self.visible_count();
+            let new_pos = self.list_state.selected().map(|i| i.min(count.saturating_sub(1)));
+            self.list_state.select(if count == 0 { None } else { new_pos });
+        }
     }
 
     /// then abort — falling back to the cached entry would send the stale values
@@ -2055,9 +2186,9 @@ impl App {
     /// run of `Char` events, so every text field has to be served — miss one and
     /// pasting into it becomes a silent no-op.
     fn handle_paste(&mut self, text: &str) {
-        // The discard prompt is up over the form, so a paste into the field
-        // underneath would land somewhere nobody can see.
-        if self.confirm_discard.is_some() {
+        // A prompt is up over the pane, so a paste into the field underneath
+        // would land somewhere nobody can see.
+        if self.confirm_discard.is_some() || self.confirm_delete.is_some() {
             return;
         }
         // Only the import buffer is multi-line; everywhere else a pasted newline
@@ -2148,6 +2279,11 @@ impl App {
         if self.confirm_discard.is_some() {
             return self.answer_discard(key);
         }
+        // The same, for the same reason: it draws over Browse, and the `d` that
+        // opened it must not also reach the list behind it.
+        if self.confirm_delete.is_some() {
+            return self.answer_delete(key);
+        }
         if self.filter_active && matches!(self.mode, Mode::Browse) {
             return handlers::handle_key_filter(self, key);
         }
@@ -2191,9 +2327,6 @@ impl App {
         }
         if matches!(self.mode, Mode::NewProfile { .. }) {
             return handlers::handle_key_new_profile(self, key);
-        }
-        if matches!(self.mode, Mode::ConfirmDelete { .. }) {
-            return handlers::handle_key_confirm_delete(self, key.code);
         }
         if matches!(self.mode, Mode::Response { response_filter_active: true, .. }) {
             return handlers::handle_key_response_filter(self, key);
@@ -2794,6 +2927,22 @@ mod tests {
         assert_eq!(Keep.step(true), Save);
         assert_eq!(Save.step(false), Keep);
         assert_eq!(Keep.step(false), Discard);
+    }
+
+    /// So does the delete prompt, which is the same list in a shorter form.
+    #[test]
+    fn the_delete_prompt_walks_and_wraps() {
+        use DeleteChoice::*;
+        assert_eq!(Keep.step(true), Delete);
+        assert_eq!(Delete.step(true), Keep);
+        assert_eq!(Keep.step(false), Delete);
+    }
+
+    /// And it opens on the answer that removes nothing: a `d` followed by a
+    /// reflexive Enter must not delete a request.
+    #[test]
+    fn the_delete_prompt_opens_on_the_harmless_answer() {
+        assert_eq!(DeleteChoice::ALL[0], DeleteChoice::Keep);
     }
 
     #[test]

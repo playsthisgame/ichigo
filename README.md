@@ -595,6 +595,18 @@ them. It is a list: `j`/`k` or the arrow keys walk it, Enter picks.
 It opens on **Save and close**, so a reflexive Enter never loses anything, and
 Esc means *keep editing*. Any other key is ignored while the prompt is up.
 
+Deleting a request from the list (`d`) puts up the same popup, in red and
+naming the request:
+
+| Row | What it does |
+| --- | ------------ |
+| Keep it | Back to the list, nothing removed |
+| Delete it | Remove the config file from disk |
+
+It opens on **Keep it** for the same reason, and `y` still deletes and `n`
+still cancels. The list stays on screen behind the prompt, so you can check the
+name against the row it came from.
+
 A form you have only walked through is not unsaved, and neither is an edit the
 save would normalize away — a trailing space typed into a URL is not a change
 the file would record. A cloned or imported request *is* unsaved from the

@@ -8,7 +8,7 @@ use ratatui::{
 };
 use ratatui_image::StatefulImage;
 use super::edit::Edit;
-use super::{App, DiscardChoice, Mode, PairKind, ResponseKind};
+use super::{App, DeleteChoice, DiscardChoice, Mode, PairKind, ResponseKind};
 use super::tree::{Entry, EntryKind, VisibleRow, visible_rows};
 use crate::theme::{Theme, emphasize};
 use std::sync::OnceLock;
@@ -480,9 +480,6 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
         Mode::NewProfile { name, params, focused, edit, error, editing, .. } => {
             draw_new_profile(frame, panes[1], name, params, *focused, edit, unsaved, error.as_deref(), editing.is_some());
         }
-        Mode::ConfirmDelete { entry_name, ..} => {
-            draw_confirm_delete(frame, panes[1], entry_name);
-        }
     }
     if let Some(h) = response_view_height {
         app.response_view_height = h;
@@ -503,6 +500,9 @@ pub(super) fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(choice) = app.confirm_discard {
         draw_confirm_discard(frame, full, choice);
+    }
+    if let Some(prompt) = &app.confirm_delete {
+        draw_confirm_delete(frame, full, &prompt.entry_name, prompt.choice);
     }
 }
 
@@ -1722,12 +1722,6 @@ fn draw_help(frame: &mut Frame, area: Rect, mode: &Mode) {
             Span::styled("   Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
             Span::styled("cancel", Style::default().fg(theme().dim)),
         ],
-        Mode::ConfirmDelete { .. } => vec![
-            Span::styled(" y/Enter ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
-            Span::styled("confirm delete", Style::default().fg(theme().dim)),
-            Span::styled("   n/Esc ", Style::default().fg(theme().accent).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(theme().dim)),
-        ],
         // While selecting, the hints are only the keys that finish or abandon
         // the selection — everything else is noise with a half-made one on
         // screen.
@@ -1858,30 +1852,37 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     frame.render_widget(widget, popup);
 }
 
-/// The prompt that stands between Esc and a request form with unsaved changes.
+/// The one prompt both confirmations are drawn as.
 ///
 /// Drawn as the keymap overlay is — centered, cleared, bordered — because it
 /// interrupts a pane the same way and answers back to it, and a prompt that
-/// looked like a different kind of thing would read as one. The border is
-/// yellow rather than blue: this one is about to throw something away, and it
-/// matches the marker it is explaining.
+/// looked like a different kind of thing would read as one. That is also why
+/// there is one of these rather than two: the unsaved-changes question and the
+/// delete question are the same shape (a sentence, a short list of answers, and
+/// the keys that walk them), so drawing them separately meant a fix to either
+/// could be made in one and forgotten in the other.
 ///
-/// The answers are a *list* rather than three letters to memorize: `j`/`k` and
-/// the arrows walk it and Enter picks, which is what every other list in the
-/// TUI already does, and it puts the consequence of each answer on the screen
-/// next to the answer itself.
-fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) {
-    let mut lines: Vec<Line<'static>> = vec![
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  This request has unsaved changes.",
-            Style::default().fg(theme().text),
-        )),
-        Line::raw(""),
-    ];
+/// The answers are a *list* rather than letters to memorize: `j`/`k` and the
+/// arrows walk it and Enter picks, which is what every other list in the TUI
+/// already does, and it puts the consequence of each answer on the screen next
+/// to the answer itself.
+///
+/// `border` is the caller's, since the colour is the one thing that legitimately
+/// differs: yellow where something is about to be dropped, red where a file is
+/// about to be removed.
+fn draw_choice_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    message: Line<'static>,
+    rows: &[(&'static str, &'static str)],
+    selected: usize,
+    border: Color,
+) {
+    let mut lines: Vec<Line<'static>> = vec![Line::raw(""), message, Line::raw("")];
 
-    for choice in DiscardChoice::ALL {
-        let is_selected = choice == selected;
+    for (i, (label, hint)) in rows.iter().enumerate() {
+        let is_selected = i == selected;
         // The same marker-and-highlight the profile picker uses, so a list
         // looks like a list wherever one turns up.
         let marker = if is_selected { "  ▶ " } else { "    " };
@@ -1893,12 +1894,12 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) 
         lines.push(Line::from(vec![
             Span::raw(marker),
             Span::styled(
-                format!("{:<width$}", choice.label(), width = DISCARD_LABEL_WIDTH),
+                format!("{:<width$}", label, width = PROMPT_LABEL_WIDTH),
                 label_style,
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            format!("      {}", choice.hint()),
+            format!("      {hint}"),
             Style::default().fg(theme().dim),
         )));
         lines.push(Line::raw(""));
@@ -1913,25 +1914,72 @@ fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) 
     ]));
 
     let height = lines.len() as u16 + 2; // + borders
-    let popup = centered_rect(DISCARD_WIDTH, height, area);
+    let popup = centered_rect(PROMPT_WIDTH, height, area);
 
     let widget = Paragraph::new(lines).block(
         Block::default()
-            .title(" Unsaved changes ")
+            .title(format!(" {title} "))
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme().accent)),
+            .border_style(Style::default().fg(border)),
     );
 
-    // Clear first: the form underneath has already been drawn into these cells.
+    // Clear first: the pane underneath has already been drawn into these cells.
     frame.render_widget(Clear, popup);
     frame.render_widget(widget, popup);
 }
 
-/// Wide enough for the longest hint the prompt draws, plus its borders.
-const DISCARD_WIDTH: u16 = 46;
+/// The prompt that stands between Esc and a request form with unsaved changes.
+///
+/// The border is yellow rather than red: this one is about to throw away
+/// something nothing has written yet, and it matches the marker it is
+/// explaining.
+fn draw_confirm_discard(frame: &mut Frame, area: Rect, selected: DiscardChoice) {
+    let rows: Vec<(&'static str, &'static str)> =
+        DiscardChoice::ALL.iter().map(|c| (c.label(), c.hint())).collect();
+    let idx = DiscardChoice::ALL.iter().position(|c| *c == selected).unwrap_or(0);
+    draw_choice_prompt(
+        frame,
+        area,
+        "Unsaved changes",
+        Line::from(Span::styled(
+            "  This request has unsaved changes.",
+            Style::default().fg(theme().text),
+        )),
+        &rows,
+        idx,
+        theme().accent,
+    );
+}
+
+/// The prompt that stands between `d` and a request's config file.
+///
+/// The same popup as the unsaved-changes one, in red and naming the request:
+/// this one removes a file, and the list is still on screen behind it so the
+/// name can be checked against the row it came from.
+fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str, selected: DeleteChoice) {
+    let rows: Vec<(&'static str, &'static str)> =
+        DeleteChoice::ALL.iter().map(|c| (c.label(), c.hint())).collect();
+    let idx = DeleteChoice::ALL.iter().position(|c| *c == selected).unwrap_or(0);
+    draw_choice_prompt(
+        frame,
+        area,
+        "Confirm delete",
+        Line::from(vec![
+            Span::styled("  Delete  ", Style::default().fg(theme().dim)),
+            Span::styled(entry_name.to_string(), Style::default().fg(theme().text).add_modifier(Modifier::BOLD)),
+            Span::styled("?  This cannot be undone.", Style::default().fg(theme().dim)),
+        ]),
+        &rows,
+        idx,
+        theme().error,
+    );
+}
+
+/// Wide enough for the longest hint either prompt draws, plus its borders.
+const PROMPT_WIDTH: u16 = 46;
 /// Pads the highlight to a constant width, so the selected row is a bar rather
 /// than a ragged patch the length of whichever answer it happens to be on.
-const DISCARD_LABEL_WIDTH: usize = 18;
+const PROMPT_LABEL_WIDTH: usize = 18;
 
 /// Centers a `width` × `height` box in `area`, shrinking to fit rather than
 /// overflowing when the terminal is smaller than the box.
@@ -1944,39 +1992,6 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width,
         height,
     }
-}
-
-fn draw_confirm_delete(frame: &mut Frame, area: Rect, entry_name: &str) {
-    let lines: Vec<Line<'static>> = vec![
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  Delete  ", Style::default().fg(theme().dim)),
-            Span::styled(entry_name.to_string(), Style::default().fg(theme().text).add_modifier(Modifier::BOLD)),
-            Span::styled("?", Style::default().fg(theme().dim)),
-        ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "  This action cannot be undone.",
-            Style::default().fg(theme().dim),
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("  y / Enter  ", Style::default().fg(theme().error).add_modifier(Modifier::BOLD)),
-            Span::styled("yes, delete", Style::default().fg(theme().dim)),
-        ]),
-        Line::from(vec![
-            Span::styled("  n / Esc    ", Style::default().fg(theme().success).add_modifier(Modifier::BOLD)),
-            Span::styled("cancel", Style::default().fg(theme().dim)),
-        ]),
-    ];
-
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Confirm Delete ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(theme().error)),
-    );
-    frame.render_widget(paragraph, area);
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -2969,6 +2984,34 @@ mod tests {
         // The keys that walk it, so nobody has to guess at j/k.
         assert!(pane.contains("j/k"), "{pane}");
         assert!(pane.contains("Enter"), "{pane}");
+    }
+
+    /// The delete prompt is the same popup: it names the request, both answers,
+    /// and the keys that walk them.
+    #[test]
+    fn the_delete_prompt_names_the_request_and_both_answers() {
+        let pane = rendered(60, 24, |frame: &mut Frame, area: Rect| {
+            draw_confirm_delete(frame, area, "auth/login", DeleteChoice::Keep)
+        });
+        assert!(pane.contains("auth/login"), "{pane}");
+        assert!(pane.contains("cannot be undone"), "{pane}");
+        for choice in DeleteChoice::ALL {
+            assert!(pane.contains(choice.label()), "{pane}");
+        }
+        assert!(pane.contains("j/k"), "{pane}");
+        assert!(pane.contains("Enter"), "{pane}");
+    }
+
+    /// The marker sits on the selected row and nowhere else — the popup's only
+    /// indication of which answer Enter takes.
+    #[test]
+    fn the_delete_prompt_marks_the_selected_answer() {
+        let pane = rendered(60, 24, |frame: &mut Frame, area: Rect| {
+            draw_confirm_delete(frame, area, "login", DeleteChoice::Delete)
+        });
+        let marked: Vec<&str> = pane.lines().filter(|line| line.contains('\u{25b6}')).collect();
+        assert_eq!(marked.len(), 1, "{pane}");
+        assert!(marked[0].contains(DeleteChoice::Delete.label()), "{pane}");
     }
 
     /// What the issue was: the request form is taller than the pane, so the
